@@ -1,0 +1,29 @@
+model_id: "accounts/fireworks/models/gpt-oss-120b"
+temps: [0.0]
+samples_per_item:
+  "0.0": 1
+  "0.7": 5
+max_new_tokens:
+  closed_book: 512
+  open_book: 512
+top_p: 1.0
+top_k: 50
+stop: []
+sizes:
+  closed_book_max_items: null
+  open_book_max_items: null
+  triviaqa_max_items: null
+  nq_open_max_items: null
+  squad_v2_max_items: null
+paths:
+  raw_dir: "data/raw"
+  prepared_dir: "data/prepared"
+  batch_inputs_dir: "data/batch_inputs"
+  results_dir: "results"
+  reports_dir: "reports"
+  run_manifest: "results/run_manifest.json"
+pricing:
+  input_per_million: 0.15
+  output_per_million: 0.60
+  batch_discount: 0.5
+use_batch_api: true

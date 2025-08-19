@@ -1,0 +1,8 @@
+FIREWORKS_API_KEY=sk-your-key-here
+# Set your Fireworks account slug, NOT an email. Examples:
+#   fireworks
+#   my-team
+# You may also set a full resource like accounts/fireworks; the scripts will extract the slug.
+FIREWORKS_ACCOUNT_ID=fireworks
+# Optional override; default is https://api.fireworks.ai
+# FIREWORKS_API_BASE=https://api.fireworks.ai

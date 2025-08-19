@@ -1,0 +1,4 @@
+Answer using only the provided passage. If the passage is missing, irrelevant, or insufficient, reply exactly with:
+I don't know.
+
+Then, if you do answer, keep it concise and quote only grounded facts from the passage.

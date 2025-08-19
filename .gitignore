@@ -1,0 +1,60 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pytest_cache/
+.pytest_cache/
+*.log
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+
+# Editors/IDEs
+.vscode/
+.idea/
+*.swp
+
+# Secrets and local config
+.env
+.env.*
+*.env
+*.secrets*
+secrets.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Project-specific: generated artifacts and large data
+results/
+reports/
+# Keep the markdown report file if you want to track it; by default ignore entire reports dir
+# If you want to keep report.md, comment the reports/ line above and ignore only large assets
+
+# Batch inputs and prepared/raw datasets (can be large and/or derived)
+data/raw/
+data/prepared/
+data/batch_inputs/
+
+# Fireworks downloaded bundles or binaries
+*.bin
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+
+# Run manifests (may contain run metadata); keep if you want reproducibility tracked
+# results/run_manifest.json
+
+# Local notes/plans (per user request)
+fix_plan/issues.md
+AI_experiment_plan.txt
+
