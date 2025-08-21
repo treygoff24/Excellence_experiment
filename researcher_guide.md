@@ -2,9 +2,11 @@
 
 ## Executive Summary
 
-This document provides a comprehensive guide for researchers writing an academic paper based on our controlled A/B experiment evaluating the impact of system prompts on large language model performance. The study measured whether a philosophical "excellence-oriented" treatment prompt significantly improves factual accuracy compared to a minimal baseline control prompt.
+This document provides a comprehensive guide for researchers writing an academic paper based on our controlled A/B experiments evaluating the impact of system prompts on large language model performance. The study measured whether a philosophical "excellence-oriented" treatment prompt significantly improves factual accuracy compared to a minimal baseline control prompt across different temperature settings.
 
-**Key Finding**: The treatment prompt caused a statistically significant improvement in performance (p < 10⁻¹⁰⁰), with a 6.1 percentage point increase in exact match accuracy on closed-book tasks.
+**Key Findings**: 
+- **Temperature = 0.0 (Deterministic)**: The treatment prompt caused a statistically significant improvement in performance (p < 10⁻¹⁰⁰), with a 6.1 percentage point increase in exact match accuracy on closed-book tasks.
+- **Temperature = 1.0 (Stochastic)**: Currently under evaluation with enhanced methodology including 10 replicates per item and extended token limits for variance estimation.
 
 ## 1. Research Question and Hypothesis
 
@@ -29,8 +31,9 @@ System prompts have emerged as a critical factor in steering language model beha
 ### 2.2 Model and Infrastructure
 - **Model**: `accounts/fireworks/models/gpt-oss-120b` (OpenAI GPT-OSS-120B via Fireworks AI)
 - **API**: Fireworks AI Batch Inference API (OpenAI-compatible)
-- **Temperature**: T=0.0 (deterministic decoding)
-- **Max Tokens**: 1024 for both closed-book and open-book tasks
+- **Temperature**: T=0.0 (baseline study), T=1.0 (current stochastic evaluation)
+- **Max Tokens**: 512 (T=0.0 baseline), 1024 (T=1.0 experiment) for both closed-book and open-book tasks
+- **Sampling**: 1 sample per item (T=0.0), 10 replicates per item (T=1.0)
 - **Context Length**: 131,072 tokens maximum
 - **Cost**: $0.075/1M input tokens, $0.30/1M completion tokens (50% batch discount applied)
 
@@ -91,32 +94,53 @@ Three standard question-answering benchmarks were used to ensure broad coverage:
    - Tests practical knowledge application
 
 ### 3.2 Sample Sizes
+
+#### Temperature = 0.0 (Baseline Study)
 - **Total Items**: 25,424 unique questions per condition
 - **Total Comparisons**: 50,848 paired evaluations  
 - **Closed-book**: ~12,712 items per condition
 - **Open-book (SQuAD)**: ~12,712 items per condition
 
+#### Temperature = 1.0 (Current Experiment) 
+- **Total Items**: 25,424 unique questions per condition
+- **Replicates**: 10 samples per item per condition
+- **Total Evaluations**: ~508,480 individual responses
+- **Total Comparisons**: 254,240 paired comparisons (after aggregating replicates)
+- **Enhanced Statistical Power**: Standard deviation and confidence interval calculation
+
 ### 3.3 Data File Structure
 
 #### Primary Results Files
 
-**`results/per_item_scores.csv`** (50,847 rows)
+**`results/per_item_scores.csv`**
+
+*Temperature = 0.0 (50,847 rows)*:
 ```csv
 abstain_rate,condition,em,f1,false_answer_rate,item_key,temp,type,unsupported_rate
 0.0,control,1.0,,,triviaqa|qw_1694,0.0,closed,
 0.0,treatment,1.0,,,triviaqa|qw_1694,0.0,closed,
 ```
 
+*Temperature = 1.0 (enhanced with standard deviations)*:
+```csv
+abstain_rate,condition,em,em_std,f1,f1_std,false_answer_rate,false_answer_rate_std,item_key,temp,type,unsupported_rate,unsupported_rate_std,abstain_rate_std
+0.2,control,0.7,0.48,,,0.1,0.3,triviaqa|qw_1694,1.0,closed,,0.42
+```
+
 **Fields**:
-- `abstain_rate`: Binary indicator (1.0 = model said "I don't know")
+- `abstain_rate`: Proportion of "I don't know" responses (0.0-1.0)
 - `condition`: "control" or "treatment" 
-- `em`: Exact Match score (1.0 = correct, 0.0 = incorrect)
+- `em`: Exact Match score (aggregated across replicates, 0.0-1.0)
+- `em_std`: Standard deviation of EM across replicates (T=1.0 only)
 - `f1`: Token-level F1 score (SQuAD only, empty for closed-book)
-- `false_answer_rate`: Binary indicator for false answers on unanswerables
+- `f1_std`: Standard deviation of F1 across replicates (T=1.0 only)
+- `false_answer_rate`: Proportion of false answers on unanswerables
+- `false_answer_rate_std`: Standard deviation of false answer rate (T=1.0 only)
 - `item_key`: Unique identifier format: `dataset|item_id`
-- `temp`: Temperature (always 0.0 in this study)
+- `temp`: Temperature (0.0 or 1.0)
 - `type`: "closed" or "open"
-- `unsupported_rate`: Binary indicator for claims not supported by passage (open-book only)
+- `unsupported_rate`: Proportion of claims not supported by passage (open-book only)
+- `*_std` fields: Standard deviations added in T=1.0 experiment for variance analysis
 
 **`results/predictions.csv`** (50,847 rows)
 ```csv
@@ -235,11 +259,20 @@ Control Correct    a        b      } b = 1,186
 
 ### 6.1 Aggregate Performance
 
+#### Temperature = 0.0 (Baseline Results)
+
 | Task Type | Control EM | Treatment EM | Δ (pp) | Significance |
 |-----------|------------|--------------|---------|--------------|
 | **Closed-book** | 47.4% | 53.5% | **+6.1** | p < 0.001 |
 | **Open-book** | 0.4% | 0.7% | +0.3 | p < 0.001 |
 | **Combined** | 23.9% | 27.1% | **+3.2** | p < 10⁻¹⁰⁸ |
+
+#### Temperature = 1.0 (Current Experiment)
+*Results pending - experiment designed to measure:*
+- Effect size with stochastic sampling
+- Variance estimation across 10 replicates per item
+- 95% confidence intervals for all metrics
+- Standard deviation of performance differences
 
 ### 6.2 Detailed Metrics
 
@@ -285,8 +318,9 @@ The treatment prompt's effectiveness may derive from:
 ### 7.4 Limitations and Confounds
 1. **Prompt length confound**: Treatment is 77x longer (1,391 vs 18 tokens)
 2. **Single model tested**: Results may not generalize to other architectures
-3. **Temperature = 0 only**: Stochastic behavior not evaluated
+3. **Temperature dependency**: T=0.0 shows deterministic effects; T=1.0 experiment will test stochastic robustness
 4. **Domain specificity**: Effects concentrated in factual question-answering
+5. **Token limit expansion**: T=1.0 experiment doubled max tokens (1024 vs 512), potentially confounding length effects
 
 ## 8. Suggested Paper Structure
 
@@ -315,9 +349,11 @@ The treatment prompt's effectiveness may derive from:
 - Discuss implications for prompt engineering practice
 
 **Limitations**:
-- Single model and temperature setting
+- Single model tested (GPT-OSS-120B)
+- Temperature comparison (T=0.0 vs T=1.0) introduces multiple confounds
 - Philosophical vs. other prompt types not compared
 - Computational cost vs. performance trade-offs
+- Token limit changes concurrent with temperature changes
 
 ### 8.2 Key Statistical Reporting
 
@@ -343,10 +379,18 @@ The treatment prompt's effectiveness may derive from:
 - **Analysis code**: Complete pipeline in `scripts/` and `scoring/` directories
 
 ### 9.3 Computational Requirements
+
+#### Temperature = 0.0 (Completed)
 - **Model access**: Fireworks AI account with `gpt-oss-120b` access
-- **Estimated cost**: ~$6 USD for full replication
+- **Actual cost**: $5.84 USD
 - **Runtime**: ~2-4 hours including batch job queuing
 - **Dependencies**: Python 3.10+, see `requirements.txt`
+
+#### Temperature = 1.0 (Current Experiment)
+- **Estimated cost**: ~$58-70 USD (10x replicates + 2x token limit)
+- **Estimated runtime**: ~4-8 hours (larger dataset processing)
+- **Enhanced features**: Improved upload reliability, timeout handling, confidence intervals
+- **Statistical output**: Standard deviations and 95% CIs for all metrics
 
 ## 10. Theoretical Implications
 

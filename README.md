@@ -126,7 +126,31 @@ Excellence_experiment/
 └── reports/              # Generated evaluation reports
 ```
 
-## Latest Results
+## Experiment History
+
+### Temperature = 1.0 Experiment (Current - temp-1-experiment branch)
+
+**Model**: `accounts/fireworks/models/gpt-oss-120b` @ T=1.0  
+**Status**: In Progress  
+**Key Changes**:
+- Temperature increased from 0.0 to 1.0 for stochastic sampling
+- Samples per item increased from 1 to 10 replicates for variance estimation
+- Max tokens doubled from 512 to 1024 for both task types
+- Enhanced robustness features: dataset upload retries, extended timeouts, file rewind logic
+- Added standard deviation metrics and 95% confidence intervals to scoring
+- Improved batch splitting with proper .jsonl extensions
+
+**Configuration**:
+```yaml
+temps: [1.0]
+samples_per_item:
+  "1.0": 10    # 10 replicates for variance estimation
+max_new_tokens:
+  closed_book: 1024
+  open_book: 1024
+```
+
+### Temperature = 0.0 Baseline Results
 
 **Model**: `accounts/fireworks/models/gpt-oss-120b` @ T=0.0  
 **Last Run**: 2025-08-19 (based on run manifest)
@@ -151,18 +175,27 @@ Excellence_experiment/
 
 ## Configuration
 
-Key settings in `config/eval_config.yaml`:
+Key settings in `config/eval_config.yaml` (current temp=1.0 experiment):
 
 ```yaml
 model_id: "accounts/fireworks/models/gpt-oss-120b"
-temps: [0.0]  # Add 0.7 for stochastic evaluation
+temps: [1.0]  # Stochastic sampling for variance estimation
 samples_per_item:
-  "0.0": 1    # Deterministic
-  "0.7": 5    # K=5 samples for averaging
+  "1.0": 10   # 10 replicates for statistical analysis
 max_new_tokens:
-  closed_book: 1024
-  open_book: 1024
+  closed_book: 1024  # Doubled from 512
+  open_book: 1024    # Doubled from 512
 use_batch_api: true  # 50% cost savings
+```
+
+**Previous baseline configuration (T=0.0)**:
+```yaml
+temps: [0.0]  # Deterministic
+samples_per_item:
+  "0.0": 1    # Single sample per item
+max_new_tokens:
+  closed_book: 512
+  open_book: 512
 ```
 
 ## Datasets
