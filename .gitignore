@@ -58,3 +58,6 @@ data/batch_inputs/
 fix_plan/issues.md
 AI_experiment_plan.txt
 
+# IDE-specific developer guidance
+WARP.md
+
