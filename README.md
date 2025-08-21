@@ -160,8 +160,8 @@ samples_per_item:
   "0.0": 1    # Deterministic
   "0.7": 5    # K=5 samples for averaging
 max_new_tokens:
-  closed_book: 512
-  open_book: 512
+  closed_book: 1024
+  open_book: 1024
 use_batch_api: true  # 50% cost savings
 ```
 

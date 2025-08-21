@@ -30,7 +30,7 @@ System prompts have emerged as a critical factor in steering language model beha
 - **Model**: `accounts/fireworks/models/gpt-oss-120b` (OpenAI GPT-OSS-120B via Fireworks AI)
 - **API**: Fireworks AI Batch Inference API (OpenAI-compatible)
 - **Temperature**: T=0.0 (deterministic decoding)
-- **Max Tokens**: 512 for both closed-book and open-book tasks
+- **Max Tokens**: 1024 for both closed-book and open-book tasks
 - **Context Length**: 131,072 tokens maximum
 - **Cost**: $0.075/1M input tokens, $0.30/1M completion tokens (50% batch discount applied)
 

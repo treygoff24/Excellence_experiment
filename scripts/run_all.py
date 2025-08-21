@@ -44,10 +44,14 @@ def split_jsonl_by_size(src_path: str, max_bytes: int) -> list[str]:
     parts: list[str] = []
     base_dir = os.path.dirname(src_path)
     base_name = os.path.basename(src_path)
-    name_root = base_name
+    # Keep .jsonl as the final extension for all parts to ensure downstream
+    # systems recognize the file type. Example: foo.p01.jsonl
+    name_root, ext = os.path.splitext(base_name)
+    if not ext:
+        ext = ".jsonl"
     idx = 1
     current_bytes = 0
-    current_path = os.path.join(base_dir, f"{name_root}.part{idx:02d}")
+    current_path = os.path.join(base_dir, f"{name_root}.p{idx:02d}{ext}")
     current_file = open(current_path, "w", encoding="utf-8")
     parts.append(current_path)
     with open(src_path, "r", encoding="utf-8") as fin:
@@ -59,7 +63,7 @@ def split_jsonl_by_size(src_path: str, max_bytes: int) -> list[str]:
                 current_file.close()
                 idx += 1
                 current_bytes = 0
-                current_path = os.path.join(base_dir, f"{name_root}.part{idx:02d}")
+                current_path = os.path.join(base_dir, f"{name_root}.p{idx:02d}{ext}")
                 current_file = open(current_path, "w", encoding="utf-8")
                 parts.append(current_path)
             current_file.write(line)
@@ -71,16 +75,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config/eval_config.yaml")
     ap.add_argument("--account_id", default=os.environ.get("FIREWORKS_ACCOUNT_ID"))
+    ap.add_argument("--condition", choices=["control", "treatment", "both"], default="both")
+    ap.add_argument("--skip_prepare", action="store_true")
+    ap.add_argument("--skip_build", action="store_true")
     ap.add_argument("--skip_batch", action="store_true")
     args = ap.parse_args()
     cfg = load_config(args.config)
     ensure_dirs(cfg)
-    run_cmd([sys.executable, "-m", "scripts.prepare_data", "--config", args.config])
-    run_cmd([sys.executable, "-m", "scripts.build_batches", "--config", args.config])
+    if not args.skip_prepare:
+        run_cmd([sys.executable, "-m", "scripts.prepare_data", "--config", args.config])
+    if not args.skip_build:
+        run_cmd([sys.executable, "-m", "scripts.build_batches", "--config", args.config])
     control_prompt = open("config/prompts/control_system.txt", "r", encoding="utf-8").read()
     treatment_prompt = open("config/prompts/treatment_system.txt", "r", encoding="utf-8").read()
+    run_id = datetime.utcnow().strftime("r%Y%m%d%H%M%S")
     manifest = {
         "created_utc": datetime.utcnow().isoformat() + "Z",
+        "run_id": run_id,
         "model_id": cfg["model_id"],
         "temps": cfg["temps"],
         "samples_per_item": cfg["samples_per_item"],
@@ -134,28 +145,36 @@ def main():
         )
 
     account_id = _derive_account_id(args.account_id)
+    conditions: list[str] = [args.condition] if args.condition in ("control", "treatment") else ["control", "treatment"]
     for temp in cfg["temps"]:
         t_str = _format_temp_label(temp)
-        for cond in ["control", "treatment"]:
+        for cond in conditions:
             jsonl_path = os.path.join(cfg["paths"]["batch_inputs_dir"], f"t{t_str}_{cond}.jsonl")
-            display_name = f"excellence-t{t_str}-{cond}"
-            # Fireworks doc note: input dataset must be <500MB; split if needed
-            parts = split_jsonl_by_size(jsonl_path, max_bytes=500 * 1024 * 1024)
+            display_name = f"excellence-t{t_str}-{cond}-{run_id}"
+            # Keep each part <=140MB so uploads always use the multipart JSONL path
+            parts = split_jsonl_by_size(jsonl_path, max_bytes=140 * 1024 * 1024)
             if not parts:
                 raise SystemExit(f"Missing or empty input file: {jsonl_path}")
             datasets_for_cond: list[str] = []
             for pi, part_path in enumerate(parts, start=1):
                 ds_name = display_name if len(parts) == 1 else f"{display_name}-p{pi:02d}"
                 dsid = create_dataset(ds_name, account_id)
-                upload_dataset_file(account_id, dsid, part_path)
+                # Ensure remote filename clearly ends with .jsonl for correct type detection
+                base_no_ext, base_ext = os.path.splitext(os.path.basename(jsonl_path))
+                if not base_ext:
+                    base_ext = ".jsonl"
+                remote_fname = (
+                    f"{base_no_ext}{base_ext}" if len(parts) == 1 else f"{base_no_ext}.p{pi:02d}{base_ext}"
+                )
+                upload_dataset_file(account_id, dsid, part_path, filename=remote_fname)
                 datasets_for_cond.append(dsid)
             manifest["datasets"][f"t{t_str}_{cond}"] = datasets_for_cond if len(datasets_for_cond) > 1 else datasets_for_cond[0]
             # Use a single uniform max_tokens per job; choose the maximum across splits
-            mn = cfg.get("max_new_tokens", {"closed_book": 512, "open_book": 512})
+            mn = cfg.get("max_new_tokens", {"closed_book": 1024, "open_book": 1024})
             try:
-                job_max_tokens = int(max(int(mn.get("closed_book", 512)), int(mn.get("open_book", 512))))
+                job_max_tokens = int(max(int(mn.get("closed_book", 1024)), int(mn.get("open_book", 1024))))
             except Exception:
-                job_max_tokens = 512
+                job_max_tokens = 1024
             # Create a batch job per dataset part; Fireworks will produce a result per job
             job_names: list[str] = []
             dsid_list = datasets_for_cond
@@ -397,8 +416,18 @@ def main():
     lines.append("")
     lines.append(f"Model: {cfg['model_id']}")
     lines.append(f"Temperatures: {', '.join(str(t) for t in cfg['temps'])}")
-    k07 = cfg['samples_per_item'].get('0.7') or cfg['samples_per_item'].get(0.7)
-    lines.append(f"Samples per item @0.7: {k07}")
+    # Report per-temp replicate counts to avoid stale text when temps != 0.7
+    try:
+        for t in cfg["temps"]:
+            k = (
+                cfg["samples_per_item"].get(str(float(t)))
+                or cfg["samples_per_item"].get(f"{float(t):.1f}")
+                or cfg["samples_per_item"].get(float(t))
+                or "?"
+            )
+            lines.append(f"Samples per item @T={float(t):.1f}: {k}")
+    except Exception:
+        pass
     lines.append("")
     # Prompt tokens
     lines.append("## Prompts")

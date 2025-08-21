@@ -1,11 +1,10 @@
 model_id: "accounts/fireworks/models/gpt-oss-120b"
-temps: [0.0]
+temps: [1.0]
 samples_per_item:
-  "0.0": 1
-  "0.7": 5
+  "1.0": 10
 max_new_tokens:
-  closed_book: 512
-  open_book: 512
+  closed_book: 1024
+  open_book: 1024
 top_p: 1.0
 top_k: 50
 stop: []

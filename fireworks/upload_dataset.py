@@ -111,6 +111,25 @@ def _post_multipart_with_retries(url: str, headers: dict, files: dict, max_attem
     while attempt < max_attempts:
         attempt += 1
         try:
+            # Rewind any file-like objects so each retry re-sends the full payload
+            try:
+                for key, value in list(files.items()):
+                    # Common shapes per httpx: {"file": (<name>, <fileobj>, <content_type>)}
+                    if isinstance(value, (list, tuple)) and len(value) >= 2:
+                        file_obj = value[1]
+                        if hasattr(file_obj, "seek"):
+                            try:
+                                file_obj.seek(0)
+                            except Exception:
+                                pass
+                    elif hasattr(value, "seek"):
+                        try:
+                            value.seek(0)
+                        except Exception:
+                            pass
+            except Exception:
+                # Best-effort rewind only; never fail the upload loop because of this
+                pass
             with httpx.Client(timeout=None) as client:
                 resp = client.post(url, headers=headers, files=files)
             if 200 <= resp.status_code < 300:
@@ -174,7 +193,7 @@ def _get_dataset_state(account_id: str, dataset_id: str) -> str | None:
             return None
         raise
 
-def _wait_until_ready(account_id: str, dataset_id: str, timeout_s: float = 600.0, poll_s: float = 2.0) -> None:
+def _wait_until_ready(account_id: str, dataset_id: str, timeout_s: float = 900.0, poll_s: float = 2.0) -> None:
     deadline = time.time() + timeout_s
     last_state: str | None = None
     while time.time() < deadline:
@@ -299,21 +318,34 @@ def create_dataset(display_name: str, account_id: str) -> str:
         "datasetId": base_id,
     }
 
-    try:
-        r = _post_json_with_retries(url, headers=auth_headers(), json_payload=payload, params=None)
+    # Attempt creation; if 409 Conflict, append a numeric suffix and retry a few times defensively
+    suffix = 1
+    max_suffix = 5
+    while True:
         try:
-            _newly_created_datasets.add(base_id)
-        except Exception:
-            pass
-    except httpx.HTTPStatusError as e:
-        # If already exists, treat it as success and return the id so we can upload into it
-        if e.response is not None and e.response.status_code == 409:
+            r = _post_json_with_retries(url, headers=auth_headers(), json_payload=payload, params=None)
             try:
-                _newly_created_datasets.discard(base_id)
+                _newly_created_datasets.add(base_id)
             except Exception:
                 pass
-            return base_id
-        raise
+            break
+        except httpx.HTTPStatusError as e:
+            if e.response is not None and e.response.status_code == 409:
+                # Collision; adjust id/display and retry
+                if suffix >= max_suffix:
+                    # Give up retrying suffixes; treat as success with the original id
+                    try:
+                        _newly_created_datasets.discard(base_id)
+                    except Exception:
+                        pass
+                    return base_id
+                suffix += 1
+                new_display = f"{display_name}-{suffix}"
+                base_id = normalize_dataset_id(new_display)
+                payload["dataset"]["displayName"] = new_display
+                payload["datasetId"] = base_id
+                continue
+            raise
 
     body = r.json() if r.headers.get("content-type", "").lower().startswith("application/json") else {}
     # Common shapes: {"name": "accounts/<acc>/datasets/<id>"} or {"id": "<id>"}
@@ -375,6 +407,22 @@ def upload_dataset_file(account_id: str, dataset_id: str, local_path: str, filen
                         raise
                 else:
                     raise
+            except Exception as e:
+                # Fallback: if multipart repeatedly fails (e.g., persistent 429/5xx),
+                # switch to the signed URL + validate flow for robustness.
+                try:
+                    print(
+                        f"Multipart upload failed for {dataset_id} with {type(e).__name__}: {e}. "
+                        f"Falling back to signed URL flow...",
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
+                signed = _request_signed_url(account_id, dataset_id, fname, size_bytes)
+                _put_file_to_signed_url(signed, local_path)
+                _validate_upload(account_id, dataset_id)
+                _wait_until_ready(account_id, dataset_id)
+                return {"status": "uploaded", "method": "fallback_signed_url", "datasetId": dataset_id}
         # Confirm transition to READY
         _wait_until_ready(account_id, dataset_id)
         return {"status": "uploaded", "method": "multipart", "datasetId": dataset_id}

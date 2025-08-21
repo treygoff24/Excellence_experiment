@@ -126,7 +126,7 @@ def create_batch_job(account_id: str, model: str, input_dataset_id: str, display
             data = resp.json()
         return data.get("state", "")
 
-    def wait_for_dataset_ready(account_id: str, dataset_id: str, timeout_sec: int = 300, poll_interval_sec: int = 5) -> bool:
+    def wait_for_dataset_ready(account_id: str, dataset_id: str, timeout_sec: int = 900, poll_interval_sec: int = 5) -> bool:
         import time
         start = time.monotonic()
         while (time.monotonic() - start) < timeout_sec:

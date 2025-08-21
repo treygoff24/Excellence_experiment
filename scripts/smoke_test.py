@@ -265,7 +265,7 @@ def main():
             ])
 
             if do_closed:
-                max_tok_closed = int(cfg.get("max_new_tokens", {}).get("closed_book", 512))
+                max_tok_closed = int(cfg.get("max_new_tokens", {}).get("closed_book", 1024))
                 for row in closed_items:
                     dataset = row.get("dataset") or "closed_book"
                     rid = row.get("id") or row.get("qid") or ""
@@ -297,7 +297,7 @@ def main():
                         ])
 
             if do_open:
-                max_tok_open = int(cfg.get("max_new_tokens", {}).get("open_book", 512))
+                max_tok_open = int(cfg.get("max_new_tokens", {}).get("open_book", 1024))
                 for row in open_items:
                     dataset = row.get("dataset") or "squad_v2"
                     rid = row.get("id") or row.get("qid") or ""

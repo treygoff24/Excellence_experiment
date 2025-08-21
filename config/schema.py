@@ -38,8 +38,8 @@ class SizesModel(BaseModel):
 
 
 class MaxNewTokensModel(BaseModel):
-    closed_book: int = Field(default=512)
-    open_book: int = Field(default=512)
+    closed_book: int = Field(default=1024)
+    open_book: int = Field(default=1024)
 
 
 class EvalConfigModel(BaseModel):

@@ -21,6 +21,14 @@ def read_preds_csv(path: str):
         for r in reader: yield r
 def aggregate_replicates(values):
     return sum(values)/len(values) if values else 0.0
+
+def stdev(values):
+    n = len(values)
+    if n <= 1:
+        return 0.0
+    mean_val = sum(values) / n
+    var = sum((x - mean_val) ** 2 for x in values) / (n - 1)
+    return var ** 0.5
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pred_csv", default="results/predictions.csv")
@@ -61,11 +69,16 @@ def main():
     for key, metrics in bucket.items():
         item_key, typ, condition, temp = key
         row = {"item_key": item_key, "type": typ, "condition": condition, "temp": temp, "em": aggregate_replicates(metrics.get("em", []))}
+        row["em_std"] = stdev(metrics.get("em", []))
         if typ == "open":
             row["f1"] = aggregate_replicates(metrics.get("f1", []))
+            row["f1_std"] = stdev(metrics.get("f1", []))
             row["false_answer_rate"] = aggregate_replicates(false_ans_bucket.get(key, []))
+            row["false_answer_rate_std"] = stdev(false_ans_bucket.get(key, []))
             row["unsupported_rate"] = aggregate_replicates(unsupported_bucket.get(key, []))
+            row["unsupported_rate_std"] = stdev(unsupported_bucket.get(key, []))
         row["abstain_rate"] = aggregate_replicates(abst_bucket.get(key, []))
+        row["abstain_rate_std"] = stdev(abst_bucket.get(key, []))
         rows.append(row)
     out_csv = os.path.join(args.out_dir, "per_item_scores.csv")
     import csv
