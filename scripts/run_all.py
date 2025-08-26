@@ -150,47 +150,6 @@ def write_manifest(path: str, data: dict):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-def split_jsonl_by_size(src_path: str, max_bytes: int) -> list[str]:
-    """Split a JSONL file into parts not exceeding max_bytes each (approximate).
-
-    Returns a list of part file paths. If src_path is already <= max_bytes,
-    returns [src_path] without creating new files.
-    """
-    try:
-        size = os.stat(src_path).st_size
-    except FileNotFoundError:
-        return []
-    if size <= max_bytes:
-        return [src_path]
-    parts: list[str] = []
-    base_dir = os.path.dirname(src_path)
-    base_name = os.path.basename(src_path)
-    # Keep .jsonl as the final extension for all parts to ensure downstream
-    # systems recognize the file type. Example: foo.p01.jsonl
-    name_root, ext = os.path.splitext(base_name)
-    if not ext:
-        ext = ".jsonl"
-    idx = 1
-    current_bytes = 0
-    current_path = os.path.join(base_dir, f"{name_root}.p{idx:02d}{ext}")
-    current_file = open(current_path, "w", encoding="utf-8")
-    parts.append(current_path)
-    with open(src_path, "r", encoding="utf-8") as fin:
-        for line in fin:
-            if not line:
-                continue
-            b = len(line.encode("utf-8"))
-            if current_bytes + b > max_bytes and current_bytes > 0:
-                current_file.close()
-                idx += 1
-                current_bytes = 0
-                current_path = os.path.join(base_dir, f"{name_root}.p{idx:02d}{ext}")
-                current_file = open(current_path, "w", encoding="utf-8")
-                parts.append(current_path)
-            current_file.write(line)
-            current_bytes += b
-    current_file.close()
-    return parts
 def main():
     load_dotenv()
     ap = argparse.ArgumentParser()
@@ -345,42 +304,36 @@ def main():
                 suffix = f"_{ps_name}" if (len(prompt_sets_cfg) > 1 or ps_name not in ("default", None)) else ""
                 jsonl_path = os.path.join(cfg["paths"]["batch_inputs_dir"], f"t{t_str}{suffix}_{cond}.jsonl")
                 display_name = f"excellence-{ps_name}-t{t_str}-{cond}-{run_id}"
-                parts = split_jsonl_by_size(jsonl_path, max_bytes=140 * 1024 * 1024)
-                if not parts:
-                    raise SystemExit(f"Missing or empty input file: {jsonl_path}")
-                datasets_for_cond: list[str] = []
-                for pi, part_path in enumerate(parts, start=1):
-                    ds_name = display_name if len(parts) == 1 else f"{display_name}-p{pi:02d}"
-                    dsid = create_dataset(ds_name, account_id)
-                    base_no_ext, base_ext = os.path.splitext(os.path.basename(jsonl_path))
-                    if not base_ext:
-                        base_ext = ".jsonl"
-                    remote_fname = (f"{base_no_ext}{base_ext}" if len(parts) == 1 else f"{base_no_ext}.p{pi:02d}{base_ext}")
-                    upload_dataset_file(account_id, dsid, part_path, filename=remote_fname)
-                    datasets_for_cond.append(dsid)
-                trial_manifest["datasets"][f"t{t_str}_{cond}"] = datasets_for_cond if len(datasets_for_cond) > 1 else datasets_for_cond[0]
+                if not os.path.isfile(jsonl_path):
+                    raise SystemExit(f"Missing input file: {jsonl_path}")
+                ds_name = display_name
+                dsid = create_dataset(ds_name, account_id)
+                base_no_ext, base_ext = os.path.splitext(os.path.basename(jsonl_path))
+                if not base_ext:
+                    base_ext = ".jsonl"
+                remote_fname = f"{base_no_ext}{base_ext}"
+                # upload_dataset_file automatically chooses multipart or signed URL
+                # flow based on size, enabling uploads of files >150MB.
+                upload_dataset_file(account_id, dsid, jsonl_path, filename=remote_fname)
+                trial_manifest["datasets"][f"t{t_str}_{cond}"] = dsid
 
                 try:
                     job_max_tokens = int(max(int(mx.get("closed_book", 1024)), int(mx.get("open_book", 1024))))
                 except Exception:
                     job_max_tokens = 1024
-                job_names: list[str] = []
-                dsid_list = datasets_for_cond if isinstance(datasets_for_cond, list) else [datasets_for_cond]
-                for pi, dsid in enumerate(dsid_list, start=1):
-                    job = create_batch_job(
-                        account_id=account_id,
-                        model=model_id,
-                        input_dataset_id=dsid,
-                        display_name=(f"{display_name}-job" if len(dsid_list) == 1 else f"{display_name}-job-p{pi:02d}"),
-                        temperature=float(temp),
-                        max_tokens=job_max_tokens,
-                        top_p=top_p,
-                        top_k=top_k,
-                        stop=cfg.get("stop") or None,
-                    )
-                    job_name = job.get("name") or job.get("id")
-                    job_names.append(job_name)
-                trial_manifest["jobs"][f"t{t_str}_{cond}"] = job_names if len(job_names) > 1 else job_names[0]
+                job = create_batch_job(
+                    account_id=account_id,
+                    model=model_id,
+                    input_dataset_id=dsid,
+                    display_name=f"{display_name}-job",
+                    temperature=float(temp),
+                    max_tokens=job_max_tokens,
+                    top_p=top_p,
+                    top_k=top_k,
+                    stop=cfg.get("stop") or None,
+                )
+                job_name = job.get("name") or job.get("id")
+                trial_manifest["jobs"][f"t{t_str}_{cond}"] = job_name
 
         # Write per-trial manifest
         write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
