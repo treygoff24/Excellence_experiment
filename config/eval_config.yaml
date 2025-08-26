@@ -21,6 +21,7 @@ paths:
   results_dir: "results"
   reports_dir: "reports"
   run_manifest: "results/run_manifest.json"
+  experiments_dir: "experiments"
 pricing:
   input_per_million: 0.15
   output_per_million: 0.60

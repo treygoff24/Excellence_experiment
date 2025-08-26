@@ -13,10 +13,12 @@ pip install -r requirements.txt
 
 # Configure credentials and prompts (see Setup section)
 # Then run:
-python -m scripts.run_all
+python -m scripts.run_all --archive
 # or
 make eval
 ```
+
+> **New in 2025**: Run isolation system automatically organizes experiments into separate directories. See [EXPERIMENT_WORKFLOW.md](EXPERIMENT_WORKFLOW.md) for details.
 
 ## Features
 
@@ -106,6 +108,20 @@ python -m scripts.smoke_test
 # Generate cost summary
 python -m scripts.summarize_costs
 ```
+
+### Smoke Test (Offline, Full Flow)
+
+Exercise the entire workflow locally on a tiny subset (no external API calls):
+
+```
+# Makefile target
+make smoke
+
+# Or directly
+python -m scripts.smoke_test --mode flow --n 2 --out_dir results/smoke
+```
+
+This runs: build_batches → simulate results → parse → score → stats → cost, writing outputs under `results/smoke/<timestamp>/results/`.
 
 ## Project Structure
 
@@ -229,3 +245,58 @@ Edit files in `config/prompts/` and `config/task_instructions/`. The system will
 - Track prompt token counts
 - Include prompt hashes in reproducibility manifest
 - Report token cost differences between conditions
+
+## Flexible experimentation (models, prompts, sweeps)
+
+- Config additions in `config/eval_config.yaml`:
+  - `model_aliases`: map short names to full model ids
+  - `prompt_sets`: named sets with `control` and `treatment` paths
+  - `default_prompt_set`: which set to use when not specified
+  - `models`: optional list of models to sweep (simple)
+  - `sweep`: optional cartesian sweep across `models`, `prompt_sets`, `temps`, `top_p`, `top_k`, and `max_new_tokens`
+  - `trials`: explicit list of trial objects with per-trial overrides
+
+Example:
+
+```yaml
+model_aliases:
+  mixtral8x7b: accounts/fireworks/models/mixtral-8x7b-instruct
+  llama38b: accounts/fireworks/models/llama-v3p1-8b-instruct
+prompt_sets:
+  default:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/treatment_system.txt
+  concise:
+    control: config/prompts/control_concise.txt
+    treatment: config/prompts/treatment_concise.txt
+default_prompt_set: default
+sweep:
+  models: [mixtral8x7b, llama38b]
+  prompt_sets: [default, concise]
+  temps: [0.2, 0.7]
+  top_p: [0.9, 1.0]
+  max_new_tokens:
+    open_book: [512, 1024]
+    closed_book: [512]
+```
+
+- Build inputs once per prompt set and temperatures:
+
+```bash
+python -m scripts.build_batches --config config/eval_config.yaml --prompt_set default --temps 0.2,0.7
+```
+
+- Run all trials (sweep or explicit):
+
+```bash
+python -m scripts.run_all --config config/eval_config.yaml --models mixtral8x7b,llama38b --prompt_sets default,concise --temps 0.2,0.7
+```
+
+Outputs:
+- `experiments/run_<RUN_ID>/batch_inputs/` shared across trials
+- Per-trial: `experiments/run_<RUN_ID>/<trial-slug>/{results,reports}/`
+- Per-trial manifest: `trial_manifest.json`
+- Multi-trial summary: `experiments/run_<RUN_ID>/multi_trial_manifest.json`
+- Aggregate comparison: `experiments/run_<RUN_ID>/aggregate_report.md`
+
+Backwards compatibility: if only `model_id` and `temps` are set, behavior matches prior single-model single-prompt runs.

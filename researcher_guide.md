@@ -412,3 +412,31 @@ This study provides empirical grounding for the hypothesis that system prompts f
 **Replication Repository**: `Excellence_experiment/`
 
 This guide provides complete information for writing a rigorous academic paper. All claims should be supported by the empirical evidence documented in the results files, and the statistical analysis approach ensures robust conclusions about system prompt effectiveness.
+
+## Running multi-trial experiments
+
+1) Configure sweeps or trials in `config/eval_config.yaml` using `prompt_sets`, `models`/`model_aliases`, and `sweep` or `trials`.
+2) Prepare and build inputs:
+
+```bash
+python -m scripts.prepare_data --config config/eval_config.yaml
+python -m scripts.build_batches --config config/eval_config.yaml --prompt_set default --temps 0.2,0.7
+```
+
+3) Launch experiments (overrides optional):
+
+```bash
+python -m scripts.run_all --config config/eval_config.yaml --models mixtral8x7b,llama38b --prompt_sets default,concise --temps 0.2,0.7
+```
+
+Artifacts:
+- Shared inputs: `experiments/run_<RUN_ID>/batch_inputs/`
+- Per-trial dirs: `experiments/run_<RUN_ID>/<trial-slug>/{results,reports}/`
+- Per-trial manifest: `trial_manifest.json`
+- Summary: `experiments/run_<RUN_ID>/multi_trial_manifest.json`
+- Aggregate: `experiments/run_<RUN_ID>/aggregate_report.md`
+
+Tips:
+- Use `--plan_only` to print the expanded trial plan without running.
+- Keep `samples_per_item` aligned with all `temps` used in sweeps/trials.
+- Reuse datasets across models by keeping batch inputs identical (prompt set + temp).

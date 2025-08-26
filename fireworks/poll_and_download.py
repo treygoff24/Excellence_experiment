@@ -58,6 +58,9 @@ def get_dataset(account_id: str, dataset_id: str):
     url = f"{V1}/accounts/{account_id}/datasets/{dataset_id}"
     resp = _get_with_retries(url, headers=auth_headers())
     return resp.json()
+def get_dataset_external_url(account_id: str, dataset_id: str) -> str | None:
+    ds = get_dataset(account_id, dataset_id)
+    return ds.get("externalUrl") or ds.get("external_url")
 def try_download_external_url(url: str, out_dir: str):
     if not url: return None
     out_path = os.path.join(out_dir, "dataset_download.bin")

@@ -1,6 +1,6 @@
 from __future__ import annotations
-import os, argparse, json, time, csv, hashlib, traceback
-from typing import List, Dict, Any
+import os, argparse, json, time, csv, hashlib, traceback, tempfile
+from typing import List, Dict, Any, Tuple
 from dotenv import load_dotenv
 import yaml
 from config.schema import load_config
@@ -42,19 +42,195 @@ def get_base_url() -> str:
     # Prefer explicit inference/v1 path
     return f"{base.rstrip('/')}/inference/v1"
 
+def _flow_mode(args) -> None:
+    """Offline, end-to-end smoke covering build → parse → score → stats → cost.
+
+    Assumptions:
+    - Uses existing prepared data if present; otherwise creates a tiny synthetic set.
+    - Limits to args.n items per split, temps=[0.0], samples_per_item={"0.0":1}.
+    - Does not hit network or external APIs.
+    """
+    cfg = load_config(args.config)
+    # Resolve paths and ensure isolated smoke run directories
+    prepared_dir = cfg["paths"]["prepared_dir"]
+    run_ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    run_id = f"smoke_{run_ts}"
+    base_out = os.path.join(args.out_dir, run_id)
+    os.makedirs(base_out, exist_ok=True)
+    batch_dir = os.path.join(base_out, "batch_inputs")
+    results_dir = os.path.join(base_out, "results")
+    os.makedirs(batch_dir, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
+
+    # Prepare a minimal config override written to a temp file
+    cfg_override = dict(cfg)
+    cfg_override["temps"] = [0.0]
+    cfg_override["samples_per_item"] = {"0.0": 1}
+    cfg_override.setdefault("paths", {}).update({
+        "batch_inputs_dir": batch_dir,
+        "results_dir": results_dir,
+    })
+
+    # If prepared data is missing, synthesize a tiny set
+    def _ensure_prepared_minimal() -> str:
+        nonlocal prepared_dir
+        src_ob = os.path.join(prepared_dir, "open_book.jsonl")
+        src_cb = os.path.join(prepared_dir, "closed_book.jsonl")
+        # Always build a reduced prepared set for smoke under base_out
+        dst_prepared = os.path.join(base_out, "prepared")
+        os.makedirs(dst_prepared, exist_ok=True)
+        dst_ob = os.path.join(dst_prepared, "open_book.jsonl")
+        dst_cb = os.path.join(dst_prepared, "closed_book.jsonl")
+        if os.path.isfile(src_ob) and os.path.isfile(src_cb):
+            # Copy only the first N items from each split
+            def _copy_first_n(src, dst, n):
+                cnt = 0
+                with open(src, "r", encoding="utf-8") as fin, open(dst, "w", encoding="utf-8") as fout:
+                    for line in fin:
+                        s = line.strip()
+                        if not s: continue
+                        fout.write(s + "\n"); cnt += 1
+                        if cnt >= max(1, int(args.n)):
+                            break
+            _copy_first_n(src_ob, dst_ob, args.n)
+            _copy_first_n(src_cb, dst_cb, args.n)
+            prepared_dir = dst_prepared
+            return prepared_dir
+        # No source prepared data; synthesize a tiny set
+        ob_rows = [
+            {"dataset": "squad_v2", "id": "ob1", "context": "Paris is in France.", "question": "Which country is Paris in?", "answers": ["France"], "is_unanswerable": False},
+            {"dataset": "squad_v2", "id": "ob2", "context": "No one knows this.", "question": "What is the answer?", "answers": [], "is_unanswerable": True},
+        ]
+        cb_rows = [
+            {"dataset": "triviaqa", "id": "cb1", "question": "How many valves does a trumpet have?", "answers": ["3", "Three"]},
+            {"dataset": "nq_open", "id": "cb2", "question": "Who wrote The Hobbit?", "answers": ["J. R. R. Tolkien", "JRR Tolkien", "Tolkien"]},
+        ]
+        with open(dst_ob, "w", encoding="utf-8") as f:
+            for r in ob_rows[: max(1, int(args.n))]: f.write(json.dumps(r) + "\n")
+        with open(dst_cb, "w", encoding="utf-8") as f:
+            for r in cb_rows[: max(1, int(args.n))]: f.write(json.dumps(r) + "\n")
+        prepared_dir = dst_prepared
+        return prepared_dir
+
+    prepared_dir = _ensure_prepared_minimal()
+    cfg_override["paths"]["prepared_dir"] = prepared_dir
+
+    # Write override config
+    tmp_cfg_path = os.path.join(base_out, "config.smoke.yaml")
+    with open(tmp_cfg_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg_override, f)
+
+    # Build minimal batches (temps fixed to 0.0; use default prompt set)
+    import subprocess, sys
+    subprocess.check_call([sys.executable, "-m", "scripts.build_batches", "--config", tmp_cfg_path, "--temps", "0.0"])  # validation: raises on failure
+    print("build_batches: ok (t=0.0, K=1)")
+
+    # Identify generated batch files (without prompt set suffix for default)
+    t0_ctrl = os.path.join(batch_dir, "t0_control.jsonl")
+    t0_trt = os.path.join(batch_dir, "t0_treatment.jsonl")
+    # Fallback if prompt set suffix present
+    if not os.path.isfile(t0_ctrl):
+        # Find any control/treatment files for t0
+        for name in os.listdir(batch_dir):
+            if name.startswith("t0_") and name.endswith("_control.jsonl"): t0_ctrl = os.path.join(batch_dir, name)
+            if name.startswith("t0_") and name.endswith("_treatment.jsonl"): t0_trt = os.path.join(batch_dir, name)
+
+    def _load_canon(prep_dir: str) -> Tuple[dict, dict]:
+        ob = {}
+        cb = {}
+        for path, target in [(os.path.join(prep_dir, "open_book.jsonl"), ob), (os.path.join(prep_dir, "closed_book.jsonl"), cb)]:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line=line.strip();
+                    if not line: continue
+                    row=json.loads(line)
+                    target[f"{row.get('dataset')}|{row.get('id')}"]=row
+        return ob, cb
+
+    open_canon, closed_canon = _load_canon(prepared_dir)
+
+    # Helper to choose a plausible prediction from canon
+    def _predict_from_custom_id(cid: str) -> str:
+        dataset, item_id, condition, temp_str, sample_idx, typ = cid.split("|")
+        key = f"{dataset}|{item_id}"
+        if typ == "open":
+            ex = open_canon.get(key) or {}
+            if ex.get("is_unanswerable"):
+                return "I don't know."
+            ans = (ex.get("answers") or [])
+            return (ans[0] if ans else "I don't know.")
+        else:
+            ex = closed_canon.get(key) or {}
+            ans = (ex.get("answers") or [])
+            return (ans[0] if ans else "I don't know.")
+
+    # Create a combined results JSONL simulating Fireworks batch output
+    results_jsonl = os.path.join(results_dir, "results_combined.jsonl")
+    total = 0
+    with open(results_jsonl, "w", encoding="utf-8") as fout:
+        for part in [t0_ctrl, t0_trt]:
+            with open(part, "r", encoding="utf-8") as f:
+                for line in f:
+                    row = json.loads(line)
+                    cid = row.get("custom_id")
+                    pred = _predict_from_custom_id(cid)
+                    payload = {
+                        "custom_id": cid,
+                        "response": {
+                            "id": f"local-sim-{hashlib.sha1(cid.encode()).hexdigest()[:12]}",
+                            "body": {
+                                "choices": [
+                                    {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": pred}}
+                                ],
+                                "usage": {"prompt_tokens": 32, "completion_tokens": max(1, len(pred.split()))}
+                            }
+                        }
+                    }
+                    fout.write(json.dumps(payload) + "\n")
+                    total += 1
+    print(f"simulate_results: ok ({total} responses)")
+
+    # Parse → Score → Stats → Costs
+    import subprocess, sys
+    subprocess.check_call([sys.executable, "-m", "fireworks.parse_results", "--results_jsonl", results_jsonl, "--out_csv", os.path.join(results_dir, "predictions.csv")])
+    print("parse_results: ok")
+    subprocess.check_call([sys.executable, "-m", "scoring.score_predictions", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", prepared_dir, "--out_dir", results_dir, "--config", tmp_cfg_path])
+    print("score_predictions: ok")
+    try:
+        subprocess.check_call([sys.executable, "-m", "scoring.stats", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--metric", "em", "--out_path", os.path.join(results_dir, "significance.json")])
+        print("stats: ok")
+    except Exception as e:
+        # Provide a graceful fallback when optional deps (e.g., scipy) are unavailable
+        sig_path = os.path.join(results_dir, "significance.json")
+        with open(sig_path, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        print(f"stats: skipped ({type(e).__name__}) → wrote empty significance.json")
+    subprocess.check_call([sys.executable, "-m", "scripts.summarize_costs", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--config", tmp_cfg_path, "--out_path", os.path.join(results_dir, "costs.json")])
+    print("summarize_costs: ok")
+
+    print(f"Smoke flow complete. Outputs in {results_dir}")
+
 
 def main():
     load_dotenv()
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config/eval_config.yaml")
-    ap.add_argument("--n", type=int, default=50, help="Number of items to run (per type)")
+    ap.add_argument("--mode", choices=["flow", "api"], default="flow", help="'flow' for offline full pipeline; 'api' to hit chat API")
+    # Flow mode options
+    ap.add_argument("--n", type=int, default=5, help="Number of items per split (flow mode)")
+    # API mode options
     ap.add_argument("--temp", type=float, default=0.0)
     ap.add_argument("--type", choices=["closed", "open", "both"], default="closed")
     ap.add_argument("--condition", choices=["control", "treatment", "both"], default="both")
     ap.add_argument("--out_dir", default="results/smoke")
     args = ap.parse_args()
 
+    if args.mode == "flow":
+        _flow_mode(args)
+        return
+
+    # API mode (previous behavior)
     if OpenAI is None:
         raise SystemExit("The 'openai' package is required. Please install requirements.txt")
 
@@ -342,5 +518,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

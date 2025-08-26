@@ -41,6 +41,8 @@ def format_temp_label(t: float) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config/eval_config.yaml")
+    ap.add_argument("--prompt_set", default=None, help="Name of prompt set in config.prompt_sets")
+    ap.add_argument("--temps", default=None, help="Comma-separated temperatures to build (override config)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -49,16 +51,30 @@ def main():
     batch_dir = cfg["paths"]["batch_inputs_dir"]
     os.makedirs(batch_dir, exist_ok=True)
 
-    ctrl_path = "config/prompts/control_system.txt"
-    trt_path = "config/prompts/treatment_system.txt"
+    # Determine prompt set
+    prompt_sets = cfg.get("prompt_sets") or {}
+    default_ps = cfg.get("default_prompt_set") or "default"
+    ps_name = (args.prompt_set or default_ps)
+    ps = prompt_sets.get(ps_name)
+    if not ps:
+        raise SystemExit(f"Unknown prompt set '{ps_name}'. Available: {', '.join(sorted(prompt_sets.keys()))}")
+    ctrl_path = ps.get("control")
+    trt_path = ps.get("treatment")
     if not os.path.isfile(ctrl_path) or not os.path.isfile(trt_path):
-        raise SystemExit("Missing prompts. Please add control and treatment prompts under config/prompts/.")
+        raise SystemExit("Missing prompts. Please add control and treatment prompts and reference them via config.prompt_sets.")
     control_system = open(ctrl_path, "r", encoding="utf-8").read().strip()
     treatment_system = open(trt_path, "r", encoding="utf-8").read().strip()
     closed_instr = open("config/task_instructions/closed_book.txt", "r", encoding="utf-8").read().strip()
     open_instr = open("config/task_instructions/open_book.txt", "r", encoding="utf-8").read().strip()
 
-    temps = cfg["temps"]
+    # Determine temperatures and validate against samples_per_item
+    if args.temps:
+        try:
+            temps = [float(t.strip()) for t in args.temps.split(",") if t.strip()]
+        except Exception:
+            raise SystemExit("--temps must be a comma-separated list of numbers, e.g., '0.2,0.7,1.0'")
+    else:
+        temps = cfg["temps"]
     samples_per_item = cfg["samples_per_item"]
 
     ob_rows = read_lines(os.path.join(prepared_dir, "open_book.jsonl"))
@@ -69,8 +85,11 @@ def main():
 
     for t in temps:
         t_str = format_temp_label(t)
-        out_control = os.path.join(batch_dir, f"t{t_str}_control.jsonl")
-        out_treat = os.path.join(batch_dir, f"t{t_str}_treatment.jsonl")
+        # Include prompt set in filenames only when multiple sets are defined to preserve backward compatibility
+        include_ps = len(prompt_sets) > 1 or (ps_name not in ("default", None))
+        suffix = f"_{ps_name}" if include_ps else ""
+        out_control = os.path.join(batch_dir, f"t{t_str}{suffix}_control.jsonl")
+        out_treat = os.path.join(batch_dir, f"t{t_str}{suffix}_treatment.jsonl")
         with open(out_control, "w", encoding="utf-8") as fc, open(out_treat, "w", encoding="utf-8") as ft:
             # Ensure per-file uniqueness of custom_id to satisfy Fireworks dataset validation
             seen_control: set[str] = set()

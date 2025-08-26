@@ -32,7 +32,7 @@ def process_results(results_jsonl: str, out_csv: str):
     fieldnames = ["custom_id","dataset","item_id","condition","temp","sample_index","type","request_id","finish_reason","response_text","prompt_tokens","completion_tokens","total_tokens"]
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     with open(out_csv, "w", encoding="utf-8", newline="") as fcsv:
-        w = csv.DictWriter(fcsv, fieldnames=fieldnames); w.writeheader()
+        w = csv.DictWriter(fcsv, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL, escapechar='\\'); w.writeheader()
         for row in iter_jsonl(results_jsonl):
             cid = row.get("custom_id") or row.get("customId")
             resp = row.get("response") or {}

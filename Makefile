@@ -29,4 +29,4 @@ report:
 eval:
 	$(PY) -m scripts.run_all
 smoke:
-	$(PY) -m scripts.smoke_test --config config/eval_config.yaml --n 50 --temp 0.0 --type both --condition both --out_dir results/smoke
+	$(PY) -m scripts.smoke_test --config config/eval_config.yaml --mode flow --n 2 --out_dir results/smoke

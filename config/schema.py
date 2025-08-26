@@ -21,6 +21,8 @@ class PathsModel(BaseModel):
     results_dir: str = Field(default="results")
     reports_dir: str = Field(default="reports")
     run_manifest: str = Field(default="results/run_manifest.json")
+    # Optional experiments root directory used by orchestrators
+    experiments_dir: str = Field(default="experiments")
 
 
 class PricingModel(BaseModel):
@@ -42,6 +44,41 @@ class MaxNewTokensModel(BaseModel):
     open_book: int = Field(default=1024)
 
 
+class PromptSetModel(BaseModel):
+    control: str
+    treatment: str
+
+
+class SweepModel(BaseModel):
+    models: Optional[List[str]] = None
+    prompt_sets: Optional[List[str]] = None
+    temps: Optional[List[float]] = None
+    top_p: Optional[List[float]] = None
+    top_k: Optional[List[int]] = None
+    max_new_tokens: Optional[Dict[str, List[int]]] = None
+
+    @field_validator("temps")
+    @classmethod
+    def _validate_sweep_temps(cls, v: Optional[List[float]]):  # type: ignore[override]
+        return None if v is None else [float(t) for t in v]
+
+
+class TrialModel(BaseModel):
+    id: Optional[str] = None
+    model: Optional[str] = None
+    model_id: Optional[str] = None
+    prompt_set: Optional[str] = None
+    temps: Optional[List[float]] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    max_new_tokens: Optional[MaxNewTokensModel] = None
+
+    @field_validator("temps")
+    @classmethod
+    def _validate_trial_temps(cls, v: Optional[List[float]]):  # type: ignore[override]
+        return None if v is None else [float(t) for t in v]
+
+
 class EvalConfigModel(BaseModel):
     model_id: str
     temps: List[float] = Field(default_factory=lambda: [0.0, 0.7])
@@ -55,6 +92,13 @@ class EvalConfigModel(BaseModel):
     pricing: PricingModel = Field(default_factory=PricingModel)
     use_batch_api: bool = True
     unsupported_threshold: float = Field(default=0.5)
+    # New optional fields for flexible experimentation
+    model_aliases: Dict[str, str] = Field(default_factory=dict)
+    models: Optional[List[float | str]] = None  # allow aliases or full ids
+    prompt_sets: Optional[Dict[str, PromptSetModel]] = None
+    default_prompt_set: Optional[str] = None
+    sweep: Optional[SweepModel] = None
+    trials: Optional[List[TrialModel]] = None
 
     @field_validator("samples_per_item")
     @classmethod
@@ -97,6 +141,29 @@ def load_config(path: str) -> dict:
     # but normalize any env vars or user home symbols
     for key in ("raw_dir", "prepared_dir", "batch_inputs_dir", "results_dir", "reports_dir"):
         cfg["paths"][key] = os.path.expanduser(os.path.expandvars(cfg["paths"][key]))
+    # Normalize optional experiments_dir for orchestrators
+    if cfg.get("paths", {}).get("experiments_dir"):
+        cfg["paths"]["experiments_dir"] = os.path.expanduser(os.path.expandvars(cfg["paths"]["experiments_dir"]))
+
+    # Backward-compatible default prompt set when not defined
+    if not cfg.get("prompt_sets"):
+        cfg["prompt_sets"] = {
+            "default": {
+                "control": "config/prompts/control_system.txt",
+                "treatment": "config/prompts/treatment_system.txt",
+            }
+        }
+        cfg["default_prompt_set"] = cfg.get("default_prompt_set") or "default"
+    else:
+        if not cfg.get("default_prompt_set"):
+            try:
+                first_key = sorted(list(cfg["prompt_sets"].keys()))[0]
+            except Exception:
+                first_key = "default"
+            cfg["default_prompt_set"] = first_key
+
+    # Normalize temps to floats
+    cfg["temps"] = [float(t) for t in (cfg.get("temps") or [])]
     return cfg
 
 
