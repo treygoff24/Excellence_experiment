@@ -161,6 +161,52 @@ def write_manifest(path: str, data: dict):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+def _split_jsonl_file(src_path: str, out_dir: str, base_prefix: str, parts: int) -> list[tuple[int, str]]:
+    """Split a JSONL file into N approximately equal parts.
+
+    Returns a list of (part_number, part_path). If parts <= 1, returns [(1, src_path)].
+    If part files already exist and are non-empty, reuse them.
+    """
+    parts = int(parts) if parts and int(parts) > 1 else 1
+    if parts <= 1:
+        return [(1, src_path)]
+    os.makedirs(out_dir, exist_ok=True)
+    # If splits already exist, reuse
+    existing: list[tuple[int, str]] = []
+    for i in range(1, parts + 1):
+        p = os.path.join(out_dir, f"{base_prefix}.p{i:02d}.jsonl")
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            existing.append((i, p))
+    if len(existing) == parts:
+        return existing
+    # Read all lines once and split
+    with open(src_path, "r", encoding="utf-8") as f:
+        lines = [ln for ln in f.readlines() if ln.strip()]
+    n = len(lines)
+    if n == 0:
+        # create empty part files
+        out_files: list[tuple[int, str]] = []
+        for i in range(1, parts + 1):
+            p = os.path.join(out_dir, f"{base_prefix}.p{i:02d}.jsonl")
+            open(p, "w", encoding="utf-8").close()
+            out_files.append((i, p))
+        return out_files
+    chunk = max(1, (n + parts - 1) // parts)
+    out_files: list[tuple[int, str]] = []
+    for i in range(parts):
+        start = i * chunk
+        end = min(n, (i + 1) * chunk)
+        if start >= n:
+            # still create an empty file for consistency
+            part_lines: list[str] = []
+        else:
+            part_lines = lines[start:end]
+        p = os.path.join(out_dir, f"{base_prefix}.p{i+1:02d}.jsonl")
+        with open(p, "w", encoding="utf-8") as out:
+            out.writelines(part_lines)
+        out_files.append((i + 1, p))
+    return out_files
 def main():
     load_dotenv()
     ap = argparse.ArgumentParser()
@@ -328,18 +374,17 @@ def main():
                 display_name = f"excellence-{ps_name}-t{t_str}-{cond}-{run_id}"
                 if not os.path.isfile(jsonl_path):
                     raise SystemExit(f"Missing input file: {jsonl_path}")
-                ds_name = display_name
-                dsid = create_dataset(ds_name, account_id)
-                base_no_ext, base_ext = os.path.splitext(os.path.basename(jsonl_path))
-                if not base_ext:
-                    base_ext = ".jsonl"
-                remote_fname = f"{base_no_ext}{base_ext}"
-                # upload_dataset_file automatically chooses multipart or signed URL
-                # flow based on size, enabling uploads of files >150MB.
-                upload_dataset_file(account_id, dsid, jsonl_path, filename=remote_fname)
-                trial_manifest["datasets"][f"t{t_str}_{cond}"] = dsid
 
-                # Enforce Fireworks batch concurrency via QueueManager (single-job queue)
+                # Split the dataset into up to max_concurrent parts for parallel jobs
+                base_prefix = f"t{t_str}{suffix}_{cond}"
+                part_files = _split_jsonl_file(
+                    jsonl_path,
+                    cfg["paths"]["batch_inputs_dir"],
+                    base_prefix,
+                    parts=int(args.max_concurrent_jobs) if args.max_concurrent_jobs else 4,
+                )
+
+                # Enforce Fireworks batch concurrency via QueueManager
                 queue = QueueManager(
                     account_id=account_id,
                     model_id=model_id,
@@ -350,12 +395,21 @@ def main():
                     condition=cond,
                     run_id=run_id,
                 )
-                queue.add_job(1, "", dsid)
+                # Upload each part as a separate dataset and enqueue a job
+                dsids_for_cond: list[str] = []
+                for part_number, part_path in part_files:
+                    ds_name = f"{display_name}-p{part_number:02d}"
+                    dsid = create_dataset(ds_name, account_id)
+                    remote_fname = os.path.basename(part_path)
+                    upload_dataset_file(account_id, dsid, part_path, filename=remote_fname)
+                    dsids_for_cond.append(dsid)
+                    queue.add_job(part_number, "", dsid)
+                trial_manifest["datasets"][f"t{t_str}_{cond}"] = dsids_for_cond
                 queue.run_queue(results_dir)
                 # Persist the job name (if available) for bookkeeping
                 jnames = [j.job_name for j in queue.jobs if j.job_name]
                 if jnames:
-                    trial_manifest["jobs"][f"t{t_str}_{cond}"] = jnames[0]
+                    trial_manifest["jobs"][f"t{t_str}_{cond}"] = jnames
 
         # Write per-trial manifest
         write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
