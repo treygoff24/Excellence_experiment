@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 from .upload_dataset import create_dataset, upload_dataset_file
 from .start_batch_job import create_batch_job
-from .poll_and_download import poll_until_done, get_dataset, try_download_external_url
+from .poll_and_download import poll_until_done, get_dataset, try_download_external_url, get_batch_job
 from config.schema import load_config
 
 
@@ -103,33 +103,30 @@ class QueueManager:
             return False
     
     def check_running_jobs(self) -> List[JobInfo]:
-        """Check status of running jobs and return completed ones"""
-        completed = []
-        
+        """Check status of running jobs and return completed ones.
+
+        Uses a single GET (no loop) to avoid chatty output and busy-waiting.
+        """
+        completed: List[JobInfo] = []
         for job_name, job in list(self.running_jobs.items()):
             try:
-                job_result = poll_until_done(self.account_id, job_name, poll_seconds=0)  # Just check once
-                
+                job_result = get_batch_job(self.account_id, job_name)
                 job_state = job_result.get("state")
                 if job_state in ("COMPLETED", "FAILED", "EXPIRED"):
                     # Job finished
                     del self.running_jobs[job_name]
                     job.complete_time = datetime.now()
-                    
                     if job_state == "COMPLETED":
                         job.status = "completed"
                         print(f"✓ Job P{job.part_number:02d} completed")
                     else:
                         job.status = "failed"
                         print(f"✗ Job P{job.part_number:02d} failed: {job_state}")
-                    
                     completed.append(job)
                 else:
                     job.status = "running"
-                    
             except Exception as e:
                 print(f"Warning: Error checking job P{job.part_number:02d}: {e}")
-        
         return completed
     
     def download_results(self, job: JobInfo, results_dir: str) -> bool:

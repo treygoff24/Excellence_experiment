@@ -185,14 +185,22 @@ def _combine_jsonls(root_dir: str, out_path: str) -> int:
                 except Exception:
                     continue
     return lines
-def poll_until_done(account_id: str, job_name: str, poll_seconds: int=15):
+def poll_until_done(account_id: str, job_name: str, poll_seconds: int = 15):
+    """Poll a batch job until terminal state.
+
+    - Prints only on state change to reduce log spam.
+    - Sleeps `poll_seconds` between checks (default: 15s).
+    """
+    last_state = None
     while True:
         job = get_batch_job(account_id, job_name)
         state = job.get("state")
-        print(f"[poll] job {job_name} -> {state}")
-        if state in ("COMPLETED","FAILED","EXPIRED"):
+        if state != last_state:
+            print(f"[poll] job {job_name} -> {state}")
+            last_state = state
+        if state in ("COMPLETED", "FAILED", "EXPIRED"):
             return job
-        time.sleep(poll_seconds)
+        time.sleep(max(1, int(poll_seconds)))
 def main():
     load_dotenv()
     ap = argparse.ArgumentParser()

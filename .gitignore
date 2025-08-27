@@ -33,8 +33,11 @@ secrets.*
 *.pfx
 
 # Project-specific: generated artifacts and large data
+# Ignore results/reports globally (any depth)
 results/
 reports/
+**/results/
+**/reports/
 # Keep the markdown report file if you want to track it; by default ignore entire reports dir
 # If you want to keep report.md, comment the reports/ line above and ignore only large assets
 
@@ -60,4 +63,3 @@ AI_experiment_plan.txt
 
 # IDE-specific developer guidance
 WARP.md
-

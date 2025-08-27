@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os, sys, json, hashlib, argparse, subprocess, re
+import yaml
 import csv
 import tarfile, zipfile, gzip, shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,6 +10,20 @@ from fireworks.upload_dataset import create_dataset, upload_dataset_file
 from fireworks.poll_and_download import poll_until_done, get_dataset, try_download_external_url
 from fireworks.batch_queue_manager import QueueManager
 from config.schema import load_config
+
+def _split_list_arg(val) -> list[str]:
+    """Normalize an argparse value into a flat list.
+
+    Accepts None, a comma-separated string, or a list of strings (space-separated usage).
+    """
+    if val is None:
+        return []
+    if isinstance(val, (list, tuple)):
+        parts: list[str] = []
+        for x in val:
+            parts.extend(p.strip() for p in str(x).split(",") if p and p.strip())
+        return parts
+    return [p.strip() for p in str(val).split(",") if p and p.strip()]
 def _format_temp_label(t: float) -> str:
     s = f"{float(t):.1f}"
     return "0" if s == "0.0" else s.replace(".", "")
@@ -57,23 +72,19 @@ def _trial_slug(model_id: str, prompt_set: str, top_p: float | None, top_k: int 
 
 def _expand_trials(cfg: dict, args) -> list[dict]:
     aliases = cfg.get("model_aliases", {}) or {}
-    cli_models = []
-    if getattr(args, "models", None):
-        cli_models = [m.strip() for m in args.models.split(",") if m.strip()]
+    cli_models = _split_list_arg(getattr(args, "models", None))
     cfg_models = cfg.get("models") or []
     base_models = cli_models or cfg_models or [cfg["model_id"]]
     models_full = [_resolve_model_id(m, aliases) for m in base_models]
 
-    cli_ps = []
-    if getattr(args, "prompt_sets", None):
-        cli_ps = [p.strip() for p in args.prompt_sets.split(",") if p.strip()]
+    cli_ps = _split_list_arg(getattr(args, "prompt_sets", None))
     ps_cfg = cfg.get("prompt_sets") or {}
     default_ps = cfg.get("default_prompt_set") or (sorted(list(ps_cfg.keys()))[0] if ps_cfg else "default")
     base_ps = cli_ps or [default_ps]
 
     def _temps_from_arg_or_cfg():
         if getattr(args, "temps", None):
-            return [float(t.strip()) for t in args.temps.split(",") if t.strip()]
+            return [float(t) for t in _split_list_arg(args.temps)]
         return cfg.get("temps") or [0.0]
 
     base_temps = _temps_from_arg_or_cfg()
@@ -161,9 +172,9 @@ def main():
     ap.add_argument("--skip_batch", action="store_true")
     ap.add_argument("--run_id", help="Custom run ID (auto-generated if not provided)")
     # Overrides and planning
-    ap.add_argument("--models", help="Comma-separated models or aliases (overrides config models)")
-    ap.add_argument("--prompt_sets", help="Comma-separated prompt set names")
-    ap.add_argument("--temps", help="Comma-separated temperatures override")
+    ap.add_argument("--models", nargs="+", help="Models or aliases (space or comma separated)")
+    ap.add_argument("--prompt_sets", nargs="+", help="Prompt set names (space or comma separated)")
+    ap.add_argument("--temps", nargs="+", help="Temperatures override (space or comma separated)")
     ap.add_argument("--plan_only", action="store_true", help="Show expanded trial plan and exit")
     ap.add_argument("--archive", action="store_true", help="Archive results after completion")
     ap.add_argument("--max_concurrent_jobs", type=int, default=4, help="Max concurrent Fireworks batch jobs (default: 4)")
@@ -186,6 +197,16 @@ def main():
         run_root = None
         multi_manifest_path = cfg["paths"]["run_manifest"]
 
+    # When using experiments dir, persist an effective config so subprocesses see updated paths
+    effective_config_path = args.config
+    if use_exp_root:
+        try:
+            effective_config_path = os.path.join(run_root, "effective_config.yaml")
+            with open(effective_config_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(cfg, f, sort_keys=False)
+        except Exception as e:
+            print(f"WARNING: Failed to write effective config: {e}. Using original config.")
+
     # Plan-only mode prints the trial matrix then exits
     if args.plan_only:
         plan = {"created_utc": datetime.utcnow().isoformat() + "Z", "run_id": run_id, "num_trials": len(trials), "trials": trials}
@@ -194,7 +215,7 @@ def main():
 
     ensure_dirs(cfg)
     if not args.skip_prepare:
-        run_cmd([sys.executable, "-m", "scripts.prepare_data", "--config", args.config])
+        run_cmd([sys.executable, "-m", "scripts.prepare_data", "--config", effective_config_path])
     if not args.skip_build:
         # Build once per prompt set with union of temps across trials
         temps_per_ps: dict[str, set[float]] = {}
@@ -205,7 +226,7 @@ def main():
             temps_per_ps.setdefault(psn, set()).update(float(t) for t in (tr.get("temps") or cfg.get("temps") or [0.0]))
         for psn, tset in temps_per_ps.items():
             temps_arg = ",".join(str(t) for t in sorted(tset))
-            run_cmd([sys.executable, "-m", "scripts.build_batches", "--config", args.config, "--prompt_set", psn, "--temps", temps_arg])
+            run_cmd([sys.executable, "-m", "scripts.build_batches", "--config", effective_config_path, "--prompt_set", psn, "--temps", temps_arg])
     if args.skip_batch:
         # Write a minimal multi-trial plan and exit
         plan = {"created_utc": datetime.utcnow().isoformat() + "Z", "run_id": run_id, "num_trials": len(trials), "trials": trials}
@@ -521,31 +542,31 @@ def main():
         # Parse predictions → CSV
         run_cmd([sys.executable, "-m", "fireworks.parse_results", "--results_jsonl", combined_path, "--out_csv", os.path.join(results_dir, "predictions.csv")])
         # Score per-item
-        run_cmd([sys.executable, "-m", "scoring.score_predictions", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--out_dir", results_dir, "--config", args.config])
+        run_cmd([sys.executable, "-m", "scoring.score_predictions", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--out_dir", results_dir, "--config", effective_config_path])
         # Stats
-        run_cmd([sys.executable, "-m", "scoring.stats", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", args.config, "--out_path", os.path.join(results_dir, "significance.json")])
+        run_cmd([sys.executable, "-m", "scoring.stats", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "significance.json")])
         # Unsupported sensitivity analysis (Phase 4)
         try:
-            run_cmd([sys.executable, "-m", "scripts.unsupported_sensitivity", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", args.config, "--out_path", os.path.join(results_dir, "unsupported_sensitivity.json")])
+            run_cmd([sys.executable, "-m", "scripts.unsupported_sensitivity", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", effective_config_path, "--out_path", os.path.join(results_dir, "unsupported_sensitivity.json")])
         except Exception:
             pass
         # Mixed-effects robustness models (optional)
         try:
-            run_cmd([sys.executable, "-m", "scripts.mixed_effects", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", args.config, "--out_path", os.path.join(results_dir, "mixed_models.json")])
+            run_cmd([sys.executable, "-m", "scripts.mixed_effects", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", effective_config_path, "--out_path", os.path.join(results_dir, "mixed_models.json")])
         except Exception:
             pass
         # Power/MDE analysis (optional)
         try:
-            run_cmd([sys.executable, "-m", "scripts.power_analysis", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", args.config, "--out_path", os.path.join(results_dir, "power_analysis.json")])
+            run_cmd([sys.executable, "-m", "scripts.power_analysis", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", effective_config_path, "--out_path", os.path.join(results_dir, "power_analysis.json")])
         except Exception:
             pass
         # Cost-effectiveness summary (optional)
         try:
-            run_cmd([sys.executable, "-m", "scripts.cost_effectiveness", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", args.config, "--out_path", os.path.join(results_dir, "cost_effectiveness.json")])
+            run_cmd([sys.executable, "-m", "scripts.cost_effectiveness", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "cost_effectiveness.json")])
         except Exception:
             pass
         # Costs
-        run_cmd([sys.executable, "-m", "scripts.summarize_costs", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--config", args.config, "--out_path", os.path.join(results_dir, "costs.json")])
+        run_cmd([sys.executable, "-m", "scripts.summarize_costs", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "costs.json")])
         # Generate a concise Markdown report
         report_path = os.path.join(reports_dir, "report.md")
 

@@ -1,7 +1,7 @@
 model_id: "accounts/fireworks/models/gpt-oss-120b"
-temps: [1.0]
+temps: [0.0]
 samples_per_item:
-  "1.0": 10
+  "0.0": 1
 max_new_tokens:
   closed_book: 1024
   open_book: 1024
@@ -10,7 +10,7 @@ top_k: 50
 stop: []
 sizes:
   closed_book_max_items: null
-  open_book_max_items: null
+  open_book_max_items: 3000
   triviaqa_max_items: null
   nq_open_max_items: null
   squad_v2_max_items: null
@@ -42,3 +42,43 @@ unsupported:
   strategy: overlap
   threshold: 0.5
   min_token_overlap: 0.6
+prompt_sets:
+  default:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/treatment_system.txt
+  operational_only:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/operational_only_system.md
+  structure_without_content:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/structure_without_content_system.md
+  philosophy_without_instructions:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/philosophy_without_instructions_system.md
+  length_matched_random:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/length_matched_random_system.md
+  length_matched_best_practices:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/length_matched_best_practices_system.md
+  excellence_25_percent:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/excellence_25_percent_system.md
+  excellence_50_percent:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/excellence_50_percent_system.md
+  excellence_75_percent:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/excellence_75_percent_system.md
+default_prompt_set: default
+sweep:
+  prompt_sets:
+    - operational_only
+    - structure_without_content
+    - philosophy_without_instructions
+    - length_matched_random
+    - length_matched_best_practices
+    - excellence_25_percent
+    - excellence_50_percent
+    - excellence_75_percent
+  temps: [0.0]
