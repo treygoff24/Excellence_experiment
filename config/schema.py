@@ -92,6 +92,56 @@ class EvalConfigModel(BaseModel):
     pricing: PricingModel = Field(default_factory=PricingModel)
     use_batch_api: bool = True
     unsupported_threshold: float = Field(default=0.5)
+    class UnsupportedModel(BaseModel):
+        strategy: str = Field(default="baseline")  # baseline|overlap|nli
+        threshold: float = Field(default=0.5)
+        min_token_overlap: float = Field(default=0.6)
+        nli_model: str | None = None
+
+        @field_validator("threshold", "min_token_overlap")
+        @classmethod
+        def _validate_ufloats(cls, v: float):  # type: ignore[override]
+            v = float(v)
+            if not (0.0 <= v <= 1.0):
+                raise ValueError("unsupported.* values must be in [0,1]")
+            return v
+
+    unsupported: UnsupportedModel = Field(default_factory=UnsupportedModel)
+    # Statistical settings
+    class StatsModel(BaseModel):
+        bootstrap_samples: int = Field(default=5000)
+        permutation_samples: int = Field(default=5000)
+        random_seed: int = Field(default=1337)
+        enable_permutation: bool = Field(default=True)
+        enable_fdr: bool = Field(default=True)
+        risk_thresholds: List[float] = Field(default_factory=lambda: [0.0, 0.25, 0.5, 0.75, 1.0])
+        tost_alpha: float = Field(default=0.05)
+        tost_margins: Dict[str, float] = Field(default_factory=lambda: {"em": 0.01, "f1": 0.01})
+
+        @field_validator("bootstrap_samples", "permutation_samples")
+        @classmethod
+        def _validate_positive(cls, v: int):  # type: ignore[override]
+            if int(v) <= 0:
+                raise ValueError("samples must be positive")
+            return int(v)
+
+        @field_validator("risk_thresholds")
+        @classmethod
+        def _validate_thresholds(cls, v: List[float]):  # type: ignore[override]
+            arr = sorted(max(0.0, min(1.0, float(x))) for x in (v or []))
+            if not arr:
+                arr = [0.0, 0.5, 1.0]
+            return arr
+
+        @field_validator("tost_alpha")
+        @classmethod
+        def _validate_alpha(cls, v: float):  # type: ignore[override]
+            v = float(v)
+            if not (0 < v < 1):
+                raise ValueError("tost_alpha must be in (0,1)")
+            return v
+
+    stats: StatsModel = Field(default_factory=StatsModel)
     # New optional fields for flexible experimentation
     model_aliases: Dict[str, str] = Field(default_factory=dict)
     models: Optional[List[float | str]] = None  # allow aliases or full ids
@@ -164,6 +214,10 @@ def load_config(path: str) -> dict:
 
     # Normalize temps to floats
     cfg["temps"] = [float(t) for t in (cfg.get("temps") or [])]
+    # Backward compatibility: if top-level unsupported_threshold set and unsupported.threshold missing, propagate
+    try:
+        if cfg.get("unsupported_threshold") is not None and not cfg.get("unsupported", {}).get("threshold"):
+            cfg["unsupported"]["threshold"] = float(cfg.get("unsupported_threshold"))
+    except Exception:
+        pass
     return cfg
-
-

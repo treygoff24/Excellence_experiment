@@ -523,7 +523,27 @@ def main():
         # Score per-item
         run_cmd([sys.executable, "-m", "scoring.score_predictions", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--out_dir", results_dir, "--config", args.config])
         # Stats
-        run_cmd([sys.executable, "-m", "scoring.stats", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--metric", "em", "--out_path", os.path.join(results_dir, "significance.json")])
+        run_cmd([sys.executable, "-m", "scoring.stats", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", args.config, "--out_path", os.path.join(results_dir, "significance.json")])
+        # Unsupported sensitivity analysis (Phase 4)
+        try:
+            run_cmd([sys.executable, "-m", "scripts.unsupported_sensitivity", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", args.config, "--out_path", os.path.join(results_dir, "unsupported_sensitivity.json")])
+        except Exception:
+            pass
+        # Mixed-effects robustness models (optional)
+        try:
+            run_cmd([sys.executable, "-m", "scripts.mixed_effects", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", args.config, "--out_path", os.path.join(results_dir, "mixed_models.json")])
+        except Exception:
+            pass
+        # Power/MDE analysis (optional)
+        try:
+            run_cmd([sys.executable, "-m", "scripts.power_analysis", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", args.config, "--out_path", os.path.join(results_dir, "power_analysis.json")])
+        except Exception:
+            pass
+        # Cost-effectiveness summary (optional)
+        try:
+            run_cmd([sys.executable, "-m", "scripts.cost_effectiveness", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", args.config, "--out_path", os.path.join(results_dir, "cost_effectiveness.json")])
+        except Exception:
+            pass
         # Costs
         run_cmd([sys.executable, "-m", "scripts.summarize_costs", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--config", args.config, "--out_path", os.path.join(results_dir, "costs.json")])
         # Generate a concise Markdown report

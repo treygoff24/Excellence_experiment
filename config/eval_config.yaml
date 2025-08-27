@@ -27,3 +27,18 @@ pricing:
   output_per_million: 0.60
   batch_discount: 0.5
 use_batch_api: true
+stats:
+  bootstrap_samples: 5000
+  permutation_samples: 5000
+  random_seed: 1337
+  enable_permutation: true
+  enable_fdr: true
+  risk_thresholds: [0.0, 0.25, 0.5, 0.75, 1.0]
+  tost_alpha: 0.05
+  tost_margins:
+    em: 0.01
+    f1: 0.01
+unsupported:
+  strategy: overlap
+  threshold: 0.5
+  min_token_overlap: 0.6

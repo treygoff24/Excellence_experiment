@@ -23,7 +23,7 @@ parse:
 score:
 	$(PY) -m scoring.score_predictions --pred_csv results/predictions.csv --prepared_dir data/prepared --out_dir results
 stats:
-	$(PY) -m scoring.stats --per_item_csv results/per_item_scores.csv --metric em --out_path results/significance.json
+	$(PY) -m scoring.stats --per_item_csv results/per_item_scores.csv --config config/eval_config.yaml --out_path results/significance.json
 report:
 	$(PY) -m scripts.summarize_costs --pred_csv results/predictions.csv --config config/eval_config.yaml --out_path results/costs.json
 eval:

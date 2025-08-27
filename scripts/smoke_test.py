@@ -197,7 +197,7 @@ def _flow_mode(args) -> None:
     subprocess.check_call([sys.executable, "-m", "scoring.score_predictions", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", prepared_dir, "--out_dir", results_dir, "--config", tmp_cfg_path])
     print("score_predictions: ok")
     try:
-        subprocess.check_call([sys.executable, "-m", "scoring.stats", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--metric", "em", "--out_path", os.path.join(results_dir, "significance.json")])
+        subprocess.check_call([sys.executable, "-m", "scoring.stats", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", args.config, "--out_path", os.path.join(results_dir, "significance.json")])
         print("stats: ok")
     except Exception as e:
         # Provide a graceful fallback when optional deps (e.g., scipy) are unavailable
@@ -205,6 +205,30 @@ def _flow_mode(args) -> None:
         with open(sig_path, "w", encoding="utf-8") as f:
             json.dump({}, f)
         print(f"stats: skipped ({type(e).__name__}) → wrote empty significance.json")
+    # Unsupported sensitivity (optional)
+    try:
+        subprocess.check_call([sys.executable, "-m", "scripts.unsupported_sensitivity", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", prepared_dir, "--config", tmp_cfg_path, "--out_path", os.path.join(results_dir, "unsupported_sensitivity.json")])
+        print("unsupported_sensitivity: ok")
+    except Exception as e:
+        print(f"unsupported_sensitivity: skipped ({type(e).__name__})")
+    # Mixed-effects (optional)
+    try:
+        subprocess.check_call([sys.executable, "-m", "scripts.mixed_effects", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", prepared_dir, "--config", tmp_cfg_path, "--out_path", os.path.join(results_dir, "mixed_models.json")])
+        print("mixed_effects: ok")
+    except Exception as e:
+        print(f"mixed_effects: skipped ({type(e).__name__})")
+    # Power/MDE (optional)
+    try:
+        subprocess.check_call([sys.executable, "-m", "scripts.power_analysis", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--prepared_dir", prepared_dir, "--config", tmp_cfg_path, "--out_path", os.path.join(results_dir, "power_analysis.json")])
+        print("power_analysis: ok")
+    except Exception as e:
+        print(f"power_analysis: skipped ({type(e).__name__})")
+    # Cost-effectiveness (optional)
+    try:
+        subprocess.check_call([sys.executable, "-m", "scripts.cost_effectiveness", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", tmp_cfg_path, "--out_path", os.path.join(results_dir, "cost_effectiveness.json")])
+        print("cost_effectiveness: ok")
+    except Exception as e:
+        print(f"cost_effectiveness: skipped ({type(e).__name__})")
     subprocess.check_call([sys.executable, "-m", "scripts.summarize_costs", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--config", tmp_cfg_path, "--out_path", os.path.join(results_dir, "costs.json")])
     print("summarize_costs: ok")
 

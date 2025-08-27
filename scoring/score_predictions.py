@@ -2,6 +2,7 @@ from __future__ import annotations
 import os, json, csv, argparse
 from collections import defaultdict
 from . import squad_v2, triviaqa, nq_open
+from .unsupported import is_unsupported
 from config.schema import load_config
 def load_jsonl(path: str):
     with open(path, "r", encoding="utf-8") as f:
@@ -38,7 +39,11 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     cfg = load_config(args.config)
-    unsupported_threshold = float(cfg.get("unsupported_threshold", 0.5))
+    # Unsupported detection settings
+    uns_cfg = (cfg.get("unsupported") or {})
+    unsupported_threshold = float(uns_cfg.get("threshold", cfg.get("unsupported_threshold", 0.5)))
+    unsupported_strategy = (uns_cfg.get("strategy") or "baseline").lower()
+    unsupported_params = {"min_token_overlap": float(uns_cfg.get("min_token_overlap", 0.6))}
     canon = load_canonical(args.prepared_dir)
     bucket = defaultdict(lambda: defaultdict(list))
     abst_bucket = defaultdict(list)
@@ -51,13 +56,17 @@ def main():
         if typ == "open":
             ex = canon["open"][key_item]
             score = squad_v2.score_item(pred, ex["answers"], ex["is_unanswerable"])
-            from .normalize import normalize_answer
-            ctx = normalize_answer(ex["context"]); pt = normalize_answer(pred)
-            # Unsupported claim heuristic: penalize when confident non-abstention and
-            # predicted content is not a substring of context by normalized tokens.
-            unsupported = 0.0
-            if (score["abstained"] <= (1.0 - unsupported_threshold)) and pt and (pt not in ctx):
-                unsupported = 1.0
+            # Improved unsupported detection
+            unsupported = float(
+                is_unsupported(
+                    pred,
+                    ex["context"],
+                    abstained=score.get("abstained", 0.0),
+                    strategy=unsupported_strategy,
+                    threshold=unsupported_threshold,
+                    params=unsupported_params,
+                )
+            )
             bucket[key]["em"].append(score["em"]); bucket[key]["f1"].append(score["f1"])
             abst_bucket[key].append(score["abstained"]); false_ans_bucket[key].append(score["false_answer"]); unsupported_bucket[key].append(unsupported)
         else:

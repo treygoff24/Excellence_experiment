@@ -170,15 +170,198 @@ def write_report(cfg: dict, manifest: dict, means: dict, significance: dict, cos
                     if ci_f1_ctrl or ci_f1_trt:
                         lines.append(f"- F1 95% CI — Control: {fmt_ci(ci_f1_ctrl)}; Treatment: {fmt_ci(ci_f1_trt)}")
         # Significance per temp
-        s = significance.get(str(float(temp))) or significance.get(float(temp)) or {}
-        if s:
+        sig = significance
+        # Support schema v2 {results: {"1.0": {open:{...}, closed:{...}}}} and legacy keyed by temp
+        results_v2 = sig.get("results") if isinstance(sig, dict) else None
+        if results_v2:
+            tkey = f"{float(temp):.1f}"
+            s_obj = results_v2.get(tkey, {}) if isinstance(results_v2, dict) else {}
+            if s_obj:
+                lines.append("")
+                lines.append("### Significance")
+                lines.append("")
+                for typ in ("closed", "open"):
+                    if typ not in s_obj:
+                        continue
+                    lines.append(f"- {typ.capitalize()}-book:")
+                    mcn = s_obj[typ].get("mcnemar", {})
+                    or_part = ""
+                    try:
+                        or_est = mcn.get("odds_ratio")
+                        or_ci = mcn.get("or_ci_95") or [None, None]
+                        if or_est is not None and or_ci:
+                            or_part = f", OR={or_est:.3f} CI95=[{or_ci[0]}, {or_ci[1]}]"
+                    except Exception:
+                        pass
+                    qv = mcn.get("q_value")
+                    q_part = f", q={qv:.4f}" if isinstance(qv, (int, float)) else ""
+                    lines.append(f"  - McNemar: b={mcn.get('b')}, c={mcn.get('c')}, p_exact={mcn.get('p_exact')}{or_part}{q_part}")
+                    # Deltas with CI
+                    met = s_obj[typ].get("metrics", {})
+                    if met:
+                        lines.append("  - Deltas (Treatment − Control) with 95% CI:")
+                        order = ["em", "f1", "abstain_rate", "false_answer_rate", "unsupported_rate"]
+                        for k in order:
+                            if k not in met:
+                                continue
+                            try:
+                                dm = float(met[k].get("delta_mean", 0.0))
+                            except Exception:
+                                dm = 0.0
+                            ci = met[k].get("ci_95") or [None, None]
+                            qv = (met[k].get("wilcoxon", {}) or {}).get("q_value")
+                            q_part = f", q={qv:.4f}" if isinstance(qv, (int, float)) else ""
+                            lines.append(f"    - {k}: Δ={dm:+.4f} CI95=[{ci[0]}, {ci[1]}]{q_part}")
+                    # Selective risk summary
+                    sel = s_obj[typ].get("selective_risk", {})
+                    if sel:
+                        aurc = sel.get("aurc", {})
+                        if aurc:
+                            lines.append(
+                                f"  - Risk–Coverage AURC: Control={aurc.get('control')}, Treatment={aurc.get('treatment')}"
+                            )
+                        pts = sel.get("points", {})
+                        if pts:
+                            ctrl_pts = pts.get("control") or []
+                            trt_pts = pts.get("treatment") or []
+                            if ctrl_pts and trt_pts:
+                                lines.append("  - Risk–Coverage points (threshold, coverage, risk):")
+                                def _fmt(pt):
+                                    return f"(τ={pt.get('threshold')}, cov={pt.get('coverage')}, risk={pt.get('risk')})"
+                                lines.append(
+                                    "    - Control: " + ", ".join(_fmt(p) for p in ctrl_pts)
+                                )
+                                lines.append(
+                                    "    - Treatment: " + ", ".join(_fmt(p) for p in trt_pts)
+                                )
+                    # TOST non-inferiority
+                    tost = s_obj[typ].get("tost", {})
+                    if tost:
+                        lines.append("  - Non-inferiority (TOST):")
+                        for key in ("em", "f1"):
+                            if key in tost:
+                                ti = tost[key]
+                                lines.append(
+                                    f"    - {key.upper()}: margin={ti.get('margin')}, p={ti.get('p_value')}, non_inferior={ti.get('non_inferior')} (Δ={ti.get('mean_delta'):+.4f}, CI95=[{ti.get('ci_95',[None,None])[0]}, {ti.get('ci_95',[None,None])[1]}])"
+                                )
+                # Subgroups by dataset
+                for typ in ("closed", "open"):
+                    if typ not in s_obj:
+                        continue
+                    sub = (s_obj.get(typ, {}) or {}).get("subgroups", {})
+                    ds = (sub.get("dataset") or {}) if isinstance(sub, dict) else {}
+                if ds:
+                    lines.append(f"  - Subgroups ({typ}):")
+                    for ds_name, ds_block in ds.items():
+                        met = ds_block.get("metrics", {})
+                        em = met.get("em", {})
+                        ci = em.get("ci_95") or [None, None]
+                        dm = em.get("delta_mean", 0.0)
+                        qv = (em.get("wilcoxon", {}) or {}).get("q_value")
+                        q_part = f", q={qv:.4f}" if isinstance(qv, (int, float)) else ""
+                        lines.append(f"    - {ds_name}: EM Δ={dm:+.4f} CI95=[{ci[0]}, {ci[1]}]{q_part}")
+        # Unsupported sensitivity (optional)
+        sens_path = os.path.join(os.path.dirname(out_path).replace("reports", "results"), "unsupported_sensitivity.json")
+        try:
+            with open(sens_path, "r", encoding="utf-8") as f:
+                sens = json.load(f)
+        except Exception:
+            sens = None
+        if sens and isinstance(sens, dict):
             lines.append("")
-            lines.append("### Significance")
+            lines.append("### Unsupported Sensitivity")
             lines.append("")
-            m = s.get("mcnemar", {})
-            w = s.get("wilcoxon", {})
-            lines.append(f"- McNemar: b={m.get('b')}, c={m.get('c')}, p={m.get('p_value')}")
-            lines.append(f"- Wilcoxon: W={w.get('W')}, p={w.get('p_value')}")
+            res = sens.get("results", {}) or {}
+            tkey = f"{float(temp):.1f}"
+            if tkey in res:
+                lines.append("- Δ unsupported_rate across thresholds (Treatment − Control):")
+                for thr_s, obj in sorted(res.get(tkey, {}).items(), key=lambda kv: float(kv[0])):
+                    dm = obj.get("delta_mean", 0.0)
+                    ci = obj.get("ci_95") or [None, None]
+                    lines.append(f"  - τ={thr_s}: Δ={dm:+.4f} CI95=[{ci[0]}, {ci[1]}]")
+        # Power/MDE (optional)
+        power_path = os.path.join(os.path.dirname(out_path).replace("reports", "results"), "power_analysis.json")
+        try:
+            with open(power_path, "r", encoding="utf-8") as f:
+                pwr = json.load(f)
+        except Exception:
+            pwr = None
+        if pwr and isinstance(pwr, dict):
+            lines.append("")
+            lines.append("### Power / MDE (Primary Endpoint)")
+            lines.append("")
+            lines.append(f"- alpha={pwr.get('alpha')}, power={pwr.get('power')}, metric={pwr.get('metric')}")
+            tkey = f"{float(temp):.1f}"
+            res = (pwr.get("results") or {}).get(tkey)
+            if res:
+                lines.append(f"- @T={tkey}: n_items={res.get('n_items')}, sd_delta={res.get('sd_delta')}")
+                lines.append(f"  - MDE (two-sided): {res.get('mde')}")
+                rn = res.get("required_n_for_target", {}) or {}
+                if rn:
+                    pretty = ", ".join(f"Δ={k} → N={v}" for k, v in sorted(rn.items(), key=lambda kv: float(kv[0])))
+                    lines.append(f"  - Required N for targets: {pretty}")
+        # Mixed-effects / GEE robustness (optional)
+        mixed_path = os.path.join(os.path.dirname(out_path).replace("reports", "results"), "mixed_models.json")
+        try:
+            with open(mixed_path, "r", encoding="utf-8") as f:
+                mixed = json.load(f)
+        except Exception:
+            mixed = None
+        if mixed and isinstance(mixed, dict):
+            lines.append("")
+            lines.append("### Mixed-Effects (Robustness)")
+            lines.append("")
+            if mixed.get("status") == "unavailable":
+                reason = mixed.get('reason') or ((mixed.get('models') or {}).get('reason') if isinstance(mixed.get('models'), dict) else None)
+                lines.append(f"- Skipped: {reason}")
+            else:
+                m = mixed.get("models", {}) or mixed
+                logit = m.get("logistic_binary_correct", {})
+                if logit:
+                    lines.append("- Logistic (binary_correct via GEE):")
+                    or_map = logit.get("odds_ratio", {}) or {}
+                    or_ci = logit.get("or_ci", {}) or {}
+                    key = "C(condition)[T.treatment]"
+                    if key in or_map:
+                        ci = or_ci.get(key) or [None, None]
+                        lines.append(f"  - Treatment OR={or_map.get(key):.3f} CI95=[{ci[0]}, {ci[1]}]")
+                lin = m.get("linear_f1_open", {})
+                if lin:
+                    lines.append("- Linear (F1, open-book):")
+                    params = lin.get("params", {}) or {}
+                    ci_all = lin.get("conf_int", {}) or {}
+                    key = "C(condition)[T.treatment]"
+                    if key in params:
+                        ci = ci_all.get(key) or [None, None]
+                        lines.append(f"  - Treatment Δ={params.get(key):+.4f} CI95=[{ci[0]}, {ci[1]}]")
+        # Cost-effectiveness (optional)
+        ce_path = os.path.join(os.path.dirname(out_path).replace("reports", "results"), "cost_effectiveness.json")
+        try:
+            with open(ce_path, "r", encoding="utf-8") as f:
+                ce = json.load(f)
+        except Exception:
+            ce = None
+        if ce and isinstance(ce, dict):
+            lines.append("")
+            lines.append("### Cost-Effectiveness")
+            lines.append("")
+            tkey = f"{float(temp):.1f}"
+            row = (ce.get("results") or {}).get(tkey)
+            if row:
+                lines.append(f"- Δ Cost (Treatment − Control): ${row.get('usd_diff', 0.0):.4f}")
+                lines.append(f"  - $ per 1pp EM gain: {row.get('usd_per_1pp_gain_em')}")
+                lines.append(f"  - $ per 1pp F1 gain: {row.get('usd_per_1pp_gain_f1')}")
+                lines.append(f"  - $ per 1pp false-answer reduction: {row.get('usd_per_1pp_reduction_false_answer')}")
+        else:
+            s = significance.get(str(float(temp))) or significance.get(float(temp)) or {}
+            if s:
+                lines.append("")
+                lines.append("### Significance")
+                lines.append("")
+                m = s.get("mcnemar", {})
+                w = s.get("wilcoxon", {})
+                lines.append(f"- McNemar: b={m.get('b')}, c={m.get('c')}, p={m.get('p_value')}")
+                lines.append(f"- Wilcoxon: W={w.get('W')}, p={w.get('p_value')}")
         lines.append("")
 
     if costs:
@@ -229,5 +412,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
