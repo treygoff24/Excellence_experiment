@@ -6,8 +6,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from dotenv import load_dotenv
 from fireworks.upload_dataset import create_dataset, upload_dataset_file
-from fireworks.start_batch_job import create_batch_job
 from fireworks.poll_and_download import poll_until_done, get_dataset, try_download_external_url
+from fireworks.batch_queue_manager import QueueManager
 from config.schema import load_config
 def _format_temp_label(t: float) -> str:
     s = f"{float(t):.1f}"
@@ -166,6 +166,7 @@ def main():
     ap.add_argument("--temps", help="Comma-separated temperatures override")
     ap.add_argument("--plan_only", action="store_true", help="Show expanded trial plan and exit")
     ap.add_argument("--archive", action="store_true", help="Archive results after completion")
+    ap.add_argument("--max_concurrent_jobs", type=int, default=4, help="Max concurrent Fireworks batch jobs (default: 4)")
     args = ap.parse_args()
     cfg = load_config(args.config)
     
@@ -317,23 +318,23 @@ def main():
                 upload_dataset_file(account_id, dsid, jsonl_path, filename=remote_fname)
                 trial_manifest["datasets"][f"t{t_str}_{cond}"] = dsid
 
-                try:
-                    job_max_tokens = int(max(int(mx.get("closed_book", 1024)), int(mx.get("open_book", 1024))))
-                except Exception:
-                    job_max_tokens = 1024
-                job = create_batch_job(
+                # Enforce Fireworks batch concurrency via QueueManager (single-job queue)
+                queue = QueueManager(
                     account_id=account_id,
-                    model=model_id,
-                    input_dataset_id=dsid,
-                    display_name=f"{display_name}-job",
+                    model_id=model_id,
+                    config=cfg,
+                    max_concurrent=int(args.max_concurrent_jobs) if args.max_concurrent_jobs else 4,
+                    temp_label=t_str,
                     temperature=float(temp),
-                    max_tokens=job_max_tokens,
-                    top_p=top_p,
-                    top_k=top_k,
-                    stop=cfg.get("stop") or None,
+                    condition=cond,
+                    run_id=run_id,
                 )
-                job_name = job.get("name") or job.get("id")
-                trial_manifest["jobs"][f"t{t_str}_{cond}"] = job_name
+                queue.add_job(1, "", dsid)
+                queue.run_queue(results_dir)
+                # Persist the job name (if available) for bookkeeping
+                jnames = [j.job_name for j in queue.jobs if j.job_name]
+                if jnames:
+                    trial_manifest["jobs"][f"t{t_str}_{cond}"] = jnames[0]
 
         # Write per-trial manifest
         write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
