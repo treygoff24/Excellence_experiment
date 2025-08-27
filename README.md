@@ -30,7 +30,14 @@ make eval
   - Abstention rate tracking
   - False answer detection on unanswerables
   - Unsupported claim detection for open-book tasks
-- **Statistical Analysis**: McNemar and Wilcoxon tests for significance testing
+- **Statistical Analysis (2025 upgrade)**:
+  - Exact McNemar test with odds ratio + 95% CI (Baptista–Pike)
+  - Paired bootstrap CIs for deltas (EM, F1, abstain_rate, false_answer_rate, unsupported_rate)
+  - Effect sizes: Hodges–Lehmann, Cohen’s d, Cliff’s delta; optional permutation p-values
+  - Multiple comparisons: Benjamini–Hochberg FDR q-values across temps/types/subgroups
+  - Subgroups: per-dataset effects (TriviaQA, NQ-Open, SQuAD v2)
+  - Selective-risk: risk–coverage points and AURC; Non‑inferiority (TOST) for EM/F1
+  - Mixed-effects robustness (optional): logistic GEE for EM, cluster‑robust linear model for F1
 - **Cost Tracking**: Token usage monitoring with batch discount application
 - **Reproducibility**: Complete run manifests with prompts, parameters, and job IDs
 
@@ -215,6 +222,51 @@ max_new_tokens:
 ```
 
 ## Datasets
+
+### Additional configuration keys (new)
+
+Augmented statistical and unsupported detection configuration:
+
+```yaml
+stats:
+  bootstrap_samples: 5000
+  permutation_samples: 5000
+  random_seed: 1337
+  enable_permutation: true
+  enable_fdr: true
+  risk_thresholds: [0.0, 0.25, 0.5, 0.75, 1.0]
+  tost_alpha: 0.05
+  tost_margins: { em: 0.01, f1: 0.01 }
+unsupported:
+  strategy: overlap   # baseline|overlap|nli (nli is a conservative placeholder)
+  threshold: 0.5
+  min_token_overlap: 0.6
+```
+
+### New artifacts and scripts
+
+- `results/significance.json` (schema_version=2):
+  - Per temp/type: `mcnemar{b,c,p_exact,odds_ratio,or_ci_95,q_value}`
+  - `metrics[k]` with `delta_mean`, `ci_95`, `wilcoxon{W,p_value,q_value}`, `hodges_lehmann`, `cohens_d`, `cliffs_delta`, `perm_p_value`
+  - `subgroups.dataset[...]` (per-dataset effects)
+  - `selective_risk{thresholds,points,aurc}`
+  - `tost{em,f1}` non-inferiority summaries
+- `scripts/unsupported_sensitivity.py` → `results/unsupported_sensitivity.json`
+- `scripts/mixed_effects.py` → `results/mixed_models.json` (requires `statsmodels`)
+- `scripts/power_analysis.py` → `results/power_analysis.json`
+- `scripts/cost_effectiveness.py` → `results/cost_effectiveness.json`
+
+### Report updates
+
+`scripts/generate_report.py` now includes:
+- Significance with OR+CI, Δ with 95% CIs, and FDR q-values
+- Dataset subgroups; selective-risk AURC and points; TOST
+- Mixed-effects (if available), unsupported sensitivity, power/MDE, and cost-effectiveness
+
+### Git hygiene for large artifacts
+
+- This repo intentionally ignores any `results/` and `reports/` directories (at any path depth) to avoid committing large data.
+- Keep artifacts local or publish externally (e.g., a release asset or object storage). If needed, use git‑lfs for huge files.
 
 The framework evaluates on three standard datasets:
 
