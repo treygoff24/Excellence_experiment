@@ -18,6 +18,7 @@ This document orients Claude (and similar LLM agents) to the project’s structu
 ## How to Run
 - Full pipeline: `python -m scripts.run_all --config config/eval_config.yaml --archive` (or `make eval`).
 - Offline smoke: `make smoke` — generates a tiny end‑to‑end run locally.
+- Orchestrator smoke (dry‑run, auto‑cleanup): `python -m scripts.smoke_orchestration --n 3 --prompt_set operational_only [--keep]`.
 - Post‑processing (run any subset):
   - `python -m scoring.stats --per_item_csv results/per_item_scores.csv --config config/eval_config.yaml --out_path results/significance.json`
   - `python -m scripts.unsupported_sensitivity --pred_csv results/predictions.csv --prepared_dir data/prepared --config config/eval_config.yaml --out_path results/unsupported_sensitivity.json`
@@ -25,6 +26,16 @@ This document orients Claude (and similar LLM agents) to the project’s structu
   - `python -m scripts.power_analysis --per_item_csv results/per_item_scores.csv --prepared_dir data/prepared --config config/eval_config.yaml --out_path results/power_analysis.json`
   - `python -m scripts.cost_effectiveness --pred_csv results/predictions.csv --per_item_csv results/per_item_scores.csv --config config/eval_config.yaml --out_path results/cost_effectiveness.json`
   - `python -m scripts.generate_report --config config/eval_config.yaml --results_dir results --reports_dir reports`
+
+## Orchestrator Controls
+- `--condition {control,treatment,both}`
+- `--parts_per_dataset N` or `--lines_per_part N` (decoupled from concurrency)
+- `--max_concurrent_jobs M`
+- `--resume` (skip completed parts using per‑trial manifest)
+- `--limit_items N`, `--skip_prepare`, `--skip_build`
+- `--dry_run` (synthesize results locally for offline iteration)
+
+Environment: `.env` is loaded via python‑dotenv. Prefer `--account_id=slug` or omit entirely. Avoid `--account_id "$FIREWORKS_ACCOUNT_ID"` if the shell variable may be unset.
 
 ## Key Config (eval_config.yaml)
 ```yaml
@@ -51,8 +62,9 @@ unsupported:
 
 ## Do/Don’t
 - Do keep seeds fixed and respect validated config schemas.
-- Do use `scripts/smoke_test.py` for quick iteration.
+- Do use `scripts.s​moke_test.py` or `scripts.smoke_orchestration` for quick iteration.
 - Don’t commit large artifacts — any `results/`/`reports/` dirs are ignored recursively.
+ - Per‑run under `experiments/run_<RUN_ID>/` is also ignored; reference paths in PRs instead of committing.
 - Don’t change output schema keys casually; keep backward compatibility or update docs accordingly.
 
 ## Common Tasks

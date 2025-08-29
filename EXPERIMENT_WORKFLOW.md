@@ -1,26 +1,22 @@
 # Experiment Workflow Guide
 
-This guide explains how to use the new experiment management system that provides clean separation between different experimental runs.
+This guide explains the experiment management system and the orchestrator controls that provide clean separation between runs and robust resumability.
 
 ## Overview
 
-The system now organizes experiments into separate directories under `experiments/` with the naming convention `t{temperature}_{run_id}`, preventing data mixing between runs.
+The system organizes each run under `experiments/run_<RUN_ID>/`. Within a run, each trial (model × prompt set × decoding) has its own slugged directory.
 
 ## Directory Structure
 
 ```
 experiments/
-├── t0_r20250818/          # Temperature=0.0 run from 2025-08-18
-│   ├── batch_inputs/
-│   ├── results/
-│   ├── reports/
-│   └── archive_manifest.json
-├── t1_r20250821/          # Temperature=1.0 run from 2025-08-21
-│   ├── batch_inputs/
-│   ├── results/
-│   ├── reports/
-│   └── archive_manifest.json
-└── current -> t1_r20250821  # Optional symlink to active experiment
+  run_<RUN_ID>/
+    gpt-oss-120b-operational_only-tp1-tk50-mx1024-1024/
+      results/              # predictions.csv, per_item_scores.csv, significance.json, costs.json, etc.
+      reports/              # report.md
+    ... other trial slugs ...
+    multi_trial_manifest.json
+    aggregate_report.md
 ```
 
 ## Running Experiments
@@ -33,11 +29,15 @@ experiments/
    python scripts/clean_workspace.py           # Actually clean
    ```
 
-2. **Run experiment** with automatic run isolation:
-   ```bash
-   # Will create experiment directory automatically if experiments/ exists
-   python scripts/run_all.py --archive
-   ```
+2. **Run experiment** with orchestrator controls:
+  ```bash
+  # Creates experiments/run_<RUN_ID>/ with per‑trial folders
+  python -m scripts.run_all --config config/eval_config.yaml --archive
+
+  # Treatment only, decoupled splitting (24 parts), 4 concurrent jobs, resumable
+  python -m scripts.run_all --config config/eval_config.yaml \
+    --condition=treatment --parts_per_dataset=24 --max_concurrent_jobs=4 --resume --archive
+  ```
 
 3. **List all experiments**:
    ```bash
@@ -59,7 +59,7 @@ python scripts/run_all.py --run_id my_custom_run --archive
 
 **Skip certain steps:**
 ```bash
-python scripts/run_all.py --skip_prepare --skip_build --archive
+python -m scripts.run_all --skip_prepare --skip_build --archive
 ```
 
 **Manual archiving:**
@@ -69,12 +69,17 @@ python scripts/archive_run.py --experiment_name t15_custom_experiment
 
 ## Configuration
 
-The config file now supports an `experiments_dir` path:
+The config file supports an `experiments_dir` path and prompt sets:
 
 ```yaml
 paths:
   # ... other paths ...
   experiments_dir: "experiments"
+prompt_sets:
+  operational_only:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/operational_only_system.md
+  # ... other sets ...
 ```
 
 ## Script Reference

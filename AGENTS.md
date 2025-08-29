@@ -19,6 +19,8 @@
   - `make build` — create batch inputs in `data/batch_inputs/`.
   - `make eval` — full pipeline via `scripts/run_all.py`.
 - `make smoke` — small end‑to‑end run for sanity checks.
+- Orchestrator smoke (dry‑run, auto‑cleanup):
+  - `python -m scripts.smoke_orchestration --n 3 --prompt_set operational_only` (add `--keep` to retain outputs)
 - `make parse | score | stats | report` — post‑processing utilities.
 - New post‑processing:
   - `python -m scripts.unsupported_sensitivity ...` → sensitivity sweep for unsupported detection.
@@ -26,6 +28,9 @@
   - `python -m scripts.power_analysis ...` → MDE and required N for primary endpoint.
   - `python -m scripts.cost_effectiveness ...` → $ per 1pp gains and cost deltas.
 - Direct run: `python -m scripts.run_all --config config/eval_config.yaml --archive`.
+  - Orchestrator knobs: `--condition`, `--parts_per_dataset`/`--lines_per_part`, `--max_concurrent_jobs`, `--resume`, `--limit_items`, `--skip_prepare`, `--skip_build`, `--dry_run`.
+  - Example (treatment‑only, fill up to 4 concurrent, resume safe):
+    - `python -m scripts.run_all --config config/eval_config.yaml --condition=treatment --parts_per_dataset=24 --max_concurrent_jobs=4 --resume --archive`
 - Validate config: `python -c "from config.schema import EvalConfig; EvalConfig.from_file('config/eval_config.yaml')"`.
 
 ## Coding Style & Naming Conventions
@@ -55,10 +60,11 @@
 
 ## Large Files Policy
 - Do not commit `results/` or `reports/` directories. These are ignored recursively by `.gitignore`.
+- Per‑run directories under `experiments/run_*/` and `experiments/**/batch_inputs/` are also ignored.
 - If you must share artifacts, upload them externally and link paths in PRs.
 
 ## Agent Tips
-- Prefer `make smoke` to validate changes quickly; keep seeds/config deterministic.
+- Prefer `make smoke` and `scripts.smoke_orchestration` to validate changes quickly; keep seeds/config deterministic.
 - When editing stats/report schemas, document fields in README and keep backward compatibility when feasible.
 - Avoid network actions unless necessary; ask for approval when required.
 
@@ -69,3 +75,4 @@
   - Affected config diff (`config/eval_config.yaml`) and prompt file paths.
   - Evidence: `make smoke` output, paths to generated artifacts (e.g., `experiments/run_<RUN_ID>/…`), and any updated reports.
 - Security: copy `ENV_TEMPLATE.txt` to `.env`; never commit secrets. `python-dotenv` loads env vars at runtime.
+  - `.env` is auto‑loaded; avoid passing empty shell expansions. Prefer `--account_id=slug` or omit.

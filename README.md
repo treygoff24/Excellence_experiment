@@ -18,7 +18,7 @@ python -m scripts.run_all --archive
 make eval
 ```
 
-> **New in 2025**: Run isolation system automatically organizes experiments into separate directories. See [EXPERIMENT_WORKFLOW.md](EXPERIMENT_WORKFLOW.md) for details.
+> New in 2025: The orchestrator now decouples dataset splitting from concurrency, persists per‑trial manifests for resume, and includes a dry‑run smoke. See [EXPERIMENT_WORKFLOW.md](EXPERIMENT_WORKFLOW.md) for run layout.
 
 ## Features
 
@@ -98,6 +98,34 @@ The pipeline executes these steps automatically:
 5. **Results Processing** - Downloads, parses, and scores results
 6. **Report Generation** - Creates comprehensive evaluation report → `reports/report.md`
 
+### Orchestrator Controls (new)
+
+- `--condition {control,treatment,both}`: run only one arm or both.
+- `--parts_per_dataset N`: split each input into N parts (decoupled from concurrency).
+- `--lines_per_part N`: alternatively, target lines per part (overrides parts_per_dataset).
+- `--max_concurrent_jobs M`: how many Fireworks batch jobs run at once.
+- `--resume`: resume an interrupted run based on per‑trial manifests (skips finished parts).
+- `--limit_items N`: cap items read from each input (useful for dev sanity checks).
+- `--skip_prepare`/`--skip_build`: reuse existing `prepared/` or `batch_inputs/`.
+- `--dry_run`: synthesize completed jobs and results locally; exercises full parse/score/report flow offline.
+
+Examples:
+
+```
+# Treatment only across all configured prompt sets; 24 parts per dataset, 4 jobs at a time, resumable
+python -m scripts.run_all --config config/eval_config.yaml \
+  --condition=treatment --parts_per_dataset=24 --max_concurrent_jobs=4 --resume --archive
+
+# Plan only (no submissions)
+python -m scripts.run_all --config config/eval_config.yaml --plan_only
+
+# Quick local iteration (no network), tiny slice
+python -m scripts.run_all --config config/eval_config.yaml --dry_run \
+  --prompt_sets operational_only --temps 0.0 --limit_items 200 --parts_per_dataset 3 --max_concurrent_jobs 2
+```
+
+Environment note: `.env` is loaded automatically. Prefer `--account_id=slug` (equals style) or omit entirely if it is in `.env`. Avoid passing `--account_id "$FIREWORKS_ACCOUNT_ID"` if the shell variable is unset.
+
 ### Individual Scripts
 
 For development or debugging, run individual pipeline components:
@@ -116,7 +144,7 @@ python -m scripts.smoke_test
 python -m scripts.summarize_costs
 ```
 
-### Smoke Test (Offline, Full Flow)
+### Smoke Tests
 
 Exercise the entire workflow locally on a tiny subset (no external API calls):
 
@@ -128,7 +156,14 @@ make smoke
 python -m scripts.smoke_test --mode flow --n 2 --out_dir results/smoke
 ```
 
-This runs: build_batches → simulate results → parse → score → stats → cost, writing outputs under `results/smoke/<timestamp>/results/`.
+1) Classic “flow” smoke (offline scoring pipeline): build_batches → simulate results → parse → score → stats → cost → report under `results/smoke/<ts>/results/`.
+
+2) New orchestration smoke (dry‑run end‑to‑end with the orchestrator):
+
+```
+python -m scripts.smoke_orchestration --n 3 --prompt_set operational_only
+# Add --keep to inspect outputs; default auto‑cleans its artifacts
+```
 
 ## Project Structure
 
@@ -145,8 +180,22 @@ Excellence_experiment/
 ├── fireworks/            # Fireworks AI integration
 ├── scoring/              # Evaluation metrics and scoring
 ├── scripts/              # Main pipeline scripts
-├── results/              # Evaluation outputs and manifests
-└── reports/              # Generated evaluation reports
+├── results/              # Evaluation outputs (top-level simple runs; ignored by Git)
+└── reports/              # Generated evaluation reports (ignored by Git)
+
+Experiments are organized as:
+
+```
+experiments/
+  run_<RUN_ID>/
+    <trial-slug>/
+      results/            # per-trial outputs (predictions, per_item_scores, significance, etc.)
+      reports/            # per-trial report.md
+    multi_trial_manifest.json
+    aggregate_report.md
+```
+
+Trial slugs look like: `gpt-oss-120b-operational_only-tp1-tk50-mx1024-1024`.
 ```
 
 ## Experiment History
