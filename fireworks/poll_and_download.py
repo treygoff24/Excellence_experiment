@@ -62,7 +62,17 @@ def get_dataset_external_url(account_id: str, dataset_id: str) -> str | None:
     ds = get_dataset(account_id, dataset_id)
     return ds.get("externalUrl") or ds.get("external_url")
 def try_download_external_url(url: str, out_dir: str):
-    if not url: return None
+    if not url:
+        return None
+    # Support local file URLs to ease testing
+    if url.startswith("file://"):
+        src_path = url[len("file://"):]
+        if os.path.isfile(src_path):
+            out_path = os.path.join(out_dir, "dataset_download.bin")
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            shutil.copyfile(src_path, out_path)
+            return out_path
+        return None
     out_path = os.path.join(out_dir, "dataset_download.bin")
     attempt = 0
     delay_seconds = 1.0

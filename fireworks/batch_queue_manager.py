@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
+from typing import Callable, Any
 from dotenv import load_dotenv
 
 from .upload_dataset import create_dataset, upload_dataset_file
@@ -43,6 +44,7 @@ class QueueManager:
     temperature: float = 1.0
     condition: str = "treatment"
     run_id: str = ""
+    progress_cb: Optional[Callable[[dict], None]] = None
     
     def add_job(self, part_number: int, dataset_path: str, dataset_id: str = None) -> JobInfo:
         """Add a job to the queue"""
@@ -91,6 +93,17 @@ class QueueManager:
             if job.job_name:
                 self.running_jobs[job.job_name] = job
                 print(f"✓ Job P{job.part_number:02d} submitted: {job.job_name}")
+                # Progress event
+                try:
+                    if self.progress_cb:
+                        self.progress_cb({
+                            "event": "submitted",
+                            "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
+                            "job_name": job.job_name,
+                            "dataset_id": job.dataset_id,
+                        })
+                except Exception:
+                    pass
                 return True
             else:
                 print(f"✗ Failed to get job name for P{job.part_number:02d}")
@@ -122,9 +135,30 @@ class QueueManager:
                     else:
                         job.status = "failed"
                         print(f"✗ Job P{job.part_number:02d} failed: {job_state}")
+                    # State change event (terminal)
+                    try:
+                        if self.progress_cb:
+                            self.progress_cb({
+                                "event": "state",
+                                "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
+                                "job_name": job_name,
+                                "state": job_state,
+                            })
+                    except Exception:
+                        pass
                     completed.append(job)
                 else:
                     job.status = "running"
+                    try:
+                        if self.progress_cb and job_state:
+                            self.progress_cb({
+                                "event": "state",
+                                "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
+                                "job_name": job_name,
+                                "state": job_state,
+                            })
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"Warning: Error checking job P{job.part_number:02d}: {e}")
         return completed
@@ -152,24 +186,48 @@ class QueueManager:
             # Get dataset and download
             ds = get_dataset(self.account_id, out_ds_id.split("/")[-1])
             ext_url = ds.get("externalUrl") or ds.get("external_url")
-            
+
             if ext_url:
                 downloaded_path = try_download_external_url(ext_url, job_dir)
                 if downloaded_path:
                     # Try to extract JSONL files
                     from .poll_and_download import _try_extract_jsonls, _combine_jsonls
                     extracted = _try_extract_jsonls(downloaded_path, job_dir)
-                    
+
                     if extracted:
                         # Combine extracted files
                         combined_path = os.path.join(job_dir, "results.jsonl")
                         n_lines = _combine_jsonls(job_dir, combined_path)
-                        
+
                         if n_lines > 0:
                             job.results_path = combined_path
                             print(f"✓ Downloaded {n_lines} results for P{job.part_number:02d}")
+                            try:
+                                if self.progress_cb:
+                                    self.progress_cb({
+                                        "event": "downloaded",
+                                        "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
+                                        "job_name": job.job_name,
+                                        "results_path": combined_path,
+                                    })
+                            except Exception:
+                                pass
                             return True
-            
+
+            # If no ext url or failed download, leave a breadcrumb so a later pass can fetch from UI
+            if out_ds_id:
+                with open(os.path.join(results_dir, f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}_OUTPUT_DATASET_ID.txt"), "w", encoding="utf-8") as f:
+                    f.write(str(out_ds_id))
+                try:
+                    if self.progress_cb:
+                        self.progress_cb({
+                            "event": "download_pending",
+                            "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
+                            "job_name": job.job_name,
+                            "output_dataset_id": out_ds_id,
+                        })
+                except Exception:
+                    pass
             print(f"✗ Failed to download results for P{job.part_number:02d}")
             return False
             

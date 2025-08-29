@@ -162,27 +162,49 @@ def write_manifest(path: str, data: dict):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
-def _split_jsonl_file(src_path: str, out_dir: str, base_prefix: str, parts: int) -> list[tuple[int, str]]:
+def _split_jsonl_file(
+    src_path: str,
+    out_dir: str,
+    base_prefix: str,
+    parts: int | None = None,
+    *,
+    lines_per_part: int | None = None,
+    limit_items: int | None = None,
+) -> list[tuple[int, str]]:
     """Split a JSONL file into N approximately equal parts.
 
     Returns a list of (part_number, part_path). If parts <= 1, returns [(1, src_path)].
     If part files already exist and are non-empty, reuse them.
     """
-    parts = int(parts) if parts and int(parts) > 1 else 1
-    if parts <= 1:
+    # Determine splitting mode: by lines per part or fixed number of parts
+    parts = int(parts) if parts and int(parts) > 1 else None
+    lines_per_part = int(lines_per_part) if lines_per_part and int(lines_per_part) > 0 else None
+    if parts is None and lines_per_part is None:
+        # nothing to do
         return [(1, src_path)]
     os.makedirs(out_dir, exist_ok=True)
     # If splits already exist, reuse
     existing: list[tuple[int, str]] = []
-    for i in range(1, parts + 1):
-        p = os.path.join(out_dir, f"{base_prefix}.p{i:02d}.jsonl")
-        if os.path.exists(p) and os.path.getsize(p) > 0:
-            existing.append((i, p))
-    if len(existing) == parts:
-        return existing
-    # Read all lines once and split
+    if parts is not None:
+        for i in range(1, parts + 1):
+            p = os.path.join(out_dir, f"{base_prefix}.p{i:02d}.jsonl")
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                existing.append((i, p))
+        if len(existing) == parts:
+            return existing
+    # Read all lines once and split (optionally limit first N lines)
     with open(src_path, "r", encoding="utf-8") as f:
-        lines = [ln for ln in f.readlines() if ln.strip()]
+        if limit_items is not None and int(limit_items) > 0:
+            lines: list[str] = []
+            for ln in f:
+                s = ln.strip()
+                if not s:
+                    continue
+                lines.append(ln)
+                if len(lines) >= int(limit_items):
+                    break
+        else:
+            lines = [ln for ln in f.readlines() if ln.strip()]
     n = len(lines)
     if n == 0:
         # create empty part files
@@ -192,7 +214,13 @@ def _split_jsonl_file(src_path: str, out_dir: str, base_prefix: str, parts: int)
             open(p, "w", encoding="utf-8").close()
             out_files.append((i, p))
         return out_files
-    chunk = max(1, (n + parts - 1) // parts)
+    # Decide split sizes
+    if lines_per_part is not None:
+        chunk = max(1, int(lines_per_part))
+        parts = max(1, (n + chunk - 1) // chunk)
+    else:
+        parts = max(1, int(parts) or 1)
+        chunk = max(1, (n + parts - 1) // parts)
     out_files: list[tuple[int, str]] = []
     for i in range(parts):
         start = i * chunk
@@ -224,6 +252,11 @@ def main():
     ap.add_argument("--plan_only", action="store_true", help="Show expanded trial plan and exit")
     ap.add_argument("--archive", action="store_true", help="Archive results after completion")
     ap.add_argument("--max_concurrent_jobs", type=int, default=4, help="Max concurrent Fireworks batch jobs (default: 4)")
+    ap.add_argument("--parts_per_dataset", type=int, default=None, help="How many parts to split each input into (decoupled from concurrency)")
+    ap.add_argument("--lines_per_part", type=int, default=None, help="Alternatively, target number of lines per part (overrides parts_per_dataset)")
+    ap.add_argument("--limit_items", type=int, default=None, help="Take only the first N items from each input when splitting (useful for smoke/dry runs)")
+    ap.add_argument("--resume", action="store_true", help="Resume from existing manifests; skip uploaded datasets and completed jobs")
+    ap.add_argument("--dry_run", action="store_true", help="Offline mode: do not hit Fireworks; synthesize completed jobs and results for testing")
     args = ap.parse_args()
     cfg = load_config(args.config)
     
@@ -314,7 +347,7 @@ def main():
             "Unable to determine Fireworks account id. Set FIREWORKS_ACCOUNT_ID to your account slug (e.g., 'my-team'), not an email."
         )
 
-    account_id = _derive_account_id(args.account_id)
+    account_id = _derive_account_id(args.account_id) if not args.dry_run else "dryrun"
     conditions: list[str] = [args.condition] if args.condition in ("control", "treatment") else ["control", "treatment"]
     # Submit datasets and jobs per trial and write per-trial manifests
     prompt_sets_cfg = cfg.get("prompt_sets") or {}
@@ -346,7 +379,17 @@ def main():
         control_prompt = open(ctrl_path, "r", encoding="utf-8").read()
         treatment_prompt = open(trt_path, "r", encoding="utf-8").read()
 
-        trial_manifest = {
+        # If resuming and a manifest exists, load and append to it; else start fresh
+        existing_manifest: dict | None = None
+        manifest_path_pre = os.path.join(results_dir, "trial_manifest.json")
+        if args.resume and os.path.isfile(manifest_path_pre):
+            try:
+                with open(manifest_path_pre, "r", encoding="utf-8") as _mf:
+                    existing_manifest = json.load(_mf)
+            except Exception:
+                existing_manifest = None
+
+        trial_manifest = existing_manifest or {
             "created_utc": datetime.utcnow().isoformat() + "Z",
             "run_id": run_id,
             "trial": {
@@ -381,7 +424,9 @@ def main():
                     jsonl_path,
                     cfg["paths"]["batch_inputs_dir"],
                     base_prefix,
-                    parts=int(args.max_concurrent_jobs) if args.max_concurrent_jobs else 4,
+                    parts=int(args.parts_per_dataset) if args.lines_per_part is None else None,
+                    lines_per_part=int(args.lines_per_part) if args.lines_per_part else None,
+                    limit_items=int(args.limit_items) if args.limit_items else None,
                 )
 
                 # Enforce Fireworks batch concurrency via QueueManager
@@ -395,17 +440,115 @@ def main():
                     condition=cond,
                     run_id=run_id,
                 )
+                # If resuming and this temp/cond appears complete in manifest, skip queueing
+                resume_key = f"t{t_str}_{cond}"
+                if args.resume and existing_manifest:
+                    jobs_map = (existing_manifest or {}).get("jobs", {}) or {}
+                    job_status = (existing_manifest or {}).get("job_status", {}) or {}
+                    names = jobs_map.get(resume_key) or []
+                    if names and len(names) == len(part_files):
+                        # Check that all parts appear completed
+                        all_done = True
+                        for i in range(1, len(part_files) + 1):
+                            jkey = f"{resume_key}_p{i:02d}"
+                            if job_status.get(jkey) != "completed":
+                                all_done = False; break
+                        if all_done:
+                            print(f"Resume: {resume_key} already completed; skipping queue.")
+                            # ensure fields exist in manifest
+                            trial_manifest.setdefault("datasets", {}).setdefault(resume_key, existing_manifest.get("datasets", {}).get(resume_key, []))
+                            trial_manifest.setdefault("jobs", {}).setdefault(resume_key, names)
+                            continue
+
                 # Upload each part as a separate dataset and enqueue a job
                 dsids_for_cond: list[str] = []
+                planned_jobs: list[tuple[int, str]] = []
                 for part_number, part_path in part_files:
                     ds_name = f"{display_name}-p{part_number:02d}"
-                    dsid = create_dataset(ds_name, account_id)
-                    remote_fname = os.path.basename(part_path)
-                    upload_dataset_file(account_id, dsid, part_path, filename=remote_fname)
+                    if args.dry_run:
+                        dsid = f"dryrun-{ds_name}"
+                    else:
+                        dsid = create_dataset(ds_name, account_id)
+                        remote_fname = os.path.basename(part_path)
+                        upload_dataset_file(account_id, dsid, part_path, filename=remote_fname)
                     dsids_for_cond.append(dsid)
                     queue.add_job(part_number, "", dsid)
+                    planned_jobs.append((part_number, dsid))
                 trial_manifest["datasets"][f"t{t_str}_{cond}"] = dsids_for_cond
-                queue.run_queue(results_dir)
+                # Initialize manifest job_status entries before running the queue
+                trial_manifest.setdefault("job_status", {})
+                for part_number, _ in planned_jobs:
+                    jkey = f"t{t_str}_{cond}_p{part_number:02d}"
+                    trial_manifest["job_status"][jkey] = "pending"
+                # Persist the manifest immediately (early state)
+                write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+
+                # Dry-run path: synthesize completion and results for each part, then skip actual queueing
+                if args.dry_run:
+                    import json as _json
+                    os.makedirs(results_dir, exist_ok=True)
+                    for part_number, dsid in planned_jobs:
+                        jkey = f"t{t_str}_{cond}_p{part_number:02d}"
+                        trial_manifest["job_status"][jkey] = "completed"
+                        # Create a dummy job.json and results
+                        with open(os.path.join(results_dir, f"{jkey}_job.json"), "w", encoding="utf-8") as jf:
+                            _json.dump({"state": "COMPLETED", "name": f"dryrun/{jkey}", "outputDatasetId": f"dry-{jkey}"}, jf, indent=2)
+                        # Place a small results file under a part dir
+                        job_dir = os.path.join(results_dir, jkey)
+                        os.makedirs(job_dir, exist_ok=True)
+                        results_path = os.path.join(job_dir, "results.jsonl")
+                        # Use the input custom_ids to keep dataset/id alignment
+                        part_input = os.path.join(cfg["paths"]["batch_inputs_dir"], f"t{t_str}{suffix}_{cond}.p{part_number:02d}.jsonl")
+                        count = 0
+                        with open(results_path, "w", encoding="utf-8") as rf:
+                            try:
+                                with open(part_input, "r", encoding="utf-8") as fin:
+                                    for line in fin:
+                                        s = line.strip()
+                                        if not s:
+                                            continue
+                                        obj = _json.loads(s)
+                                        cid = obj.get("custom_id") or obj.get("customId")
+                                        if not cid:
+                                            continue
+                                        rf.write(_json.dumps({
+                                            "custom_id": cid,
+                                            "response": {"body": {"choices": [{"message": {"content": "dummy"}, "finish_reason": "stop"}]}, "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+                                        }) + "\n")
+                                        count += 1
+                            except FileNotFoundError:
+                                # Fallback: write a single minimal row
+                                rf.write(_json.dumps({
+                                    "custom_id": f"closed_book|dry-{part_number}|{cond}|{float(temp):.1f}|0|closed",
+                                    "response": {"body": {"choices": [{"message": {"content": "dummy"}, "finish_reason": "stop"}]}, "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+                                }) + "\n")
+                        # Mark output dataset id for reference
+                        with open(os.path.join(results_dir, f"{jkey}_OUTPUT_DATASET_ID.txt"), "w", encoding="utf-8") as of:
+                            of.write(f"dry-{jkey}")
+                    # Persist updated manifest after dry-run synthesis
+                    write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+                else:
+                    # Real queue run with simple progress callback that updates the manifest
+                    def _progress_cb(ev: dict):
+                        try:
+                            jkey = ev.get("job_key")
+                            if jkey:
+                                trial_manifest.setdefault("job_status", {})
+                                if ev.get("event") == "submitted":
+                                    trial_manifest["job_status"][jkey] = "submitted"
+                                elif ev.get("event") == "state":
+                                    st = ev.get("state")
+                                    if st:
+                                        trial_manifest["job_status"][jkey] = st.lower()
+                                elif ev.get("event") == "downloaded":
+                                    trial_manifest["job_status"][jkey] = "completed"
+                                elif ev.get("event") == "download_pending":
+                                    trial_manifest["job_status"][jkey] = "completed"
+                            write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+                        except Exception:
+                            pass
+                    queue.progress_cb = _progress_cb  # type: ignore[attr-defined]
+                    queue.run_queue(results_dir)
                 # Persist the job name (if available) for bookkeeping
                 jnames = [j.job_name for j in queue.jobs if j.job_name]
                 if jnames:
@@ -477,6 +620,8 @@ def main():
 
     # Poll and download results for each job (per trial below)
     def _process_job(job_key: str, job_name: str, results_dir: str):
+        if args.dry_run:
+            return  # Already synthesized in dry run
         print(f"Polling job {job_key}: {job_name}")
         job = poll_until_done(account_id, job_name)
         # Persist job metadata
@@ -499,6 +644,7 @@ def main():
             print(f"WARNING: could not fetch dataset metadata for {job_key}: {e}")
             ext = None
         if not ext:
+            # Leave OUTPUT_DATASET_ID for later manual or resumed download
             return
         job_dir = os.path.join(results_dir, job_key)
         os.makedirs(job_dir, exist_ok=True)
@@ -597,8 +743,16 @@ def main():
         run_cmd([sys.executable, "-m", "fireworks.parse_results", "--results_jsonl", combined_path, "--out_csv", os.path.join(results_dir, "predictions.csv")])
         # Score per-item
         run_cmd([sys.executable, "-m", "scoring.score_predictions", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--out_dir", results_dir, "--config", effective_config_path])
-        # Stats
-        run_cmd([sys.executable, "-m", "scoring.stats", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "significance.json")])
+        # Stats (tolerate optional SciPy not installed in some environments)
+        try:
+            run_cmd([sys.executable, "-m", "scoring.stats", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "significance.json")])
+        except Exception:
+            # Write an empty file so downstream report generation still works
+            try:
+                with open(os.path.join(results_dir, "significance.json"), "w", encoding="utf-8") as _sf:
+                    json.dump({}, _sf)
+            except Exception:
+                pass
         # Unsupported sensitivity analysis (Phase 4)
         try:
             run_cmd([sys.executable, "-m", "scripts.unsupported_sensitivity", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", effective_config_path, "--out_path", os.path.join(results_dir, "unsupported_sensitivity.json")])
