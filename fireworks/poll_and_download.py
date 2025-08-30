@@ -50,10 +50,38 @@ def _get_with_retries(url: str, headers: dict, max_attempts: int = 8, base_delay
     if last_exc:
         raise last_exc
     raise RuntimeError(f"GET {url} failed after {max_attempts} attempts")
+def _normalize_state(state: str | None) -> str:
+    """Normalize Fireworks job state strings to canonical tokens.
+
+    Handles both proto-style (e.g., "JOB_STATE_COMPLETED") and plain
+    (e.g., "COMPLETED") variants. Returns one of:
+    "COMPLETED", "FAILED", "EXPIRED", "RUNNING", "PENDING", or original uppercased fallback.
+    """
+    if not state:
+        return ""
+    s = str(state).upper()
+    if "COMPLETED" in s:
+        return "COMPLETED"
+    if "FAILED" in s:
+        return "FAILED"
+    if "EXPIRED" in s:
+        return "EXPIRED"
+    if "RUNNING" in s or "PROCESSING" in s:
+        return "RUNNING"
+    if "PENDING" in s or "QUEUED" in s or "SUBMITTED" in s:
+        return "PENDING"
+    return s
+
 def get_batch_job(account_id: str, job_name: str):
     url = f"{V1}/accounts/{account_id}/batchInferenceJobs/{job_name.split('/')[-1]}"
     resp = _get_with_retries(url, headers=auth_headers())
-    return resp.json()
+    data = resp.json()
+    try:
+        # Attach a normalizedState helper for consumers
+        data["normalizedState"] = _normalize_state(data.get("state"))
+    except Exception:
+        pass
+    return data
 def get_dataset(account_id: str, dataset_id: str):
     url = f"{V1}/accounts/{account_id}/datasets/{dataset_id}"
     resp = _get_with_retries(url, headers=auth_headers())
@@ -204,9 +232,12 @@ def poll_until_done(account_id: str, job_name: str, poll_seconds: int = 15):
     last_state = None
     while True:
         job = get_batch_job(account_id, job_name)
-        state = job.get("state")
+        raw_state = job.get("state")
+        state = job.get("normalizedState") or _normalize_state(raw_state)
         if state != last_state:
-            print(f"[poll] job {job_name} -> {state}")
+            # Show raw state if available for transparency
+            disp = raw_state if raw_state is not None else state
+            print(f"[poll] job {job_name} -> {disp}")
             last_state = state
         if state in ("COMPLETED", "FAILED", "EXPIRED"):
             return job

@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 from .upload_dataset import create_dataset, upload_dataset_file
 from .start_batch_job import create_batch_job
-from .poll_and_download import poll_until_done, get_dataset, try_download_external_url, get_batch_job
+from .poll_and_download import poll_until_done, get_dataset, try_download_external_url, get_batch_job, _normalize_state
 from config.schema import load_config
 
 
@@ -124,7 +124,7 @@ class QueueManager:
         for job_name, job in list(self.running_jobs.items()):
             try:
                 job_result = get_batch_job(self.account_id, job_name)
-                job_state = job_result.get("state")
+                job_state = _normalize_state(job_result.get("state"))
                 if job_state in ("COMPLETED", "FAILED", "EXPIRED"):
                     # Job finished
                     del self.running_jobs[job_name]

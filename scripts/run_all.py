@@ -448,10 +448,13 @@ def main():
                     names = jobs_map.get(resume_key) or []
                     if names and len(names) == len(part_files):
                         # Check that all parts appear completed
+                        def _is_completed(val: str | None) -> bool:
+                            s = (str(val or "")).lower()
+                            return ("complete" in s) or (s == "completed") or (s == "downloaded")
                         all_done = True
                         for i in range(1, len(part_files) + 1):
                             jkey = f"{resume_key}_p{i:02d}"
-                            if job_status.get(jkey) != "completed":
+                            if not _is_completed(job_status.get(jkey)):
                                 all_done = False; break
                         if all_done:
                             print(f"Resume: {resume_key} already completed; skipping queue.")
@@ -464,6 +467,13 @@ def main():
                 dsids_for_cond: list[str] = []
                 planned_jobs: list[tuple[int, str]] = []
                 for part_number, part_path in part_files:
+                    # Per-part resume: skip parts already marked completed
+                    jkey_resume = f"{resume_key}_p{part_number:02d}"
+                    if args.resume and existing_manifest:
+                        prev_status = (existing_manifest.get("job_status", {}) or {}).get(jkey_resume)
+                        if str(prev_status or "").lower().find("complete") != -1 or str(prev_status or "").lower() == "downloaded":
+                            print(f"Resume: skipping already completed part {jkey_resume}")
+                            continue
                     ds_name = f"{display_name}-p{part_number:02d}"
                     if args.dry_run:
                         dsid = f"dryrun-{ds_name}"
@@ -536,10 +546,24 @@ def main():
                                 trial_manifest.setdefault("job_status", {})
                                 if ev.get("event") == "submitted":
                                     trial_manifest["job_status"][jkey] = "submitted"
+                                    # Persist job name immediately for resume safety
+                                    job_name = ev.get("job_name")
+                                    # Group jobs per temp/cond key
+                                    grp = jkey.rsplit("_p", 1)[0]
+                                    trial_manifest.setdefault("jobs", {})
+                                    arr = trial_manifest["jobs"].setdefault(grp, [])
+                                    try:
+                                        # Ensure array length covers this index
+                                        idx = int(jkey.split("_p")[-1]) - 1
+                                        if idx >= len(arr):
+                                            arr.extend([None] * (idx + 1 - len(arr)))
+                                        arr[idx] = job_name
+                                    except Exception:
+                                        pass
                                 elif ev.get("event") == "state":
                                     st = ev.get("state")
                                     if st:
-                                        trial_manifest["job_status"][jkey] = st.lower()
+                                        trial_manifest["job_status"][jkey] = str(st).lower()
                                 elif ev.get("event") == "downloaded":
                                     trial_manifest["job_status"][jkey] = "completed"
                                 elif ev.get("event") == "download_pending":
@@ -693,9 +717,12 @@ def main():
         for k, v in manifest["jobs"].items():
             if isinstance(v, list):
                 for i, name in enumerate(v, start=1):
+                    if not name:
+                        continue
                     flat_jobs.append((f"{k}_p{i:02d}", name))
             else:
-                flat_jobs.append((k, v))
+                if v:
+                    flat_jobs.append((k, v))
         with ThreadPoolExecutor(max_workers=min(4, len(flat_jobs)) or 1) as ex:
             futures = {ex.submit(_process_job, k, v, results_dir): k for k, v in flat_jobs}
             for fut in as_completed(futures):
