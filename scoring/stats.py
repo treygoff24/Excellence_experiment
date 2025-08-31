@@ -171,7 +171,47 @@ def _perm_p_value(deltas: np.ndarray, R: int, rng: np.random.Generator) -> float
 
 def compute_stats(per_item_csv: str, cfg: dict) -> dict:
     rows = load_per_item(per_item_csv)
+    
+    # Data validation: check for imbalanced conditions
+    condition_counts = defaultdict(int)
+    for row in rows:
+        condition = row.get("condition")
+        if condition:
+            condition_counts[condition] += 1
+    
+    if condition_counts:
+        print(f"Data balance check:")
+        for cond, count in sorted(condition_counts.items()):
+            print(f"  {cond}: {count:,} items")
+        
+        control_count = condition_counts.get("control", 0)
+        treatment_count = condition_counts.get("treatment", 0)
+        
+        if control_count > 0 and treatment_count > 0:
+            ratio = max(control_count, treatment_count) / min(control_count, treatment_count)
+            if ratio > 5.0:
+                print(f"⚠️  WARNING: Severe data imbalance detected! Ratio: {ratio:.1f}:1")
+                print(f"   This may indicate incomplete data aggregation.")
+            elif ratio > 2.0:
+                print(f"ℹ️  Note: Moderate data imbalance. Ratio: {ratio:.1f}:1")
+        elif control_count == 0:
+            print(f"❌ ERROR: No control data found! Only treatment data present.")
+        elif treatment_count == 0:
+            print(f"❌ ERROR: No treatment data found! Only control data present.")
+    
     paired = _paired_lists(rows)
+    
+    # Additional validation: paired vs unpaired counts
+    total_items = len(rows)
+    paired_items = sum(len(items) for items in paired.values())
+    if total_items > 0 and paired_items > 0:
+        pairing_rate = paired_items / total_items
+        print(f"Pairing analysis:")
+        print(f"  Total items: {total_items:,}")
+        print(f"  Paired items: {paired_items:,} ({pairing_rate:.1%})")
+        if pairing_rate < 0.5:
+            print(f"⚠️  WARNING: Low pairing rate ({pairing_rate:.1%}) suggests many items lack matches")
+        print(f"  Statistical analysis uses only paired items for valid comparisons.")
     rng = np.random.default_rng(int(cfg.get("stats", {}).get("random_seed", 1337)))
     B = int(cfg.get("stats", {}).get("bootstrap_samples", 5000))
     Rperm = int(cfg.get("stats", {}).get("permutation_samples", 5000))

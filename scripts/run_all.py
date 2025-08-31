@@ -882,12 +882,16 @@ def main():
                 except Exception as e:
                     print(f"WARNING: polling/downloading failed for {_k}: {e}")
 
-    # Locate and combine all results JSONL files for parsing
-    jsonl_files: list[str] = []
-    for root, _dirs, files in os.walk(results_dir):
-        for name in files:
-            if name.lower().endswith('.jsonl'):
-                jsonl_files.append(os.path.join(root, name))
+        # Locate and combine all results JSONL files for parsing (per-trial)
+        jsonl_files: list[str] = []
+        for root, _dirs, files in os.walk(results_dir):
+            for name in files:
+                if name.lower().endswith('.jsonl'):
+                    jsonl_files.append(os.path.join(root, name))
+
+        print(f"Found {len(jsonl_files)} JSONL files for aggregation:")
+        for f in jsonl_files:
+            print(f"  {f}")
 
         combined_path = os.path.join(results_dir, "results_combined.jsonl")
         combined_lines = 0
@@ -912,6 +916,7 @@ def main():
                     except Exception:
                         continue
 
+        print(f"Combined {combined_lines} unique items into {combined_path}")
         if combined_lines == 0:
             print("No parseable results found (.jsonl with custom_id). Skipping parse/score/stats/costs for this trial.")
             continue
@@ -955,131 +960,131 @@ def main():
         # Generate a concise Markdown report
         report_path = os.path.join(reports_dir, "report.md")
 
-    # Aggregate metrics
-    agg: dict[tuple[float, str, str], dict[str, float]] = {}
-    counts: dict[tuple[float, str, str], int] = {}
-    per_item_csv = os.path.join(results_dir, "per_item_scores.csv")
-    with open(per_item_csv, "r", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            temp = float(row["temp"]) if row.get("temp") not in (None, "") else 0.0
-            condition = row["condition"]
-            typ = row["type"]
-            key = (temp, condition, typ)
-            if key not in agg:
-                agg[key] = {"em": 0.0, "f1": 0.0, "abstain_rate": 0.0, "false_answer_rate": 0.0, "unsupported_rate": 0.0}
-                counts[key] = 0
-            def _to_float(x):
-                try:
-                    return float(x)
-                except Exception:
-                    return 0.0
-            agg[key]["em"] += _to_float(row.get("em"))
-            agg[key]["f1"] += _to_float(row.get("f1"))
-            agg[key]["abstain_rate"] += _to_float(row.get("abstain_rate"))
-            agg[key]["false_answer_rate"] += _to_float(row.get("false_answer_rate"))
-            agg[key]["unsupported_rate"] += _to_float(row.get("unsupported_rate"))
-            counts[key] += 1
-    # Compute means
-    means: dict[tuple[float, str, str], dict[str, float]] = {}
-    for key, sums in agg.items():
-        n = max(1, counts.get(key, 1))
-        means[key] = {k: (v / n) for k, v in sums.items()}
+        # Aggregate metrics (per-trial)
+        agg: dict[tuple[float, str, str], dict[str, float]] = {}
+        counts: dict[tuple[float, str, str], int] = {}
+        per_item_csv = os.path.join(results_dir, "per_item_scores.csv")
+        with open(per_item_csv, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                temp = float(row["temp"]) if row.get("temp") not in (None, "") else 0.0
+                condition = row["condition"]
+                typ = row["type"]
+                key = (temp, condition, typ)
+                if key not in agg:
+                    agg[key] = {"em": 0.0, "f1": 0.0, "abstain_rate": 0.0, "false_answer_rate": 0.0, "unsupported_rate": 0.0}
+                    counts[key] = 0
+                def _to_float(x):
+                    try:
+                        return float(x)
+                    except Exception:
+                        return 0.0
+                agg[key]["em"] += _to_float(row.get("em"))
+                agg[key]["f1"] += _to_float(row.get("f1"))
+                agg[key]["abstain_rate"] += _to_float(row.get("abstain_rate"))
+                agg[key]["false_answer_rate"] += _to_float(row.get("false_answer_rate"))
+                agg[key]["unsupported_rate"] += _to_float(row.get("unsupported_rate"))
+                counts[key] += 1
+        # Compute means
+        means: dict[tuple[float, str, str], dict[str, float]] = {}
+        for key, sums in agg.items():
+            n = max(1, counts.get(key, 1))
+            means[key] = {k: (v / n) for k, v in sums.items()}
 
-    # Load significance and costs
-    sig_path = os.path.join(results_dir, "significance.json")
-    costs_path = os.path.join(results_dir, "costs.json")
-    significance = {}
-    costs = {}
-    try:
-        with open(sig_path, "r", encoding="utf-8") as f:
-            significance = json.load(f)
-    except Exception:
-        pass
-    try:
-        with open(costs_path, "r", encoding="utf-8") as f:
-            costs = json.load(f)
-    except Exception:
-        pass
-
-    # Build markdown for the last processed trial (context: report_path/results_dir refer to current trial loop)
-    lines: list[str] = []
-    lines.append("# Evaluation Report")
-    lines.append("")
-    # Identify current trial metadata
-    curr_model = model_id if 'model_id' in locals() else cfg.get('model_id')
-    curr_temps = trial.get('temps') if 'trial' in locals() else (cfg.get('temps') or [])
-    lines.append(f"Model: {curr_model}")
-    lines.append(f"Temperatures: {', '.join(str(t) for t in curr_temps)}")
-    # Report per-temp replicate counts to avoid stale text when temps != 0.7
-    try:
-        for t in curr_temps:
-            k = (
-                cfg["samples_per_item"].get(str(float(t)))
-                or cfg["samples_per_item"].get(f"{float(t):.1f}")
-                or cfg["samples_per_item"].get(float(t))
-                or "?"
-            )
-            lines.append(f"Samples per item @T={float(t):.1f}: {k}")
-    except Exception:
-        pass
-    lines.append("")
-    # Prompt tokens
-    lines.append("## Prompts")
-    lines.append("")
-    try:
-        with open(os.path.join(results_dir, "trial_manifest.json"), "r", encoding="utf-8") as _mf:
-            _m = json.load(_mf)
-        lines.append(f"- Control prompt tokens: {_m['prompts']['control']['tokens']}")
-        lines.append(f"- Treatment prompt tokens: {_m['prompts']['treatment']['tokens']}")
-    except Exception:
-        pass
-    lines.append("")
-    # Metrics table per temp and type
-    for temp in curr_temps:
-        lines.append(f"## Results @ T={float(temp):.1f}")
-        for typ in ("closed", "open"):
-            lines.append("")
-            lines.append(f"### {typ.capitalize()}-book")
-            lines.append("")
-            lines.append("| Condition | EM | F1 | Abstain | False-Ans | Unsupported |")
-            lines.append("|---|---:|---:|---:|---:|---:|")
-            row_ctrl = means.get((float(temp), "control", typ), {})
-            row_trt = means.get((float(temp), "treatment", typ), {})
-            def fmt(x):
-                return f"{(x or 0.0)*100:.1f}%" if 0.0 <= (x or 0.0) <= 1.0 else f"{x:.3f}"
-            def val(d, k):
-                return d.get(k, 0.0)
-            lines.append(f"| Control | {fmt(val(row_ctrl,'em'))} | {fmt(val(row_ctrl,'f1'))} | {fmt(val(row_ctrl,'abstain_rate'))} | {fmt(val(row_ctrl,'false_answer_rate'))} | {fmt(val(row_ctrl,'unsupported_rate'))} |")
-            lines.append(f"| Treatment | {fmt(val(row_trt,'em'))} | {fmt(val(row_trt,'f1'))} | {fmt(val(row_trt,'abstain_rate'))} | {fmt(val(row_trt,'false_answer_rate'))} | {fmt(val(row_trt,'unsupported_rate'))} |")
-        # Stats
-        if significance:
-            s = significance.get(str(float(temp))) or significance.get(float(temp)) or {}
-            if s:
-                lines.append("")
-                lines.append("### Significance")
-                lines.append("")
-                m = s.get("mcnemar", {})
-                w = s.get("wilcoxon", {})
-                lines.append(f"- McNemar: b={m.get('b')}, c={m.get('c')}, p={m.get('p_value')}")
-                lines.append(f"- Wilcoxon: W={w.get('W')}, p={w.get('p_value')}")
-        lines.append("")
-    # Costs
-    if costs:
-        lines.append("## Cost")
-        lines.append("")
-        lines.append(f"- Prompt tokens: {costs.get('prompt_tokens')}")
-        lines.append(f"- Completion tokens: {costs.get('completion_tokens')}")
-        lines.append(f"- Total tokens: {costs.get('total_tokens')}")
-        usd = costs.get('usd')
+        # Load significance and costs
+        sig_path = os.path.join(results_dir, "significance.json")
+        costs_path = os.path.join(results_dir, "costs.json")
+        significance = {}
+        costs = {}
         try:
-            usd_val = float(usd)
-        except (TypeError, ValueError):
-            usd_val = 0.0
-        lines.append(f"- Estimated USD: ${usd_val:.4f}")
-        if costs.get("batch_discount_applied"):
-            lines.append("- Batch discount applied")
+            with open(sig_path, "r", encoding="utf-8") as f:
+                significance = json.load(f)
+        except Exception:
+            pass
+        try:
+            with open(costs_path, "r", encoding="utf-8") as f:
+                costs = json.load(f)
+        except Exception:
+            pass
+
+        # Build markdown for this trial
+        lines: list[str] = []
+        lines.append("# Evaluation Report")
         lines.append("")
+        # Identify current trial metadata
+        curr_model = model_id
+        curr_temps = trial.get('temps') or []
+        lines.append(f"Model: {curr_model}")
+        lines.append(f"Temperatures: {', '.join(str(t) for t in curr_temps)}")
+        # Report per-temp replicate counts
+        try:
+            for t in curr_temps:
+                k = (
+                    cfg["samples_per_item"].get(str(float(t)))
+                    or cfg["samples_per_item"].get(f"{float(t):.1f}")
+                    or cfg["samples_per_item"].get(float(t))
+                    or "?"
+                )
+                lines.append(f"Samples per item @T={float(t):.1f}: {k}")
+        except Exception:
+            pass
+        lines.append("")
+        # Prompt tokens
+        lines.append("## Prompts")
+        lines.append("")
+        try:
+            with open(os.path.join(results_dir, "trial_manifest.json"), "r", encoding="utf-8") as _mf:
+                _m = json.load(_mf)
+            lines.append(f"- Control prompt tokens: {_m['prompts']['control']['tokens']}")
+            lines.append(f"- Treatment prompt tokens: {_m['prompts']['treatment']['tokens']}")
+        except Exception:
+            pass
+        lines.append("")
+        # Metrics table per temp and type
+        for temp in curr_temps:
+            lines.append(f"## Results @ T={float(temp):.1f}")
+            for typ in ("closed", "open"):
+                lines.append("")
+                lines.append(f"### {typ.capitalize()}-book")
+                lines.append("")
+                lines.append("| Condition | EM | F1 | Abstain | False-Ans | Unsupported |")
+                lines.append("|---|---:|---:|---:|---:|---:|")
+                row_ctrl = means.get((float(temp), "control", typ), {})
+                row_trt = means.get((float(temp), "treatment", typ), {})
+                def fmt(x):
+                    return f"{(x or 0.0)*100:.1f}%" if 0.0 <= (x or 0.0) <= 1.0 else f"{x:.3f}"
+                def val(d, k):
+                    return d.get(k, 0.0)
+                lines.append(f"| Control | {fmt(val(row_ctrl,'em'))} | {fmt(val(row_ctrl,'f1'))} | {fmt(val(row_ctrl,'abstain_rate'))} | {fmt(val(row_ctrl,'false_answer_rate'))} | {fmt(val(row_ctrl,'unsupported_rate'))} |")
+                lines.append(f"| Treatment | {fmt(val(row_trt,'em'))} | {fmt(val(row_trt,'f1'))} | {fmt(val(row_trt,'abstain_rate'))} | {fmt(val(row_trt,'false_answer_rate'))} | {fmt(val(row_trt,'unsupported_rate'))} |")
+            # Stats
+            if significance:
+                s = significance.get(str(float(temp))) or significance.get(float(temp)) or {}
+                if s:
+                    lines.append("")
+                    lines.append("### Significance")
+                    lines.append("")
+                    m = s.get("mcnemar", {})
+                    w = s.get("wilcoxon", {})
+                    lines.append(f"- McNemar: b={m.get('b')}, c={m.get('c')}, p={m.get('p_value')}")
+                    lines.append(f"- Wilcoxon: W={w.get('W')}, p={w.get('p_value')}")
+            lines.append("")
+        # Costs
+        if costs:
+            lines.append("## Cost")
+            lines.append("")
+            lines.append(f"- Prompt tokens: {costs.get('prompt_tokens')}")
+            lines.append(f"- Completion tokens: {costs.get('completion_tokens')}")
+            lines.append(f"- Total tokens: {costs.get('total_tokens')}")
+            usd = costs.get('usd')
+            try:
+                usd_val = float(usd)
+            except (TypeError, ValueError):
+                usd_val = 0.0
+            lines.append(f"- Estimated USD: ${usd_val:.4f}")
+            if costs.get("batch_discount_applied"):
+                lines.append("- Batch discount applied")
+            lines.append("")
         with open(report_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 

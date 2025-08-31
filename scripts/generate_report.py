@@ -117,6 +117,52 @@ def write_report(cfg: dict, manifest: dict, means: dict, significance: dict, cos
         lines.append(f"- Treatment prompt tokens: {manifest['prompts']['treatment']['tokens']}")
     except Exception:
         pass
+    
+    # Add data balance information
+    lines.append("")
+    lines.append("## Data Balance")
+    lines.append("")
+    
+    if counts:
+        # Calculate condition totals
+        control_total = sum(count for (temp, cond, typ), count in counts.items() if cond == "control")
+        treatment_total = sum(count for (temp, cond, typ), count in counts.items() if cond == "treatment")
+        
+        lines.append(f"- Control items: {control_total:,}")
+        lines.append(f"- Treatment items: {treatment_total:,}")
+        
+        if control_total > 0 and treatment_total > 0:
+            ratio = max(control_total, treatment_total) / min(control_total, treatment_total)
+            lines.append(f"- Ratio: {ratio:.1f}:1")
+            if ratio > 5.0:
+                lines.append("- ⚠️  **Warning**: Severe data imbalance detected")
+            elif ratio > 2.0:
+                lines.append("- ℹ️  **Note**: Moderate data imbalance")
+        elif control_total == 0:
+            lines.append("- ❌ **Error**: No control data found")  
+        elif treatment_total == 0:
+            lines.append("- ❌ **Error**: No treatment data found")
+            
+        # Calculate pairing rate from significance results
+        if significance and "results" in significance:
+            paired_counts = []
+            for temp_key, temp_results in significance["results"].items():
+                for typ_key, typ_results in temp_results.items():
+                    if "n_items" in typ_results:
+                        paired_counts.append(typ_results["n_items"])
+            
+            if paired_counts:
+                total_paired = max(paired_counts)  # Should be same across temps/types
+                total_items = control_total + treatment_total
+                pairing_rate = total_paired / total_items if total_items > 0 else 0
+                
+                lines.append("")
+                lines.append("**Pairing Analysis:**")
+                lines.append(f"- Total items: {total_items:,}")  
+                lines.append(f"- Paired items: {total_paired:,} ({pairing_rate:.1%})")
+                if pairing_rate < 0.5:
+                    lines.append("- ⚠️  **Warning**: Low pairing rate suggests many items lack matches")
+                lines.append("- Statistical analysis uses only paired items for valid comparisons")
     lines.append("")
 
     for temp in cfg["temps"]:
