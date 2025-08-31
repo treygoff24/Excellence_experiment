@@ -4,6 +4,8 @@ import sys
 import json
 import time
 import argparse
+import random
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
@@ -19,7 +21,7 @@ from config.schema import load_config
 
 @dataclass
 class JobInfo:
-    """Information about a batch job"""
+    """Information about a batch job with detailed state tracking"""
     part_number: int
     dataset_id: str
     job_id: Optional[str] = None
@@ -28,11 +30,26 @@ class JobInfo:
     submit_time: Optional[datetime] = None
     complete_time: Optional[datetime] = None
     results_path: Optional[str] = None
+    last_known_state: Optional[str] = None
+    state_transitions: List[Tuple[datetime, str]] = field(default_factory=list)
+    retry_count: int = 0
+    last_error: Optional[str] = None
+    
+    def add_state_transition(self, new_state: str):
+        """Add a state transition with timestamp"""
+        self.state_transitions.append((datetime.now(), new_state))
+        self.last_known_state = new_state
+        
+    def get_duration(self) -> Optional[float]:
+        """Get job duration in seconds if completed"""
+        if self.submit_time and self.complete_time:
+            return (self.complete_time - self.submit_time).total_seconds()
+        return None
 
 
 @dataclass
 class QueueManager:
-    """Manages batch job queue with concurrency limits"""
+    """Manages batch job queue with concurrency limits and thread safety"""
     account_id: str
     model_id: str
     config: dict
@@ -45,29 +62,44 @@ class QueueManager:
     condition: str = "treatment"
     run_id: str = ""
     progress_cb: Optional[Callable[[dict], None]] = None
+    _lock: threading.RLock = field(default_factory=threading.RLock)
+    _submission_semaphore: Optional[threading.Semaphore] = None
+    
+    def __post_init__(self):
+        """Initialize semaphore after dataclass creation"""
+        self._submission_semaphore = threading.Semaphore(self.max_concurrent)
     
     def add_job(self, part_number: int, dataset_path: str, dataset_id: str = None) -> JobInfo:
-        """Add a job to the queue"""
-        job = JobInfo(
-            part_number=part_number,
-            dataset_id=dataset_id or f"temp-dataset-p{part_number:02d}"
-        )
-        self.jobs.append(job)
-        return job
+        """Add a job to the queue (thread-safe)"""
+        with self._lock:
+            job = JobInfo(
+                part_number=part_number,
+                dataset_id=dataset_id or f"temp-dataset-p{part_number:02d}"
+            )
+            self.jobs.append(job)
+            return job
     
     def can_submit_more(self) -> bool:
-        """Check if we can submit more jobs"""
-        return len(self.running_jobs) < self.max_concurrent
+        """Check if we can submit more jobs (thread-safe)"""
+        with self._lock:
+            return len(self.running_jobs) < self.max_concurrent
     
     def get_next_pending(self) -> Optional[JobInfo]:
-        """Get the next pending job"""
-        for job in self.jobs:
-            if job.status == "pending":
-                return job
-        return None
+        """Get the next pending job (thread-safe)"""
+        with self._lock:
+            for job in self.jobs:
+                if job.status == "pending":
+                    return job
+            return None
     
     def submit_job(self, job: JobInfo) -> bool:
-        """Submit a single job"""
+        """Submit a single job (thread-safe with semaphore)"""
+        # Acquire semaphore to limit concurrent submissions
+        if not self._submission_semaphore.acquire(timeout=30.0):
+            print(f"✗ Timeout acquiring semaphore for P{job.part_number:02d}")
+            job.status = "failed"
+            return False
+            
         try:
             print(f"Submitting job for part P{job.part_number:02d}...")
             
@@ -84,84 +116,137 @@ class QueueManager:
                 stop=self.config.get("stop")
             )
             
-            job.job_id = job_response.get("id")
-            job.job_name = job_response.get("name")
-            job.status = "submitted"
-            job.submit_time = datetime.now()
-            
-            # Add to running jobs
-            if job.job_name:
-                self.running_jobs[job.job_name] = job
-                print(f"✓ Job P{job.part_number:02d} submitted: {job.job_name}")
-                # Progress event
-                try:
-                    if self.progress_cb:
-                        self.progress_cb({
-                            "event": "submitted",
-                            "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
-                            "job_name": job.job_name,
-                            "dataset_id": job.dataset_id,
-                        })
-                except Exception:
-                    pass
-                return True
-            else:
-                print(f"✗ Failed to get job name for P{job.part_number:02d}")
-                job.status = "failed"
-                return False
+            # Thread-safe update of job state and running_jobs
+            with self._lock:
+                job.job_id = job_response.get("id")
+                job.job_name = job_response.get("name")
+                job.status = "submitted"
+                job.submit_time = datetime.now()
+                job.add_state_transition("SUBMITTED")
                 
+                # Add to running jobs
+                if job.job_name:
+                    self.running_jobs[job.job_name] = job
+                    print(f"✓ Job P{job.part_number:02d} submitted: {job.job_name}")
+                    # Progress event with safe callback
+                    self._safe_progress_callback({
+                        "event": "submitted",
+                        "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
+                        "job_name": job.job_name,
+                        "dataset_id": job.dataset_id,
+                        "timestamp": job.submit_time.isoformat(),
+                    })
+                    return True
+                else:
+                    print(f"✗ Failed to get job name for P{job.part_number:02d}")
+                    job.status = "failed"
+                    job.add_state_transition("FAILED")
+                    job.last_error = "Failed to get job name from response"
+                    self._submission_semaphore.release()  # Release on failure
+                    return False
+                    
         except Exception as e:
             print(f"✗ Failed to submit job P{job.part_number:02d}: {e}")
-            job.status = "failed"
+            with self._lock:
+                job.status = "failed"
+                job.add_state_transition("FAILED")
+                job.last_error = str(e)
+            self._submission_semaphore.release()  # Release on exception
             return False
     
-    def check_running_jobs(self) -> List[JobInfo]:
-        """Check status of running jobs and return completed ones.
-
-        Uses a single GET (no loop) to avoid chatty output and busy-waiting.
-        """
-        completed: List[JobInfo] = []
-        for job_name, job in list(self.running_jobs.items()):
+    def _retry_with_backoff(self, operation, max_retries: int = 3, base_delay: float = 1.0):
+        """Retry an operation with exponential backoff."""
+        for attempt in range(max_retries):
             try:
-                job_result = get_batch_job(self.account_id, job_name)
-                job_state = _normalize_state(job_result.get("state"))
-                if job_state in ("COMPLETED", "FAILED", "EXPIRED"):
-                    # Job finished
-                    del self.running_jobs[job_name]
-                    job.complete_time = datetime.now()
-                    if job_state == "COMPLETED":
-                        job.status = "completed"
-                        print(f"✓ Job P{job.part_number:02d} completed")
-                    else:
-                        job.status = "failed"
-                        print(f"✗ Job P{job.part_number:02d} failed: {job_state}")
-                    # State change event (terminal)
-                    try:
-                        if self.progress_cb:
-                            self.progress_cb({
-                                "event": "state",
-                                "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
-                                "job_name": job_name,
-                                "state": job_state,
-                            })
-                    except Exception:
-                        pass
-                    completed.append(job)
-                else:
-                    job.status = "running"
-                    try:
-                        if self.progress_cb and job_state:
-                            self.progress_cb({
-                                "event": "state",
-                                "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
-                                "job_name": job_name,
-                                "state": job_state,
-                            })
-                    except Exception:
-                        pass
+                return operation()
             except Exception as e:
-                print(f"Warning: Error checking job P{job.part_number:02d}: {e}")
+                if attempt == max_retries - 1:
+                    raise e
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 0.1)
+                print(f"Retry {attempt + 1}/{max_retries} in {delay:.1f}s due to: {e}")
+                time.sleep(delay)
+
+    def check_running_jobs(self) -> List[JobInfo]:
+        """Check status of running jobs and return completed ones with retry logic (thread-safe)."""
+        completed: List[JobInfo] = []
+        
+        # Get a snapshot of running jobs to avoid concurrent modification
+        with self._lock:
+            jobs_to_check = list(self.running_jobs.items())
+        
+        for job_name, job in jobs_to_check:
+            try:
+                # Use retry logic for job status check
+                def _get_job_status():
+                    return get_batch_job(self.account_id, job_name)
+                
+                job_result = self._retry_with_backoff(_get_job_status)
+                job_state = _normalize_state(job_result.get("state"))
+                
+                if job_state in ("COMPLETED", "FAILED", "EXPIRED"):
+                    # Job finished - thread-safe removal and semaphore release
+                    with self._lock:
+                        if job_name in self.running_jobs:  # Double-check still exists
+                            del self.running_jobs[job_name]
+                            job.complete_time = datetime.now()
+                            job.add_state_transition(job_state)
+                            
+                            if job_state == "COMPLETED":
+                                job.status = "completed"
+                                duration = job.get_duration()
+                                duration_str = f" ({duration:.1f}s)" if duration else ""
+                                print(f"✓ Job P{job.part_number:02d} completed{duration_str}")
+                            else:
+                                job.status = "failed"
+                                job.last_error = f"Job ended with state: {job_state}"
+                                print(f"✗ Job P{job.part_number:02d} failed: {job_state}")
+                            
+                            # Release semaphore slot for new job
+                            self._submission_semaphore.release()
+                            completed.append(job)
+                    
+                    # State change event (terminal) - with error handling
+                    self._safe_progress_callback({
+                        "event": "state",
+                        "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
+                        "job_name": job_name,
+                        "state": job_state,
+                        "timestamp": datetime.now().isoformat(),
+                        "duration": job.get_duration(),
+                        "transitions": len(job.state_transitions),
+                    })
+                else:
+                    # Update status for running job
+                    with self._lock:
+                        if job_name in self.running_jobs:  # Still running
+                            job.status = "running"
+                            # Only add state transition if state changed
+                            if job_state and job_state != job.last_known_state:
+                                job.add_state_transition(job_state)
+                    
+                    # Running state event - with error handling (only if state changed)
+                    if job_state and job_state != job.last_known_state:
+                        self._safe_progress_callback({
+                            "event": "state",
+                            "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
+                            "job_name": job_name,
+                            "state": job_state,
+                            "timestamp": datetime.now().isoformat(),
+                            "transitions": len(job.state_transitions),
+                        })
+            except Exception as e:
+                print(f"Error checking job P{job.part_number:02d} after retries: {e}")
+                # Don't remove from running_jobs - will retry on next check
         return completed
+    
+    def _safe_progress_callback(self, event_data: dict):
+        """Safely call progress callback with error logging."""
+        if not self.progress_cb:
+            return
+        try:
+            self.progress_cb(event_data)
+        except Exception as e:
+            print(f"Warning: Progress callback failed for {event_data.get('job_key', 'unknown')}: {e}")
     
     def download_results(self, job: JobInfo, results_dir: str) -> bool:
         """Download results for a completed job"""
@@ -202,32 +287,24 @@ class QueueManager:
                         if n_lines > 0:
                             job.results_path = combined_path
                             print(f"✓ Downloaded {n_lines} results for P{job.part_number:02d}")
-                            try:
-                                if self.progress_cb:
-                                    self.progress_cb({
-                                        "event": "downloaded",
-                                        "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
-                                        "job_name": job.job_name,
-                                        "results_path": combined_path,
-                                    })
-                            except Exception:
-                                pass
+                            self._safe_progress_callback({
+                                "event": "downloaded",
+                                "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
+                                "job_name": job.job_name,
+                                "results_path": combined_path,
+                            })
                             return True
 
             # If no ext url or failed download, leave a breadcrumb so a later pass can fetch from UI
             if out_ds_id:
                 with open(os.path.join(results_dir, f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}_OUTPUT_DATASET_ID.txt"), "w", encoding="utf-8") as f:
                     f.write(str(out_ds_id))
-                try:
-                    if self.progress_cb:
-                        self.progress_cb({
-                            "event": "download_pending",
-                            "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
-                            "job_name": job.job_name,
-                            "output_dataset_id": out_ds_id,
-                        })
-                except Exception:
-                    pass
+                self._safe_progress_callback({
+                    "event": "download_pending",
+                    "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
+                    "job_name": job.job_name,
+                    "output_dataset_id": out_ds_id,
+                })
             print(f"✗ Failed to download results for P{job.part_number:02d}")
             return False
             

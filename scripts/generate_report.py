@@ -233,7 +233,7 @@ def write_report(cfg: dict, manifest: dict, means: dict, significance: dict, cos
                                 )
                                 lines.append(
                                     "    - Treatment: " + ", ".join(_fmt(p) for p in trt_pts)
-                                )
+                        )
                     # TOST non-inferiority
                     tost = s_obj[typ].get("tost", {})
                     if tost:
@@ -244,6 +244,26 @@ def write_report(cfg: dict, manifest: dict, means: dict, significance: dict, cos
                                 lines.append(
                                     f"    - {key.upper()}: margin={ti.get('margin')}, p={ti.get('p_value')}, non_inferior={ti.get('non_inferior')} (Δ={ti.get('mean_delta'):+.4f}, CI95=[{ti.get('ci_95',[None,None])[0]}, {ti.get('ci_95',[None,None])[1]}])"
                                 )
+                    # Meta-analysis across datasets (fixed/random effects)
+                    meta = s_obj[typ].get("meta", {})
+                    if meta:
+                        lines.append("  - Meta-analysis (across datasets):")
+                        for key in ("em", "f1"):
+                            if key in meta:
+                                m = meta[key]
+                                fe = m.get("fixed", {}) or {}
+                                re = m.get("random", {}) or {}
+                                het = m.get("heterogeneity", {}) or {}
+                                lines.append(
+                                    f"    - {key.upper()} (fixed): Δ={fe.get('delta_mean', 0.0):+.4f} CI95=[{fe.get('ci_95', [None,None])[0]}, {fe.get('ci_95', [None,None])[1]}]"
+                                )
+                                lines.append(
+                                    f"      {key.upper()} (random): Δ={re.get('delta_mean', 0.0):+.4f} CI95=[{re.get('ci_95', [None,None])[0]}, {re.get('ci_95', [None,None])[1]}] (τ²={re.get('tau2')})"
+                                )
+                                if het:
+                                    lines.append(
+                                        f"      Heterogeneity: Q={het.get('Q')}, df={het.get('df')}, p={het.get('p_value')}, I²={het.get('I2')}"
+                                    )
                 # Subgroups by dataset
                 for typ in ("closed", "open"):
                     if typ not in s_obj:

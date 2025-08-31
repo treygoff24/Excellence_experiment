@@ -252,8 +252,10 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     job = poll_until_done(args.account, args.job_name)
     print(json.dumps(job, indent=2))
-    if job.get("state") != "COMPLETED":
-        print("WARNING: job not COMPLETED; exiting without download")
+    # Accept either raw or proto-style completed states
+    norm_state = job.get("normalizedState") or _normalize_state(job.get("state"))
+    if norm_state != "COMPLETED":
+        print(f"WARNING: job not COMPLETED (state={job.get('state')}); exiting without download")
         return
     out_ds_id = job.get("outputDatasetId") or job.get("output_dataset_id")
     if not out_ds_id:

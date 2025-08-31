@@ -328,6 +328,78 @@ def compute_stats(per_item_csv: str, cfg: dict) -> dict:
                 for m, info in sub_block.get("metrics", {}).items():
                     tests.append((float(temp), typ, f"dataset:{ds}", m, info["wilcoxon"], "p_value"))
 
+            # Meta-analysis across datasets for primary endpoints (EM always; F1 if open)
+            def _meta_from_subgroups(metric: str) -> dict | None:
+                try:
+                    # Collect per-dataset deltas for the metric
+                    groups: list[tuple[float, float]] = []  # (mean, var)
+                    for ds_name, ds_block in out[tkey][typ]["subgroups"]["dataset"].items():
+                        m = ds_block.get("metrics", {}).get(metric, {})
+                        n = int(m.get("n_items") or 0)
+                        # Reconstruct per-item deltas variance from CI if available; else use bootstrap spread fallback
+                        ci = m.get("ci_95") or None
+                        if n <= 1:
+                            continue
+                        mean = float(m.get("delta_mean") or 0.0)
+                        # Estimate variance via sample SD if provided through boots (not stored), fall back to CI width
+                        # Approximate SE from CI width: half-width = 1.96 * SE
+                        if ci and all(isinstance(x, (int, float)) for x in ci):
+                            hw = abs(float(ci[1]) - float(ci[0])) / 2.0
+                            se = hw / 1.96 if hw > 0 else None
+                        else:
+                            se = None
+                        # If SE unavailable, approximate via binomial variance of differences (conservative)
+                        var = float(se * se) if (se is not None and se > 0) else max(1e-8, 0.25 / n)
+                        groups.append((mean, var))
+                    K = len(groups)
+                    if K == 0:
+                        return None
+                    # Fixed-effects
+                    w = [1.0 / v if v > 0 else 0.0 for (_m, v) in groups]
+                    sw = sum(w)
+                    if sw <= 0:
+                        return None
+                    mu_fe = sum(wi * mi for (mi, vi), wi in zip(groups, w)) / sw
+                    var_fe = 1.0 / sw
+                    se_fe = var_fe ** 0.5
+                    ci_fe = [float(mu_fe - 1.96 * se_fe), float(mu_fe + 1.96 * se_fe)]
+                    # Heterogeneity (Q, I^2)
+                    Q = sum(wi * (mi - mu_fe) ** 2 for (mi, _vi), wi in zip(groups, w))
+                    df = max(1, K - 1)
+                    try:
+                        p_het = float(1.0 - stats.chi2.cdf(Q, df))
+                    except Exception:
+                        p_het = float("nan")
+                    I2 = max(0.0, float((Q - df) / Q)) if Q > 0 else 0.0
+                    # Random-effects (DerSimonian–Laird)
+                    sw2 = sum(wi * wi for wi in w)
+                    denom = sw - (sw2 / sw) if sw > 0 else 0.0
+                    tau2 = max(0.0, (Q - df) / denom) if denom > 0 else 0.0
+                    wr = [1.0 / (vi + tau2) if (vi + tau2) > 0 else 0.0 for (_mi, vi) in groups]
+                    swr = sum(wr)
+                    mu_re = sum(wi * mi for (mi, vi), wi in zip(groups, wr)) / swr if swr > 0 else mu_fe
+                    var_re = 1.0 / swr if swr > 0 else var_fe
+                    se_re = var_re ** 0.5
+                    ci_re = [float(mu_re - 1.96 * se_re), float(mu_re + 1.96 * se_re)]
+                    return {
+                        "fixed": {"delta_mean": float(mu_fe), "ci_95": ci_fe},
+                        "random": {"delta_mean": float(mu_re), "ci_95": ci_re, "tau2": float(tau2)},
+                        "heterogeneity": {"Q": float(Q), "df": int(df), "p_value": p_het, "I2": float(I2)},
+                    }
+                except Exception:
+                    return None
+
+            meta: dict[str, Any] = {}
+            em_meta = _meta_from_subgroups("em")
+            if em_meta:
+                meta["em"] = em_meta
+            if typ == "open":
+                f1_meta = _meta_from_subgroups("f1")
+                if f1_meta:
+                    meta["f1"] = f1_meta
+            if meta:
+                out[tkey][typ]["meta"] = meta
+
     # Apply Benjamini–Hochberg FDR if enabled
     if bool(cfg.get("stats", {}).get("enable_fdr", True)) and tests:
         # Collect p-values

@@ -66,3 +66,6 @@ AI_experiment_plan.txt
 
 # IDE-specific developer guidance
 WARP.md
+
+# Temporary firectl downloads
+.tmp_firectl/

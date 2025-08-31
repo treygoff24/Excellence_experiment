@@ -38,6 +38,7 @@ make eval
   - Subgroups: per-dataset effects (TriviaQA, NQ-Open, SQuAD v2)
   - Selective-risk: risk–coverage points and AURC; Non‑inferiority (TOST) for EM/F1
   - Mixed-effects robustness (optional): logistic GEE for EM, cluster‑robust linear model for F1
+  - Meta-analysis across datasets: fixed/random effects deltas with heterogeneity (Q, I², τ²)
 - **Cost Tracking**: Token usage monitoring with batch discount application
 - **Reproducibility**: Complete run manifests with prompts, parameters, and job IDs
 
@@ -164,6 +165,24 @@ python -m scripts.smoke_test --mode flow --n 2 --out_dir results/smoke
 python -m scripts.smoke_orchestration --n 3 --prompt_set operational_only
 # Add --keep to inspect outputs; default auto‑cleans its artifacts
 ```
+
+### Prompt Audit
+
+Quickly assess prompt token lengths and estimated input‑side cost deltas across prompt sets before running full evaluations:
+
+```
+# Makefile target
+make audit
+
+# Or directly
+python -m scripts.audit_prompts --config config/eval_config.yaml --out_json results/prompt_audit.json
+```
+
+The audit reports, per prompt set:
+- Control vs treatment token counts and deltas.
+- Approximate total input tokens and USD attributable to the system message only (lower bound; excludes per‑item instructions/context).
+- Simple checks for empty prompts and large length skews.
+
 
 ## Project Structure
 
@@ -298,6 +317,7 @@ unsupported:
   - Per temp/type: `mcnemar{b,c,p_exact,odds_ratio,or_ci_95,q_value}`
   - `metrics[k]` with `delta_mean`, `ci_95`, `wilcoxon{W,p_value,q_value}`, `hodges_lehmann`, `cohens_d`, `cliffs_delta`, `perm_p_value`
   - `subgroups.dataset[...]` (per-dataset effects)
+  - `meta{em,f1}` (if available): `fixed{delta_mean,ci_95}`, `random{delta_mean,ci_95,tau2}`, `heterogeneity{Q,df,p_value,I2}`
   - `selective_risk{thresholds,points,aurc}`
   - `tost{em,f1}` non-inferiority summaries
 - `scripts/unsupported_sensitivity.py` → `results/unsupported_sensitivity.json`

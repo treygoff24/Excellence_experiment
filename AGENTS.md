@@ -12,6 +12,7 @@
   - `results/`, `reports/` — top‑level summaries for simple runs.
 
 ## Build, Test, and Development Commands
+- Venv: `python -m venv .venv && source .venv/bin/activate`
 - Environment: `python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`
 - Make targets:
   - `make venv` — create venv and install deps.
@@ -51,6 +52,7 @@
   - Optional permutation p-values.
   - FDR q-values across temps/types/subgroups.
   - Subgroups per dataset; selective‑risk AURC and points; TOST non‑inferiority for EM/F1.
+  - Meta-analysis across datasets (EM, F1 open-book): fixed/random effects with heterogeneity (Q, I², τ²).
 - Optional robustness models: `scripts/mixed_effects.py` (GEE/OLS).
 
 ## Artifacts and Reports
@@ -67,6 +69,42 @@
 - Prefer `make smoke` and `scripts.smoke_orchestration` to validate changes quickly; keep seeds/config deterministic.
 - When editing stats/report schemas, document fields in README and keep backward compatibility when feasible.
 - Avoid network actions unless necessary; ask for approval when required.
+
+## Fireworks CLI (firectl)
+- Overview: Fireworks’ official CLI for managing datasets, batch inference jobs, deployments, models, and LoRA adapters. Useful for quick, manual ops or debugging alongside our scripted pipeline. Docs: https://fireworks.ai/docs/tools-sdks/firectl/firectl
+- Install:
+  - macOS/Homebrew: `brew install fw-ai/firectl/firectl` (or `brew tap fw-ai/firectl && brew install firectl`).
+  - Verify: `firectl version`.
+- Auth:
+  - `firectl auth login` to authenticate via browser, or set `FIREWORKS_API_KEY` in env (loaded automatically from `.env`).
+  - Prefer account selection by slug: pass `--account-id=<slug>` when needed (avoid empty shell expansions).
+- Common commands (discover via `firectl --help`):
+  - Datasets: `firectl create dataset`, `firectl list datasets`, `firectl get dataset <id_or_name>`.
+  - Batch jobs: `firectl list batch-jobs`, `firectl get batch-job <id_or_name>` (names may vary by version).
+  - Deployments/Models: `firectl create deployment|model`, `firectl list deployments|models`, `firectl update ...`, `firectl delete ...`.
+  - LoRA: `firectl load-lora`, `firectl unload-lora`.
+- How it maps to this repo:
+  - Dataset upload: alternative to `python -m fireworks.upload_dataset`. Use `firectl create-dataset` to upload prepared JSONL and capture the dataset ID.
+  - Start batch inference: alternative to `python -m fireworks.start_batch_job`. Use `firectl create batch-inference-job` (or your version’s equivalent) with your model/deployment and dataset ID.
+  - Monitor jobs: `firectl list batch-jobs` and `firectl get batch-job <id>`; logs may be available via a logs subcommand in some versions.
+  - Download results: our scripts `fireworks/poll_and_download.py` and `fireworks/parse_results.py` remain the primary path to pull and normalize outputs. Use CLI to retrieve job IDs and status if preferred.
+- Suggested workflows:
+  - Quick manual run:
+    1) `make build` (or `python -m scripts.build_batches ...`).
+    2) `firectl create-dataset ...` to upload the JSONL.
+    3) `firectl create batch-inference-job ... --dataset-id <id> ...`.
+    4) Poll with `firectl get batch-job <id>`. When complete, download results with `firectl download dataset <outputDatasetId> --output-dir results/raw_download`, then parse via `python -m fireworks.parse_results --job_id <id> --out_dir results/`.
+  - Orchestrated run (CLI‑assisted): run `python -m scripts.run_all ... --skip_prepare --skip_build` if you’ve already uploaded the dataset via CLI; provide the dataset/job IDs with the script flags if applicable.
+- Tips and caveats:
+  - Keep prepared inputs in the same JSONL schema our scorers expect; the CLI does not transform inputs.
+  - Use `--max-concurrent-jobs` in our orchestrator to control throughput; firectl itself doesn’t orchestrate multi‑part splitting for you.
+  - Cleanup: `firectl delete-resources` supports removing obsolete datasets/deployments/jobs; prefer deleting test artifacts after smoke runs.
+
+### Downloading results via CLI
+- Fast path: `firectl download dataset <outputDatasetId> --output-dir results/raw_download`
+  - Optional: `--download-lineage` to download the entire lineage chain of related datasets.
+- Python helper (does polling + extraction): `python -m fireworks.poll_and_download --account <account_slug> --job_name <job_id_or_name> --out_dir results/raw_download`.
+  - This polls, resolves `outputDatasetId`, downloads from `externalUrl`, extracts JSONL(s), and writes a combined `results.jsonl`.
 
 ## Commit & Pull Request Guidelines
 - Commits: concise, imperative summaries (e.g., "Improve batch splitting", "Update documentation for temperature=1.0 experiment").

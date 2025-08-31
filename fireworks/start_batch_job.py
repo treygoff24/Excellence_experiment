@@ -53,6 +53,26 @@ def _post_json_with_retries(url: str, headers: dict, json_payload: dict | None, 
     if last_exc:
         raise last_exc
     raise RuntimeError(f"POST {url} failed after {max_attempts} attempts")
+
+def _normalize_dataset_state(state: str | None) -> str:
+    """Normalize Fireworks dataset state strings to canonical tokens.
+    
+    Handles both proto-style (e.g., "DATASET_STATE_READY") and plain
+    (e.g., "READY") variants. Returns one of:
+    "READY", "FAILED", "PROCESSING", "PENDING", or original uppercased fallback.
+    """
+    if not state:
+        return ""
+    s = str(state).upper()
+    if "READY" in s:
+        return "READY"
+    if "FAILED" in s or "ERROR" in s:
+        return "FAILED"
+    if "PROCESSING" in s or "UPLOADING" in s or "BUILDING" in s:
+        return "PROCESSING"
+    if "PENDING" in s or "QUEUED" in s or "SUBMITTED" in s:
+        return "PENDING"
+    return s
 def create_batch_job(account_id: str, model: str, input_dataset_id: str, display_name=None,
                      temperature=None, max_tokens=None, top_p=None, top_k=None, stop=None):
     # Normalize account: accept "accounts/<slug>[/...]" or bare slug; extract just the slug
@@ -124,7 +144,9 @@ def create_batch_job(account_id: str, model: str, input_dataset_id: str, display
             resp = client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-        return data.get("state", "")
+        raw_state = data.get("state", "")
+        # Normalize dataset states similar to job states
+        return _normalize_dataset_state(raw_state)
 
     def wait_for_dataset_ready(account_id: str, dataset_id: str, timeout_sec: int = 900, poll_interval_sec: int = 5) -> bool:
         import time
@@ -134,6 +156,8 @@ def create_batch_job(account_id: str, model: str, input_dataset_id: str, display
             print(f"Dataset {dataset_id} state: {state}")
             if state == "READY":
                 return True
+            if state == "FAILED":
+                raise RuntimeError(f"Dataset {dataset_id} failed to process: {state}")
             time.sleep(poll_interval_sec)
         return False
 

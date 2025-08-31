@@ -30,3 +30,7 @@ eval:
 	$(PY) -m scripts.run_all
 smoke:
 	$(PY) -m scripts.smoke_test --config config/eval_config.yaml --mode flow --n 2 --out_dir results/smoke
+
+# Audit prompt token lengths and approximate input cost deltas
+audit:
+	$(PY) -m scripts.audit_prompts --config config/eval_config.yaml --out_json results/prompt_audit.json

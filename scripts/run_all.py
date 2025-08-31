@@ -3,6 +3,8 @@ import os, sys, json, hashlib, argparse, subprocess, re
 import yaml
 import csv
 import tarfile, zipfile, gzip, shutil
+import fcntl
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from dotenv import load_dotenv
@@ -157,10 +159,85 @@ def ensure_dirs(cfg: dict):
 def run_cmd(args: list[str]):
     print("+", " ".join(args)); sys.stdout.flush()
     subprocess.run(args, check=True)
+def _validate_manifest_schema(data: dict) -> bool:
+    """Validate manifest structure and required fields."""
+    try:
+        # Check top-level required fields
+        required_fields = ["created_utc", "run_id", "trial", "temps", "samples_per_item"]
+        for field in required_fields:
+            if field not in data:
+                print(f"Manifest validation failed: missing field '{field}'")
+                return False
+        
+        # Validate trial structure
+        trial = data.get("trial", {})
+        trial_fields = ["model_id", "prompt_set"]
+        for field in trial_fields:
+            if field not in trial:
+                print(f"Manifest validation failed: missing trial field '{field}'")
+                return False
+        
+        # Validate temps is a list
+        if not isinstance(data.get("temps"), list):
+            print(f"Manifest validation failed: 'temps' must be a list")
+            return False
+        
+        # Validate job_status structure (if exists)
+        job_status = data.get("job_status", {})
+        if job_status and not isinstance(job_status, dict):
+            print(f"Manifest validation failed: 'job_status' must be a dict")
+            return False
+        
+        return True
+    except Exception as e:
+        print(f"Manifest validation error: {e}")
+        return False
+
 def write_manifest(path: str, data: dict):
+    """Thread-safe atomic manifest writing with file locking and validation."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    
+    # Validate schema before writing
+    if not _validate_manifest_schema(data):
+        raise ValueError(f"Manifest validation failed for {path}")
+    
+    # Write to temporary file first, then atomic move
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", 
+            encoding="utf-8", 
+            dir=os.path.dirname(path), 
+            delete=False,
+            prefix=".tmp_manifest_",
+            suffix=".json"
+        ) as temp_file:
+            temp_path = temp_file.name
+            
+            # Acquire exclusive lock on temp file
+            fcntl.flock(temp_file.fileno(), fcntl.LOCK_EX)
+            
+            # Write data to temp file
+            json.dump(data, temp_file, indent=2)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        
+        # Atomic move to final location
+        if os.name == 'nt':  # Windows
+            # Windows doesn't support atomic replace, so remove first
+            if os.path.exists(path):
+                os.remove(path)
+        os.rename(temp_path, path)
+        temp_path = None  # Successfully moved
+        
+    except Exception as e:
+        # Clean up temp file on error
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+        raise e
 
 def _split_jsonl_file(
     src_path: str,
@@ -171,27 +248,52 @@ def _split_jsonl_file(
     lines_per_part: int | None = None,
     limit_items: int | None = None,
 ) -> list[tuple[int, str]]:
-    """Split a JSONL file into N approximately equal parts.
+    """Split a JSONL file into N approximately equal parts with validation.
 
     Returns a list of (part_number, part_path). If parts <= 1, returns [(1, src_path)].
-    If part files already exist and are non-empty, reuse them.
+    If part files already exist and are valid, reuse them.
     """
+    # Validate input file exists
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(f"Source JSONL file not found: {src_path}")
+    
     # Determine splitting mode: by lines per part or fixed number of parts
     parts = int(parts) if parts and int(parts) > 1 else None
     lines_per_part = int(lines_per_part) if lines_per_part and int(lines_per_part) > 0 else None
     if parts is None and lines_per_part is None:
-        # nothing to do
+        # nothing to do - validate source file has content
+        if os.path.getsize(src_path) == 0:
+            print(f"Warning: Source file {src_path} is empty")
         return [(1, src_path)]
     os.makedirs(out_dir, exist_ok=True)
-    # If splits already exist, reuse
+    # If splits already exist, validate and reuse them
     existing: list[tuple[int, str]] = []
     if parts is not None:
         for i in range(1, parts + 1):
             p = os.path.join(out_dir, f"{base_prefix}.p{i:02d}.jsonl")
-            if os.path.exists(p) and os.path.getsize(p) > 0:
+            if os.path.exists(p) and os.path.getsize(p) >= 0:  # Allow empty parts
                 existing.append((i, p))
         if len(existing) == parts:
-            return existing
+            # Validate that split files contain expected total lines
+            total_split_lines = 0
+            try:
+                for _, split_path in existing:
+                    with open(split_path, 'r', encoding='utf-8') as f:
+                        total_split_lines += sum(1 for line in f if line.strip())
+                        
+                # Count original lines for comparison
+                with open(src_path, 'r', encoding='utf-8') as f:
+                    original_lines = sum(1 for line in f if line.strip())
+                    if limit_items:
+                        original_lines = min(original_lines, int(limit_items))
+                
+                if total_split_lines == original_lines:
+                    print(f"Reusing validated splits: {len(existing)} parts, {total_split_lines} total lines")
+                    return existing
+                else:
+                    print(f"Split validation failed: {total_split_lines} != {original_lines} lines, regenerating")
+            except Exception as e:
+                print(f"Split validation error: {e}, regenerating")
     # Read all lines once and split (optionally limit first N lines)
     with open(src_path, "r", encoding="utf-8") as f:
         if limit_items is not None and int(limit_items) > 0:
@@ -234,6 +336,18 @@ def _split_jsonl_file(
         with open(p, "w", encoding="utf-8") as out:
             out.writelines(part_lines)
         out_files.append((i + 1, p))
+    
+    # Post-split validation
+    try:
+        total_written = sum(len([line for line in open(path, 'r', encoding='utf-8') if line.strip()]) 
+                          for _, path in out_files)
+        if total_written != n:
+            print(f"Warning: Split validation failed - wrote {total_written} lines, expected {n}")
+        else:
+            print(f"Split validation passed: {parts} parts, {total_written} total lines")
+    except Exception as e:
+        print(f"Warning: Could not validate split: {e}")
+    
     return out_files
 def main():
     load_dotenv()
@@ -379,14 +493,19 @@ def main():
         control_prompt = open(ctrl_path, "r", encoding="utf-8").read()
         treatment_prompt = open(trt_path, "r", encoding="utf-8").read()
 
-        # If resuming and a manifest exists, load and append to it; else start fresh
+        # If resuming and a manifest exists, load and validate it; else start fresh
         existing_manifest: dict | None = None
         manifest_path_pre = os.path.join(results_dir, "trial_manifest.json")
         if args.resume and os.path.isfile(manifest_path_pre):
             try:
                 with open(manifest_path_pre, "r", encoding="utf-8") as _mf:
                     existing_manifest = json.load(_mf)
-            except Exception:
+                # Validate existing manifest structure
+                if existing_manifest and not _validate_manifest_schema(existing_manifest):
+                    print(f"Warning: Invalid existing manifest at {manifest_path_pre}, starting fresh")
+                    existing_manifest = None
+            except Exception as e:
+                print(f"Warning: Could not load existing manifest: {e}")
                 existing_manifest = None
 
         trial_manifest = existing_manifest or {
@@ -424,9 +543,9 @@ def main():
                     jsonl_path,
                     cfg["paths"]["batch_inputs_dir"],
                     base_prefix,
-                    parts=int(args.parts_per_dataset) if args.lines_per_part is None else None,
-                    lines_per_part=int(args.lines_per_part) if args.lines_per_part else None,
-                    limit_items=int(args.limit_items) if args.limit_items else None,
+                    parts=(int(args.parts_per_dataset) if (args.lines_per_part is None and args.parts_per_dataset is not None) else None),
+                    lines_per_part=(int(args.lines_per_part) if args.lines_per_part is not None else None),
+                    limit_items=(int(args.limit_items) if args.limit_items is not None else None),
                 )
 
                 # Enforce Fireworks batch concurrency via QueueManager
@@ -447,15 +566,38 @@ def main():
                     job_status = (existing_manifest or {}).get("job_status", {}) or {}
                     names = jobs_map.get(resume_key) or []
                     if names and len(names) == len(part_files):
-                        # Check that all parts appear completed
-                        def _is_completed(val: str | None) -> bool:
-                            s = (str(val or "")).lower()
-                            return ("complete" in s) or (s == "completed") or (s == "downloaded")
+                        # Check that all parts appear completed AND have downloaded results
+                        def _is_completed_and_downloaded(jkey: str) -> bool:
+                            status = (str(job_status.get(jkey, "")).lower())
+                            if not (("complete" in status) or (status == "completed") or (status == "downloaded")):
+                                return False
+                            
+                            # Check if results file exists locally
+                            results_path = os.path.join(results_dir, jkey, "results.jsonl")
+                            if os.path.exists(results_path) and os.path.getsize(results_path) > 0:
+                                return True
+                            
+                            # Check for combined results file
+                            combined_path = os.path.join(results_dir, "results_combined.jsonl")
+                            if os.path.exists(combined_path):
+                                # Verify this job's results are in the combined file
+                                try:
+                                    with open(combined_path, 'r', encoding='utf-8') as f:
+                                        for line in f:
+                                            if line.strip() and jkey in line:
+                                                return True
+                                except Exception:
+                                    pass
+                            
+                            return False
+                        
                         all_done = True
                         for i in range(1, len(part_files) + 1):
                             jkey = f"{resume_key}_p{i:02d}"
-                            if not _is_completed(job_status.get(jkey)):
-                                all_done = False; break
+                            if not _is_completed_and_downloaded(jkey):
+                                all_done = False
+                                print(f"Resume: {jkey} incomplete or missing results, will retry")
+                                break
                         if all_done:
                             print(f"Resume: {resume_key} already completed; skipping queue.")
                             # ensure fields exist in manifest
@@ -467,13 +609,19 @@ def main():
                 dsids_for_cond: list[str] = []
                 planned_jobs: list[tuple[int, str]] = []
                 for part_number, part_path in part_files:
-                    # Per-part resume: skip parts already marked completed
+                    # Per-part resume: skip parts already completed AND downloaded
                     jkey_resume = f"{resume_key}_p{part_number:02d}"
                     if args.resume and existing_manifest:
                         prev_status = (existing_manifest.get("job_status", {}) or {}).get(jkey_resume)
-                        if str(prev_status or "").lower().find("complete") != -1 or str(prev_status or "").lower() == "downloaded":
-                            print(f"Resume: skipping already completed part {jkey_resume}")
-                            continue
+                        status_lower = str(prev_status or "").lower()
+                        if ("complete" in status_lower) or (status_lower == "downloaded"):
+                            # Also verify results file exists
+                            results_path = os.path.join(results_dir, jkey_resume, "results.jsonl")
+                            if os.path.exists(results_path) and os.path.getsize(results_path) > 0:
+                                print(f"Resume: skipping already completed part {jkey_resume} (results verified)")
+                                continue
+                            else:
+                                print(f"Resume: part {jkey_resume} marked completed but missing results, will retry")
                     ds_name = f"{display_name}-p{part_number:02d}"
                     if args.dry_run:
                         dsid = f"dryrun-{ds_name}"
@@ -651,7 +799,9 @@ def main():
         # Persist job metadata
         with open(os.path.join(results_dir, f"{job_key}_job.json"), "w", encoding="utf-8") as f:
             json.dump(job, f, indent=2)
-        if job.get("state") != "COMPLETED":
+        # Use normalized state computed by get_batch_job/poll_until_done to handle proto-style enums
+        state_norm = job.get("normalizedState") or str(job.get("state") or "").upper()
+        if state_norm != "COMPLETED":
             print(f"WARNING: job {job_key} not COMPLETED (state={job.get('state')}). Skipping download.")
             return
         out_ds_id = job.get("outputDatasetId") or job.get("output_dataset_id")

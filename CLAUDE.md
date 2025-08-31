@@ -16,6 +16,7 @@ This document orients Claude (and similar LLM agents) to the project’s structu
 - `results/`, `reports/` — top‑level outputs for simple runs (ignored in Git).
 
 ## How to Run
+- Environment (activate venv first): `python -m venv .venv && source .venv/bin/activate`
 - Full pipeline: `python -m scripts.run_all --config config/eval_config.yaml --archive` (or `make eval`).
 - Offline smoke: `make smoke` — generates a tiny end‑to‑end run locally.
 - Orchestrator smoke (dry‑run, auto‑cleanup): `python -m scripts.smoke_orchestration --n 3 --prompt_set operational_only [--keep]`.
@@ -57,6 +58,7 @@ unsupported:
 ## Outputs (schemas)
 - `significance.json` (schema_version=2):
   - `results["<temp>"]["open|closed"]` → `mcnemar{b,c,p_exact,odds_ratio,or_ci_95,q_value}`, `metrics[...]`, `subgroups`, `selective_risk`, `tost`.
+  - Optional `meta{em,f1}` per type: `fixed{delta_mean,ci_95}`, `random{delta_mean,ci_95,tau2}`, `heterogeneity{Q,df,p_value,I2}`.
 - Optional: `unsupported_sensitivity.json`, `mixed_models.json`, `power_analysis.json`, `cost_effectiveness.json`.
 - Report: `reports/report.md` includes all of the above.
 
@@ -77,3 +79,31 @@ unsupported:
 
 ## Contact
 - See EXPERIMENT_WORKFLOW.md and README for additional context on runs and organization.
+
+## Fireworks CLI (firectl)
+- Purpose: Command‑line control for Fireworks resources (datasets, batch inference jobs, deployments, models, LoRA). Handy for quick iteration and manual inspection alongside Python scripts. Reference: https://fireworks.ai/docs/tools-sdks/firectl/firectl
+- Install: `brew install fw-ai/firectl/firectl` (Homebrew). Confirm with `firectl version`.
+- Authenticate: `firectl auth login` or set env `FIREWORKS_API_KEY` (auto‑loaded from `.env`). Prefer passing `--account-id=<slug>` explicitly when switching orgs.
+- Core commands (discover via `firectl --help`):
+  - Datasets: `firectl create dataset`, `firectl list datasets`, `firectl get dataset <id_or_name>`.
+  - Batch inference: `firectl create batch-inference-job` (if available), `firectl list batch-jobs`, `firectl get batch-job <id_or_name>`.
+  - Deployments/Models: `firectl create deployment|model`, `firectl list deployments|models`, `firectl update ...`, `firectl delete ...`.
+  - LoRA: `firectl load-lora`, `firectl unload-lora`.
+- Using firectl with this repo:
+  - As a drop‑in for upload/start: you can upload prepared JSONL with `firectl create-dataset` instead of `fireworks/upload_dataset.py`, then start a job with `firectl create-batch-inference-job` instead of `fireworks/start_batch_job.py`.
+  - Monitoring: use `firectl list-resources batch-jobs` and `firectl get-resources batch-job <id>` for status; logs via `firectl get-batch-job-logs <id>`.
+  - Parsing results: keep using `python -m fireworks.parse_results` and downstream `scoring/*` to normalize, score, and analyze outputs; firectl doesn’t replace our parsing/statistics.
+- Example flow (manual smoke):
+  - `make build` → generate `data/batch_inputs/*.jsonl`.
+  - `firectl create-dataset ...` → note dataset ID.
+  - `firectl create batch-inference-job --dataset-id <id> --model <model_or_deployment> ...`.
+  - Wait for success (`firectl get batch-job <id>`), then download results with `firectl download dataset <outputDatasetId> --output-dir results/raw_download`. Parse with `python -m fireworks.parse_results --job_id <id> --out_dir results/` and continue with `make parse score stats report`.
+- Tips:
+  - Keep schemas consistent with our scorers; CLI won’t reshape inputs.
+  - For reproducible A/B runs, prefer `scripts.run_all` for splitting, concurrency control, and archiving; use firectl for spot‑checks or ad‑hoc jobs.
+  - Clean up with `firectl delete-resources` to avoid cluttering accounts with trial artifacts.
+
+### Downloading results via CLI
+- Fast path: `firectl download dataset <outputDatasetId> --output-dir results/raw_download`
+  - Optionally add `--download-lineage` to pull all related datasets.
+- Python helper (all‑in‑one): `python -m fireworks.poll_and_download --account <account_slug> --job_name <job_id_or_name> --out_dir results/raw_download` to poll, resolve `outputDatasetId`, download, extract, and combine into `results.jsonl`.
