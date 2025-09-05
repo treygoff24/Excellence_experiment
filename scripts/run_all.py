@@ -1,8 +1,18 @@
 from __future__ import annotations
-import os, sys, json, hashlib, argparse, subprocess, re
+import os
+import sys
+import json
+import hashlib
+import argparse
+import subprocess
+import re
+import shutil
 import yaml
 import csv
-import tarfile, zipfile, gzip, shutil
+import tarfile
+import zipfile
+import gzip
+import shutil
 import fcntl
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,6 +22,7 @@ from fireworks.upload_dataset import create_dataset, upload_dataset_file
 from fireworks.poll_and_download import poll_until_done, get_dataset, try_download_external_url
 from fireworks.batch_queue_manager import QueueManager
 from config.schema import load_config
+
 
 def _split_list_arg(val) -> list[str]:
     """Normalize an argparse value into a flat list.
@@ -26,9 +37,13 @@ def _split_list_arg(val) -> list[str]:
             parts.extend(p.strip() for p in str(x).split(",") if p and p.strip())
         return parts
     return [p.strip() for p in str(val).split(",") if p and p.strip()]
+
+
 def _format_temp_label(t: float) -> str:
     s = f"{float(t):.1f}"
     return "0" if s == "0.0" else s.replace(".", "")
+
+
 def token_len(text: str) -> int:
     try:
         import tiktoken
@@ -37,6 +52,7 @@ def token_len(text: str) -> int:
     except Exception:
         return len(text.split())
 
+
 def _format_float_for_slug(x: float) -> str:
     try:
         s = f"{float(x):.2f}"
@@ -44,8 +60,10 @@ def _format_float_for_slug(x: float) -> str:
         return str(x)
     return s.replace(".", "").rstrip("0") or "0"
 
+
 def _resolve_model_id(raw_model: str, aliases: dict) -> str:
     return (aliases or {}).get(raw_model, raw_model)
+
 
 def _model_short_name(model_id: str, aliases: dict) -> str:
     for k, v in (aliases or {}).items():
@@ -53,6 +71,7 @@ def _model_short_name(model_id: str, aliases: dict) -> str:
             return k
     base = model_id.split("/")[-1]
     return re.sub(r"[^a-zA-Z0-9_-]+", "-", base)
+
 
 def _trial_slug(model_id: str, prompt_set: str, top_p: float | None, top_k: int | None, mx: dict, *, aliases: dict | None = None) -> str:
     parts = [
@@ -72,6 +91,49 @@ def _trial_slug(model_id: str, prompt_set: str, top_p: float | None, top_k: int 
         pass
     return "-".join(str(p) for p in parts if p)
 
+
+def _abbr_prompt_set(name: str) -> str:
+    """Create a compact, stable abbreviation for long prompt set names.
+
+    Example: "structure_without_content" -> "swc"; "length_matched_best_practices" -> "lmbp".
+    Falls back to a short hash if the abbreviation is too short.
+    """
+    if not name:
+        return "def"
+    tokens = re.split(r"[^a-zA-Z0-9]+", str(name))
+    letters = "".join(t[0] for t in tokens if t)
+    if len(letters) >= 3:
+        return letters.lower()
+    # Fallback: first 6 chars of sha1
+    h = hashlib.sha1(str(name).encode()).hexdigest()[:6]
+    return (letters + h).lower()
+
+
+def _make_dataset_display_name(ps_name: str, t_label: str, cond: str, run_id: str, part_number: int) -> str:
+    """Construct a dataset display name guaranteed to be <64 chars.
+
+    Strategy: use abbreviated prompt set + short run id; aggressively trim if needed.
+    """
+    ps_abbr = _abbr_prompt_set(ps_name)
+    rid_short = (run_id or "").strip()
+    if len(rid_short) > 8:
+        rid_short = rid_short[-8:]
+    base = f"ex-{ps_abbr}-t{t_label}-{cond}-{rid_short}-p{int(part_number):02d}"
+    if len(base) < 64:
+        return base
+    # Further trim: shorten cond and ps_abbr if still too long
+    cond_short = cond[0] if cond else "c"
+    ps_short = ps_abbr[:6]
+    rid_short = rid_short[-6:] if len(rid_short) > 6 else rid_short
+    base2 = f"x-{ps_short}-t{t_label}-{cond_short}-{rid_short}-p{int(part_number):02d}"
+    if len(base2) < 64:
+        return base2
+    # Last resort: use hash suffix
+    suffix = hashlib.sha1(base.encode()).hexdigest()[:6]
+    base3 = f"x-{ps_short}-t{t_label}-{cond_short}-{suffix}-p{int(part_number):02d}"
+    return base3[:63]
+
+
 def _expand_trials(cfg: dict, args) -> list[dict]:
     aliases = cfg.get("model_aliases", {}) or {}
     cli_models = _split_list_arg(getattr(args, "models", None))
@@ -86,7 +148,24 @@ def _expand_trials(cfg: dict, args) -> list[dict]:
 
     def _temps_from_arg_or_cfg():
         if getattr(args, "temps", None):
-            return [float(t) for t in _split_list_arg(args.temps)]
+            vals: list[float] = []
+            for tok in _split_list_arg(args.temps):
+                # Tolerate stray '-' or mistakenly concatenated tokens like 'parts_per_dataset=24'
+                if tok in ("-", "--"):
+                    print("Warning: ignoring stray '-' token in --temps")
+                    continue
+                try:
+                    vals.append(float(tok))
+                except Exception:
+                    # Ignore clearly non-numeric tokens that likely belong to other flags
+                    if any(ch.isalpha() for ch in tok) or ("=" in tok):
+                        print(f"Warning: ignoring non-numeric token in --temps: {tok}")
+                        continue
+                    # Last resort: re-raise
+                    raise
+            if not vals:
+                return cfg.get("temps") or [0.0]
+            return vals
         return cfg.get("temps") or [0.0]
 
     base_temps = _temps_from_arg_or_cfg()
@@ -153,22 +232,52 @@ def _expand_trials(cfg: dict, args) -> list[dict]:
             "max_new_tokens": base_mx,
         })
     return trials
+
+
 def ensure_dirs(cfg: dict):
-    for k in ["prepared_dir","batch_inputs_dir","results_dir","reports_dir"]:
+    for k in ["prepared_dir", "batch_inputs_dir", "results_dir", "reports_dir"]:
         os.makedirs(cfg["paths"][k], exist_ok=True)
+
+
 def run_cmd(args: list[str]):
-    print("+", " ".join(args)); sys.stdout.flush()
+    print("+", " ".join(args))
+    sys.stdout.flush()
     subprocess.run(args, check=True)
+
+
 def _validate_manifest_schema(data: dict) -> bool:
-    """Validate manifest structure and required fields."""
+    """Validate manifest structure and required fields.
+
+    Supports two manifest types:
+    - Per-trial manifest (includes temps, samples_per_item, trial block)
+    - Multi-trial summary (includes trials list and num_trials)
+    """
     try:
-        # Check top-level required fields
-        required_fields = ["created_utc", "run_id", "trial", "temps", "samples_per_item"]
+        # Multi-trial summary manifest
+        if isinstance(data, dict) and "trials" in data:
+            required_fields = ["created_utc", "run_id", "num_trials", "trials"]
+            for field in required_fields:
+                if field not in data:
+                    print(f"Manifest validation failed: missing field '{field}'")
+                    return False
+            if not isinstance(data.get("trials"), list):
+                print("Manifest validation failed: 'trials' must be a list")
+                return False
+            # Light validation of entries
+            for entry in data.get("trials", []):
+                tr = (entry or {}).get("trial", {})
+                if tr and ("model_id" not in tr or "prompt_set" not in tr):
+                    print("Manifest validation failed: multi-trial entry missing trial metadata")
+                    return False
+            return True
+
+        # Per-trial manifest
+        required_fields = ["created_utc", "run_id", "temps", "samples_per_item"]
         for field in required_fields:
             if field not in data:
                 print(f"Manifest validation failed: missing field '{field}'")
                 return False
-        
+
         # Validate trial structure
         trial = data.get("trial", {})
         trial_fields = ["model_id", "prompt_set"]
@@ -176,52 +285,53 @@ def _validate_manifest_schema(data: dict) -> bool:
             if field not in trial:
                 print(f"Manifest validation failed: missing trial field '{field}'")
                 return False
-        
+
         # Validate temps is a list
         if not isinstance(data.get("temps"), list):
             print(f"Manifest validation failed: 'temps' must be a list")
             return False
-        
+
         # Validate job_status structure (if exists)
         job_status = data.get("job_status", {})
         if job_status and not isinstance(job_status, dict):
             print(f"Manifest validation failed: 'job_status' must be a dict")
             return False
-        
+
         return True
     except Exception as e:
         print(f"Manifest validation error: {e}")
         return False
 
+
 def write_manifest(path: str, data: dict):
     """Thread-safe atomic manifest writing with file locking and validation."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    
+
     # Validate schema before writing
     if not _validate_manifest_schema(data):
         raise ValueError(f"Manifest validation failed for {path}")
-    
+
     # Write to temporary file first, then atomic move
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", 
-            encoding="utf-8", 
-            dir=os.path.dirname(path), 
+            mode="w",
+            encoding="utf-8",
+            dir=os.path.dirname(path),
             delete=False,
             prefix=".tmp_manifest_",
             suffix=".json"
         ) as temp_file:
             temp_path = temp_file.name
-            
+
             # Acquire exclusive lock on temp file
             fcntl.flock(temp_file.fileno(), fcntl.LOCK_EX)
-            
+
             # Write data to temp file
             json.dump(data, temp_file, indent=2)
             temp_file.flush()
             os.fsync(temp_file.fileno())
-        
+
         # Atomic move to final location
         if os.name == 'nt':  # Windows
             # Windows doesn't support atomic replace, so remove first
@@ -229,7 +339,7 @@ def write_manifest(path: str, data: dict):
                 os.remove(path)
         os.rename(temp_path, path)
         temp_path = None  # Successfully moved
-        
+
     except Exception as e:
         # Clean up temp file on error
         if temp_path and os.path.exists(temp_path):
@@ -238,6 +348,7 @@ def write_manifest(path: str, data: dict):
             except Exception:
                 pass
         raise e
+
 
 def _split_jsonl_file(
     src_path: str,
@@ -256,7 +367,7 @@ def _split_jsonl_file(
     # Validate input file exists
     if not os.path.exists(src_path):
         raise FileNotFoundError(f"Source JSONL file not found: {src_path}")
-    
+
     # Determine splitting mode: by lines per part or fixed number of parts
     parts = int(parts) if parts and int(parts) > 1 else None
     lines_per_part = int(lines_per_part) if lines_per_part and int(lines_per_part) > 0 else None
@@ -280,13 +391,13 @@ def _split_jsonl_file(
                 for _, split_path in existing:
                     with open(split_path, 'r', encoding='utf-8') as f:
                         total_split_lines += sum(1 for line in f if line.strip())
-                        
+
                 # Count original lines for comparison
                 with open(src_path, 'r', encoding='utf-8') as f:
                     original_lines = sum(1 for line in f if line.strip())
                     if limit_items:
                         original_lines = min(original_lines, int(limit_items))
-                
+
                 if total_split_lines == original_lines:
                     print(f"Reusing validated splits: {len(existing)} parts, {total_split_lines} total lines")
                     return existing
@@ -336,19 +447,21 @@ def _split_jsonl_file(
         with open(p, "w", encoding="utf-8") as out:
             out.writelines(part_lines)
         out_files.append((i + 1, p))
-    
+
     # Post-split validation
     try:
-        total_written = sum(len([line for line in open(path, 'r', encoding='utf-8') if line.strip()]) 
-                          for _, path in out_files)
+        total_written = sum(len([line for line in open(path, 'r', encoding='utf-8') if line.strip()])
+                            for _, path in out_files)
         if total_written != n:
             print(f"Warning: Split validation failed - wrote {total_written} lines, expected {n}")
         else:
             print(f"Split validation passed: {parts} parts, {total_written} total lines")
     except Exception as e:
         print(f"Warning: Could not validate split: {e}")
-    
+
     return out_files
+
+
 def main():
     load_dotenv()
     ap = argparse.ArgumentParser()
@@ -373,10 +486,10 @@ def main():
     ap.add_argument("--dry_run", action="store_true", help="Offline mode: do not hit Fireworks; synthesize completed jobs and results for testing")
     args = ap.parse_args()
     cfg = load_config(args.config)
-    
+
     # Generate or use provided run_id
     run_id = args.run_id or datetime.utcnow().strftime("r%Y%m%d%H%M%S")
-    
+
     # Expand trials and determine run root
     experiments_dir = cfg.get("paths", {}).get("experiments_dir", "experiments")
     trials = _expand_trials(cfg, args)
@@ -424,7 +537,9 @@ def main():
         # Write a minimal multi-trial plan and exit
         plan = {"created_utc": datetime.utcnow().isoformat() + "Z", "run_id": run_id, "num_trials": len(trials), "trials": trials}
         write_manifest(multi_manifest_path, plan)
-        print("Prepared inputs only (skip_batch). Plan written:", multi_manifest_path); return
+        print("Prepared inputs only (skip_batch). Plan written:", multi_manifest_path)
+        return
+
     def _derive_account_id(raw: str | None) -> str:
         """Return a Fireworks account slug suitable for /v1/accounts/{slug}/... paths.
 
@@ -533,6 +648,7 @@ def main():
             for cond in conditions:
                 suffix = f"_{ps_name}" if (len(prompt_sets_cfg) > 1 or ps_name not in ("default", None)) else ""
                 jsonl_path = os.path.join(cfg["paths"]["batch_inputs_dir"], f"t{t_str}{suffix}_{cond}.jsonl")
+                # Keep the human-readable trial display separate from dataset names (which must be short)
                 display_name = f"excellence-{ps_name}-t{t_str}-{cond}-{run_id}"
                 if not os.path.isfile(jsonl_path):
                     raise SystemExit(f"Missing input file: {jsonl_path}")
@@ -571,12 +687,12 @@ def main():
                             status = (str(job_status.get(jkey, "")).lower())
                             if not (("complete" in status) or (status == "completed") or (status == "downloaded")):
                                 return False
-                            
+
                             # Check if results file exists locally
                             results_path = os.path.join(results_dir, jkey, "results.jsonl")
                             if os.path.exists(results_path) and os.path.getsize(results_path) > 0:
                                 return True
-                            
+
                             # Check for combined results file
                             combined_path = os.path.join(results_dir, "results_combined.jsonl")
                             if os.path.exists(combined_path):
@@ -588,9 +704,9 @@ def main():
                                                 return True
                                 except Exception:
                                     pass
-                            
+
                             return False
-                        
+
                         all_done = True
                         for i in range(1, len(part_files) + 1):
                             jkey = f"{resume_key}_p{i:02d}"
@@ -622,7 +738,8 @@ def main():
                                 continue
                             else:
                                 print(f"Resume: part {jkey_resume} marked completed but missing results, will retry")
-                    ds_name = f"{display_name}-p{part_number:02d}"
+                    # Create a safe, short dataset display name (<64 chars) to satisfy API constraints
+                    ds_name = _make_dataset_display_name(ps_name, t_str, cond, run_id, part_number)
                     if args.dry_run:
                         dsid = f"dryrun-{ds_name}"
                     else:
@@ -641,8 +758,16 @@ def main():
                 # Persist the manifest immediately (early state)
                 write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
 
-                # Dry-run path: synthesize completion and results for each part, then skip actual queueing
+                # Dry-run path: simulate queue concurrency lifecycle (no API calls)
                 if args.dry_run:
+                    try:
+                        # Exercise queue scheduling beyond concurrency limit without submitting real jobs
+                        queue.run_queue_simulated(results_dir)
+                    except Exception:
+                        # Best-effort; continue to synthesize artifacts
+                        pass
+
+                    # Then synthesize completion and results for each part
                     import json as _json
                     os.makedirs(results_dir, exist_ok=True)
                     for part_number, dsid in planned_jobs:
@@ -817,11 +942,34 @@ def main():
         except Exception as e:
             print(f"WARNING: could not fetch dataset metadata for {job_key}: {e}")
             ext = None
-        if not ext:
-            # Leave OUTPUT_DATASET_ID for later manual or resumed download
-            return
         job_dir = os.path.join(results_dir, job_key)
         os.makedirs(job_dir, exist_ok=True)
+        if not ext:
+            # Fallback: try firectl CLI if available
+            try:
+                if shutil.which("firectl"):
+                    ds_id_short = out_ds_id.split("/")[-1]
+                    cmd = ["firectl", "download", "dataset", ds_id_short, "--output-dir", job_dir]
+                    print("Attempting CLI download:", " ".join(cmd))
+                    subprocess.run(cmd, check=True)
+                    # If CLI succeeds, try to find any JSONL
+                    extracted_any = False
+                    for root, _dirs, files in os.walk(job_dir):
+                        for nm in files:
+                            if nm.lower().endswith('.jsonl'):
+                                extracted_any = True
+                                break
+                        if extracted_any:
+                            break
+                    if extracted_any:
+                        print(f"Downloaded via firectl for {job_key}")
+                    else:
+                        print(f"firectl finished but no JSONL found for {job_key}")
+                    return
+            except Exception as e:
+                print(f"WARNING: firectl fallback failed for {job_key}: {e}")
+            # Leave OUTPUT_DATASET_ID for later manual or resumed download
+            return
         try:
             p = try_download_external_url(ext, job_dir)
             print(f"Downloaded dataset for {job_key} to {p}")
@@ -974,6 +1122,7 @@ def main():
                 if key not in agg:
                     agg[key] = {"em": 0.0, "f1": 0.0, "abstain_rate": 0.0, "false_answer_rate": 0.0, "unsupported_rate": 0.0}
                     counts[key] = 0
+
                 def _to_float(x):
                     try:
                         return float(x)
@@ -1051,8 +1200,10 @@ def main():
                 lines.append("|---|---:|---:|---:|---:|---:|")
                 row_ctrl = means.get((float(temp), "control", typ), {})
                 row_trt = means.get((float(temp), "treatment", typ), {})
+
                 def fmt(x):
                     return f"{(x or 0.0)*100:.1f}%" if 0.0 <= (x or 0.0) <= 1.0 else f"{x:.3f}"
+
                 def val(d, k):
                     return d.get(k, 0.0)
                 lines.append(f"| Control | {fmt(val(row_ctrl,'em'))} | {fmt(val(row_ctrl,'f1'))} | {fmt(val(row_ctrl,'abstain_rate'))} | {fmt(val(row_ctrl,'false_answer_rate'))} | {fmt(val(row_ctrl,'unsupported_rate'))} |")
@@ -1145,5 +1296,7 @@ def main():
             print("Wrote aggregate report:", agg_path)
         except Exception as e:
             print(f"WARNING: Failed to write aggregate report: {e}")
+
+
 if __name__ == "__main__":
     main()

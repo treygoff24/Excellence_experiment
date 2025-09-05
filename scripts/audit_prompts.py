@@ -34,7 +34,7 @@ def _count_lines(path: str) -> int:
 
 
 def _fmt_usd(x: float) -> str:
-        return f"${x:,.4f}"
+    return f"${x:,.4f}"
 
 
 def audit_prompts(cfg: dict) -> Dict:
@@ -210,4 +210,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

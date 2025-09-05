@@ -6,6 +6,7 @@ import time
 import argparse
 import random
 import threading
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
@@ -64,6 +65,7 @@ class QueueManager:
     progress_cb: Optional[Callable[[dict], None]] = None
     _lock: threading.RLock = field(default_factory=threading.RLock)
     _submission_semaphore: Optional[threading.Semaphore] = None
+    quota_blocked: bool = False  # pause submissions until at least one running job completes
     
     def __post_init__(self):
         """Initialize semaphore after dataclass creation"""
@@ -97,7 +99,7 @@ class QueueManager:
         # Acquire semaphore to limit concurrent submissions
         if not self._submission_semaphore.acquire(timeout=30.0):
             print(f"✗ Timeout acquiring semaphore for P{job.part_number:02d}")
-            job.status = "failed"
+            # Do not mark failed; keep pending so we retry later
             return False
             
         try:
@@ -146,11 +148,20 @@ class QueueManager:
                     return False
                     
         except Exception as e:
-            print(f"✗ Failed to submit job P{job.part_number:02d}: {e}")
+            msg = str(e)
+            print(f"✗ Failed to submit job P{job.part_number:02d}: {msg}")
+            # If Fireworks quota/concurrency is reached, keep job pending and pause submissions
+            quota_hit = ("job-submission-count" in msg) or ("quota" in msg.lower())
             with self._lock:
-                job.status = "failed"
-                job.add_state_transition("FAILED")
-                job.last_error = str(e)
+                if quota_hit:
+                    job.last_error = msg
+                    self.quota_blocked = True
+                    print("Submission paused until a running job completes (quota full).")
+                else:
+                    # Genuine failure: mark failed
+                    job.status = "failed"
+                    job.add_state_transition("FAILED")
+                    job.last_error = msg
             self._submission_semaphore.release()  # Release on exception
             return False
     
@@ -295,7 +306,35 @@ class QueueManager:
                             })
                             return True
 
-            # If no ext url or failed download, leave a breadcrumb so a later pass can fetch from UI
+            # If no ext url or failed HTTP download, try firectl CLI if available
+            try:
+                if not ext_url and shutil.which("firectl"):
+                    ds_id_short = (out_ds_id or "").split("/")[-1]
+                    cmd = ["firectl", "download", "dataset", ds_id_short, "--output-dir", job_dir]
+                    print("Attempting CLI download:", " ".join(cmd))
+                    import subprocess as _sp
+                    _sp.run(cmd, check=True)
+                    # Best-effort: if JSONLs exist, mark as downloaded
+                    jsonl_found = False
+                    for r, _d, files in os.walk(job_dir):
+                        for nm in files:
+                            if nm.lower().endswith('.jsonl'):
+                                jsonl_found = True
+                                break
+                        if jsonl_found:
+                            break
+                    if jsonl_found:
+                        self._safe_progress_callback({
+                            "event": "downloaded",
+                            "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
+                            "job_name": job.job_name,
+                        })
+                        print(f"✓ Downloaded results via firectl for P{job.part_number:02d}")
+                        return True
+            except Exception as e:
+                print(f"CLI download failed for P{job.part_number:02d}: {e}")
+
+            # If still no results, leave a breadcrumb so a later pass can fetch from UI
             if out_ds_id:
                 with open(os.path.join(results_dir, f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}_OUTPUT_DATASET_ID.txt"), "w", encoding="utf-8") as f:
                     f.write(str(out_ds_id))
@@ -337,16 +376,23 @@ class QueueManager:
         
         while True:
             # Submit new jobs if possible
-            while self.can_submit_more():
+            while self.can_submit_more() and not self.quota_blocked:
                 next_job = self.get_next_pending()
                 if next_job is None:
                     break  # No more pending jobs
                 
-                self.submit_job(next_job)
+                ok = self.submit_job(next_job)
+                # If quota blocked, stop submitting until a completion occurs
+                if not ok and self.quota_blocked:
+                    break
                 time.sleep(2)  # Brief pause between submissions
             
             # Check running jobs
             completed_jobs = self.check_running_jobs()
+            if completed_jobs:
+                # A completion frees a slot; allow submissions again
+                with self._lock:
+                    self.quota_blocked = False
             
             # Download results for completed jobs
             for job in completed_jobs:
@@ -369,6 +415,72 @@ class QueueManager:
             else:
                 print("No running jobs, checking again in 5s...")
                 time.sleep(5)
+
+    def run_queue_simulated(self, results_dir: str, *, avg_job_seconds: float = 0.05, jitter_seconds: float = 0.02):
+        """Simulate queue processing without hitting the Fireworks API.
+
+        Exercises concurrency limits, submission gating, and lifecycle transitions,
+        but does not create real jobs or download results.
+        """
+        print(f"Starting SIMULATED queue with max {self.max_concurrent} concurrent jobs")
+
+        def _sim_worker(job: JobInfo):
+            # Simulate job running and completion
+            delay = max(0.0, random.uniform(avg_job_seconds - jitter_seconds, avg_job_seconds + jitter_seconds))
+            time.sleep(delay)
+            with self._lock:
+                # Mark complete and release resources
+                if job.job_name in self.running_jobs:
+                    del self.running_jobs[job.job_name]
+                job.complete_time = datetime.now()
+                job.status = "completed"
+                job.add_state_transition("COMPLETED")
+            self._submission_semaphore.release()
+            self._safe_progress_callback({
+                "event": "state",
+                "job_key": f"t{self.temp_label}_{self.condition}_p{job.part_number:02d}",
+                "job_name": job.job_name,
+                "state": "COMPLETED",
+                "timestamp": datetime.now().isoformat(),
+                "duration": job.get_duration(),
+            })
+
+        threads: list[threading.Thread] = []
+        max_running_peak = 0
+        while True:
+            # Submit up to max_concurrent pending jobs
+            while self.can_submit_more():
+                next_job = self.get_next_pending()
+                if next_job is None:
+                    break
+                # Acquire a slot
+                if not self._submission_semaphore.acquire(timeout=5.0):
+                    print(f"SIM: timeout acquiring semaphore for P{next_job.part_number:02d}")
+                    break
+                with self._lock:
+                    next_job.status = "running"
+                    next_job.submit_time = datetime.now()
+                    next_job.add_state_transition("SUBMITTED")
+                    # Assign a synthetic job name and register as running
+                    next_job.job_name = f"sim/t{self.temp_label}_{self.condition}_p{next_job.part_number:02d}"
+                    self.running_jobs[next_job.job_name] = next_job
+                t = threading.Thread(target=_sim_worker, args=(next_job,), daemon=True)
+                t.start()
+                threads.append(t)
+            # Track peak running
+            with self._lock:
+                max_running_peak = max(max_running_peak, len(self.running_jobs))
+            # Exit when all jobs finished
+            with self._lock:
+                pending_left = any(j.status == "pending" for j in self.jobs)
+                running_left = bool(self.running_jobs)
+            if not pending_left and not running_left:
+                break
+            time.sleep(0.01)
+        # Join threads to be safe
+        for t in threads:
+            t.join(timeout=1.0)
+        print(f"SIMULATED queue complete (peak running: {max_running_peak})")
 
 
 def upload_datasets(account_id: str, dataset_files: List[Tuple[int, str]], base_name: str, temp_label: str, condition: str) -> List[Tuple[int, str]]:

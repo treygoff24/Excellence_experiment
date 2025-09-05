@@ -1,5 +1,9 @@
 from __future__ import annotations
-import os, json, random, hashlib, argparse
+import os
+import json
+import random
+import hashlib
+import argparse
 from dataclasses import dataclass, asdict
 from typing import List, Optional
 from datasets import load_dataset
@@ -7,6 +11,8 @@ from tqdm import tqdm
 import yaml
 from config.schema import load_config
 RANDOM_SEED = 2025
+
+
 @dataclass
 class OpenBookItem:
     dataset: str
@@ -15,22 +21,32 @@ class OpenBookItem:
     question: str
     answers: list
     is_unanswerable: bool
+
+
 @dataclass
 class ClosedBookItem:
     dataset: str
     id: str
     question: str
     answers: list
+
+
 def write_jsonl(path: str, rows: list) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
 def limit(items: list, n: Optional[int]) -> list:
     return items if n is None else items[:n]
+
+
 def clean_text(s: str) -> str:
     return " ".join(s.strip().split())
-def load_squad_v2(max_items: Optional[int]=None) -> List[OpenBookItem]:
+
+
+def load_squad_v2(max_items: Optional[int] = None) -> List[OpenBookItem]:
     ds = load_dataset("squad_v2", split="validation")
     rows = []
     for ex in tqdm(ds, desc="SQuAD v2"):
@@ -46,7 +62,9 @@ def load_squad_v2(max_items: Optional[int]=None) -> List[OpenBookItem]:
         ))
     random.Random(RANDOM_SEED).shuffle(rows)
     return limit(rows, max_items)
-def load_triviaqa_rc_nocontext(max_items: Optional[int]=None) -> List[ClosedBookItem]:
+
+
+def load_triviaqa_rc_nocontext(max_items: Optional[int] = None) -> List[ClosedBookItem]:
     ds = load_dataset("trivia_qa", "rc.nocontext", split="validation")
     rows = []
     for ex in tqdm(ds, desc="TriviaQA rc.nocontext"):
@@ -64,7 +82,9 @@ def load_triviaqa_rc_nocontext(max_items: Optional[int]=None) -> List[ClosedBook
         ))
     random.Random(RANDOM_SEED).shuffle(rows)
     return limit(rows, max_items)
-def load_nq_open(max_items: Optional[int]=None) -> List[ClosedBookItem]:
+
+
+def load_nq_open(max_items: Optional[int] = None) -> List[ClosedBookItem]:
     ds = load_dataset("nq_open", split="validation")
     rows = []
     for ex in tqdm(ds, desc="NQ-Open"):
@@ -78,6 +98,8 @@ def load_nq_open(max_items: Optional[int]=None) -> List[ClosedBookItem]:
         ))
     random.Random(RANDOM_SEED).shuffle(rows)
     return limit(rows, max_items)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config/eval_config.yaml")
@@ -96,5 +118,7 @@ def main():
     write_jsonl(os.path.join(prepared_dir, "open_book.jsonl"), [asdict(x) for x in open_book])
     write_jsonl(os.path.join(prepared_dir, "closed_book.jsonl"), [asdict(x) for x in closed_book])
     print("Prepared", len(open_book), "open-book;", len(closed_book), "closed-book")
+
+
 if __name__ == "__main__":
     main()

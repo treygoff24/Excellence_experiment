@@ -311,7 +311,7 @@ def create_dataset(display_name: str, account_id: str) -> str:
     # Per docs, send datasetId in the request body and include displayName
     payload = {
         "dataset": {
-            "displayName": display_name,
+            "displayName": display_name[:63],
             # Mark as user uploaded so we can upload files into it
             "userUploaded": {},
         },
