@@ -1,5 +1,9 @@
 from __future__ import annotations
-import os, csv, json, argparse, math
+import os
+import csv
+import json
+import argparse
+import math
 from collections import defaultdict
 from typing import Dict, List, Tuple, Any
 
@@ -58,6 +62,7 @@ def _baptista_pike_or_ci(b: int, c: int, alpha: float = 0.05) -> tuple[float, fl
         hi_p = stats.beta.ppf(1 - alpha / 2.0, b + 1, max(c, 0)) if c > 0 else 1.0
     except Exception:
         lo_p, hi_p = 0.0, 1.0
+
     def to_or(p: float) -> float:
         if p <= 0.0:
             return 0.0
@@ -171,22 +176,22 @@ def _perm_p_value(deltas: np.ndarray, R: int, rng: np.random.Generator) -> float
 
 def compute_stats(per_item_csv: str, cfg: dict) -> dict:
     rows = load_per_item(per_item_csv)
-    
+
     # Data validation: check for imbalanced conditions
     condition_counts = defaultdict(int)
     for row in rows:
         condition = row.get("condition")
         if condition:
             condition_counts[condition] += 1
-    
+
     if condition_counts:
         print(f"Data balance check:")
         for cond, count in sorted(condition_counts.items()):
             print(f"  {cond}: {count:,} items")
-        
+
         control_count = condition_counts.get("control", 0)
         treatment_count = condition_counts.get("treatment", 0)
-        
+
         if control_count > 0 and treatment_count > 0:
             ratio = max(control_count, treatment_count) / min(control_count, treatment_count)
             if ratio > 5.0:
@@ -198,9 +203,9 @@ def compute_stats(per_item_csv: str, cfg: dict) -> dict:
             print(f"❌ ERROR: No control data found! Only treatment data present.")
         elif treatment_count == 0:
             print(f"❌ ERROR: No treatment data found! Only control data present.")
-    
+
     paired = _paired_lists(rows)
-    
+
     # Additional validation: paired vs unpaired counts
     total_items = len(rows)
     paired_items = sum(len(items) for items in paired.values())
@@ -276,6 +281,7 @@ def compute_stats(per_item_csv: str, cfg: dict) -> dict:
             }
         # Selective risk curves
         thresholds: list[float] = list(cfg.get("stats", {}).get("risk_thresholds", [0.0, 0.5, 1.0]))
+
         def _risk_points(em_list: list[float], abst_list: list[float]) -> list[dict]:
             pts: list[dict] = []
             # assume same K across items; compute pooled metrics via sums
@@ -299,6 +305,7 @@ def compute_stats(per_item_csv: str, cfg: dict) -> dict:
 
         ctrl_pts = _risk_points(ctrl_em_vals, ctrl_abst_vals)
         trt_pts = _risk_points(trt_em_vals, trt_abst_vals)
+
         def _aurc(points: list[dict]) -> float | None:
             # Trapezoid area over coverage vs risk; skip None
             xs = [p["coverage"] for p in points if p["coverage"] is not None and p["risk"] is not None]
@@ -533,6 +540,7 @@ def main():
             "results": results,
         }, f, indent=2)
     print("Wrote", args.out_path)
-    
+
+
 if __name__ == "__main__":
     main()

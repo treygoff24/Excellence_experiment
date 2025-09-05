@@ -117,20 +117,20 @@ def write_report(cfg: dict, manifest: dict, means: dict, significance: dict, cos
         lines.append(f"- Treatment prompt tokens: {manifest['prompts']['treatment']['tokens']}")
     except Exception:
         pass
-    
+
     # Add data balance information
     lines.append("")
     lines.append("## Data Balance")
     lines.append("")
-    
+
     if counts:
         # Calculate condition totals
         control_total = sum(count for (temp, cond, typ), count in counts.items() if cond == "control")
         treatment_total = sum(count for (temp, cond, typ), count in counts.items() if cond == "treatment")
-        
+
         lines.append(f"- Control items: {control_total:,}")
         lines.append(f"- Treatment items: {treatment_total:,}")
-        
+
         if control_total > 0 and treatment_total > 0:
             ratio = max(control_total, treatment_total) / min(control_total, treatment_total)
             lines.append(f"- Ratio: {ratio:.1f}:1")
@@ -139,10 +139,10 @@ def write_report(cfg: dict, manifest: dict, means: dict, significance: dict, cos
             elif ratio > 2.0:
                 lines.append("- ℹ️  **Note**: Moderate data imbalance")
         elif control_total == 0:
-            lines.append("- ❌ **Error**: No control data found")  
+            lines.append("- ❌ **Error**: No control data found")
         elif treatment_total == 0:
             lines.append("- ❌ **Error**: No treatment data found")
-            
+
         # Calculate pairing rate from significance results
         if significance and "results" in significance:
             paired_counts = []
@@ -150,15 +150,15 @@ def write_report(cfg: dict, manifest: dict, means: dict, significance: dict, cos
                 for typ_key, typ_results in temp_results.items():
                     if "n_items" in typ_results:
                         paired_counts.append(typ_results["n_items"])
-            
+
             if paired_counts:
                 total_paired = max(paired_counts)  # Should be same across temps/types
                 total_items = control_total + treatment_total
                 pairing_rate = total_paired / total_items if total_items > 0 else 0
-                
+
                 lines.append("")
                 lines.append("**Pairing Analysis:**")
-                lines.append(f"- Total items: {total_items:,}")  
+                lines.append(f"- Total items: {total_items:,}")
                 lines.append(f"- Paired items: {total_paired:,} ({pairing_rate:.1%})")
                 if pairing_rate < 0.5:
                     lines.append("- ⚠️  **Warning**: Low pairing rate suggests many items lack matches")
@@ -175,6 +175,7 @@ def write_report(cfg: dict, manifest: dict, means: dict, significance: dict, cos
             lines.append("|---|---:|---:|---:|---:|---:|")
             row_ctrl = means.get((float(temp), "control", typ), {})
             row_trt = means.get((float(temp), "treatment", typ), {})
+
             def val(d, k):
                 return d.get(k, 0.0)
             lines.append(
@@ -194,7 +195,7 @@ def write_report(cfg: dict, manifest: dict, means: dict, significance: dict, cos
                     sd = (sum((x - mean_val) ** 2 for x in lst) / (n - 1)) ** 0.5
                     se = sd / sqrt(n)
                     try:
-                        tcrit = float(student_t.ppf(0.975, df=n-1))
+                        tcrit = float(student_t.ppf(0.975, df=n - 1))
                     except Exception:
                         tcrit = 1.96
                     return mean_val - tcrit * se, mean_val + tcrit * se
@@ -272,6 +273,7 @@ def write_report(cfg: dict, manifest: dict, means: dict, significance: dict, cos
                             trt_pts = pts.get("treatment") or []
                             if ctrl_pts and trt_pts:
                                 lines.append("  - Risk–Coverage points (threshold, coverage, risk):")
+
                                 def _fmt(pt):
                                     return f"(τ={pt.get('threshold')}, cov={pt.get('coverage')}, risk={pt.get('risk')})"
                                 lines.append(
@@ -279,7 +281,7 @@ def write_report(cfg: dict, manifest: dict, means: dict, significance: dict, cos
                                 )
                                 lines.append(
                                     "    - Treatment: " + ", ".join(_fmt(p) for p in trt_pts)
-                        )
+                                )
                     # TOST non-inferiority
                     tost = s_obj[typ].get("tost", {})
                     if tost:

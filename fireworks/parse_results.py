@@ -1,15 +1,23 @@
 from __future__ import annotations
-import os, json, argparse, csv
+import os
+import json
+import argparse
+import csv
+
+
 def parse_custom_id(cid: str):
     parts = cid.split("|")
     if len(parts) != 6: raise ValueError(f"Bad custom_id: {cid}")
     dataset, item_id, condition, temp_str, sample_str, typ = parts
     return dataset, item_id, condition, float(temp_str), int(sample_str), typ
+
+
 def iter_jsonl(path: str):
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            line=line.strip()
+            line = line.strip()
             if line: yield json.loads(line)
+
 
 def extract_text_from_body(body: dict) -> str:
     # Support both shapes:
@@ -28,11 +36,13 @@ def extract_text_from_body(body: dict) -> str:
         return (body.get("content") or "").strip()
     return ""
 
+
 def process_results(results_jsonl: str, out_csv: str):
-    fieldnames = ["custom_id","dataset","item_id","condition","temp","sample_index","type","request_id","finish_reason","response_text","prompt_tokens","completion_tokens","total_tokens"]
+    fieldnames = ["custom_id", "dataset", "item_id", "condition", "temp", "sample_index", "type", "request_id", "finish_reason", "response_text", "prompt_tokens", "completion_tokens", "total_tokens"]
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     with open(out_csv, "w", encoding="utf-8", newline="") as fcsv:
-        w = csv.DictWriter(fcsv, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL, escapechar='\\'); w.writeheader()
+        w = csv.DictWriter(fcsv, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL, escapechar='\\')
+        w.writeheader()
         for row in iter_jsonl(results_jsonl):
             cid = row.get("custom_id") or row.get("customId")
             resp = row.get("response") or {}
@@ -50,7 +60,7 @@ def process_results(results_jsonl: str, out_csv: str):
             # Prefer explicit request_id, else fall back to generic id fields
             request_id = resp.get("request_id") or resp.get("id") or body.get("id")
             text = extract_text_from_body(body)
-            dataset,item_id,condition,temp,idx,typ = parse_custom_id(cid)
+            dataset, item_id, condition, temp, idx, typ = parse_custom_id(cid)
             w.writerow({
                 "custom_id": cid,
                 "dataset": dataset,
@@ -67,6 +77,7 @@ def process_results(results_jsonl: str, out_csv: str):
                 "total_tokens": usage.get("total_tokens"),
             })
 
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results_jsonl", required=True)
@@ -74,5 +85,7 @@ def main():
     args = ap.parse_args()
     process_results(args.results_jsonl, args.out_csv)
     print("Wrote", args.out_csv)
+
+
 if __name__ == "__main__":
     main()

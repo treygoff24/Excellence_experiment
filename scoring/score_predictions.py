@@ -1,14 +1,21 @@
 from __future__ import annotations
-import os, json, csv, argparse
+import os
+import json
+import csv
+import argparse
 from collections import defaultdict
 from . import squad_v2, triviaqa, nq_open
 from .unsupported import is_unsupported
 from config.schema import load_config
+
+
 def load_jsonl(path: str):
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            line=line.strip()
+            line = line.strip()
             if line: yield json.loads(line)
+
+
 def load_canonical(prepared_dir: str):
     data = {"open": {}, "closed": {}}
     for row in load_jsonl(os.path.join(prepared_dir, "open_book.jsonl")):
@@ -16,12 +23,17 @@ def load_canonical(prepared_dir: str):
     for row in load_jsonl(os.path.join(prepared_dir, "closed_book.jsonl")):
         data["closed"][f"{row['dataset']}|{row['id']}"] = row
     return data
+
+
 def read_preds_csv(path: str):
     with open(path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for r in reader: yield r
+
+
 def aggregate_replicates(values):
-    return sum(values)/len(values) if values else 0.0
+    return sum(values) / len(values) if values else 0.0
+
 
 def stdev(values):
     n = len(values)
@@ -30,6 +42,8 @@ def stdev(values):
     mean_val = sum(values) / n
     var = sum((x - mean_val) ** 2 for x in values) / (n - 1)
     return var ** 0.5
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pred_csv", default="results/predictions.csv")
@@ -51,7 +65,10 @@ def main():
     unsupported_bucket = defaultdict(list)
     for r in read_preds_csv(args.pred_csv):
         key_item = f"{r['dataset']}|{r['item_id']}"
-        typ = r["type"]; condition = r["condition"]; temp = float(r["temp"]); pred = r["response_text"] or ""
+        typ = r["type"]
+        condition = r["condition"]
+        temp = float(r["temp"])
+        pred = r["response_text"] or ""
         key = (key_item, typ, condition, temp)
         if typ == "open":
             ex = canon["open"][key_item]
@@ -67,13 +84,17 @@ def main():
                     params=unsupported_params,
                 )
             )
-            bucket[key]["em"].append(score["em"]); bucket[key]["f1"].append(score["f1"])
-            abst_bucket[key].append(score["abstained"]); false_ans_bucket[key].append(score["false_answer"]); unsupported_bucket[key].append(unsupported)
+            bucket[key]["em"].append(score["em"])
+            bucket[key]["f1"].append(score["f1"])
+            abst_bucket[key].append(score["abstained"])
+            false_ans_bucket[key].append(score["false_answer"])
+            unsupported_bucket[key].append(unsupported)
         else:
             ex = canon["closed"][key_item]
             scorer = triviaqa if ex["dataset"] == "triviaqa" else nq_open
             score = scorer.score_item(pred, ex["answers"])
-            bucket[key]["em"].append(score["em"]); abst_bucket[key].append(score["abstained"])
+            bucket[key]["em"].append(score["em"])
+            abst_bucket[key].append(score["abstained"])
     rows = []
     for key, metrics in bucket.items():
         item_key, typ, condition, temp = key
@@ -93,8 +114,11 @@ def main():
     import csv
     fieldnames = sorted({k for r in rows for k in r.keys()})
     with open(out_csv, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames); w.writeheader()
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
         for r in rows: w.writerow(r)
     print("Wrote", out_csv)
+
+
 if __name__ == "__main__":
     main()

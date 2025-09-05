@@ -79,4 +79,3 @@ def sweep_thresholds(pred: str, context: str, *, abstained: float | int = 0, str
     for thr in thresholds:
         out.append((float(thr), is_unsupported(pred, context, abstained=abstained, strategy=strategy, threshold=float(thr), params=params)))
     return out
-

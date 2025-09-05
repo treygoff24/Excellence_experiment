@@ -1,15 +1,27 @@
 from __future__ import annotations
-import os, sys, json, httpx, argparse, random, time
+import os
+import sys
+import json
+import httpx
+import argparse
+import random
+import time
 from dotenv import load_dotenv
 API_BASE = os.environ.get("FIREWORKS_API_BASE", "https://api.fireworks.ai")
 BATCH_BASE = f"{API_BASE}/v1"
+
+
 def auth_headers():
     key = os.environ.get("FIREWORKS_API_KEY")
     if not key: raise RuntimeError("FIREWORKS_API_KEY not set")
     return {"Authorization": f"Bearer {key}"}
+
+
 def _sleep_with_jitter(seconds: float) -> None:
     jitter = min(0.5, seconds * 0.25)
     time.sleep(max(0.0, seconds) + random.random() * jitter)
+
+
 def _post_json_with_retries(url: str, headers: dict, json_payload: dict | None, max_attempts: int = 6, base_delay: float = 1.0) -> httpx.Response:
     attempt = 0
     delay_seconds = base_delay
@@ -54,9 +66,10 @@ def _post_json_with_retries(url: str, headers: dict, json_payload: dict | None, 
         raise last_exc
     raise RuntimeError(f"POST {url} failed after {max_attempts} attempts")
 
+
 def _normalize_dataset_state(state: str | None) -> str:
     """Normalize Fireworks dataset state strings to canonical tokens.
-    
+
     Handles both proto-style (e.g., "DATASET_STATE_READY") and plain
     (e.g., "READY") variants. Returns one of:
     "READY", "FAILED", "PROCESSING", "PENDING", or original uppercased fallback.
@@ -73,6 +86,8 @@ def _normalize_dataset_state(state: str | None) -> str:
     if "PENDING" in s or "QUEUED" in s or "SUBMITTED" in s:
         return "PENDING"
     return s
+
+
 def create_batch_job(account_id: str, model: str, input_dataset_id: str, display_name=None,
                      temperature=None, max_tokens=None, top_p=None, top_k=None, stop=None):
     # Normalize account: accept "accounts/<slug>[/...]" or bare slug; extract just the slug
@@ -171,6 +186,8 @@ def create_batch_job(account_id: str, model: str, input_dataset_id: str, display
         # Surface server message for 400s and other client errors
         msg = e.response.text if getattr(e, "response", None) is not None else str(e)
         raise httpx.HTTPStatusError(f"Failed to create batch job: {msg}", request=getattr(e, "request", None), response=getattr(e, "response", None))
+
+
 def main():
     load_dotenv()
     ap = argparse.ArgumentParser()
@@ -196,5 +213,7 @@ def main():
         args.stop,
     )
     print(json.dumps(job, indent=2))
+
+
 if __name__ == "__main__":
     main()

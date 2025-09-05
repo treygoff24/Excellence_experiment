@@ -1,16 +1,30 @@
 from __future__ import annotations
-import os, time, json, httpx, argparse, random
-import zipfile, tarfile, gzip, shutil
+import os
+import time
+import json
+import httpx
+import argparse
+import random
+import zipfile
+import tarfile
+import gzip
+import shutil
 from dotenv import load_dotenv
 API_BASE = os.environ.get("FIREWORKS_API_BASE", "https://api.fireworks.ai")
 V1 = f"{API_BASE}/v1"
+
+
 def auth_headers():
     key = os.environ.get("FIREWORKS_API_KEY")
     if not key: raise RuntimeError("FIREWORKS_API_KEY not set")
     return {"Authorization": f"Bearer {key}"}
+
+
 def _sleep_with_jitter(seconds: float) -> None:
     jitter = min(0.5, seconds * 0.25)
     time.sleep(max(0.0, seconds) + random.random() * jitter)
+
+
 def _get_with_retries(url: str, headers: dict, max_attempts: int = 8, base_delay: float = 1.0) -> httpx.Response:
     attempt = 0
     delay_seconds = base_delay
@@ -50,6 +64,8 @@ def _get_with_retries(url: str, headers: dict, max_attempts: int = 8, base_delay
     if last_exc:
         raise last_exc
     raise RuntimeError(f"GET {url} failed after {max_attempts} attempts")
+
+
 def _normalize_state(state: str | None) -> str:
     """Normalize Fireworks job state strings to canonical tokens.
 
@@ -72,6 +88,7 @@ def _normalize_state(state: str | None) -> str:
         return "PENDING"
     return s
 
+
 def get_batch_job(account_id: str, job_name: str):
     url = f"{V1}/accounts/{account_id}/batchInferenceJobs/{job_name.split('/')[-1]}"
     resp = _get_with_retries(url, headers=auth_headers())
@@ -82,13 +99,19 @@ def get_batch_job(account_id: str, job_name: str):
     except Exception:
         pass
     return data
+
+
 def get_dataset(account_id: str, dataset_id: str):
     url = f"{V1}/accounts/{account_id}/datasets/{dataset_id}"
     resp = _get_with_retries(url, headers=auth_headers())
     return resp.json()
+
+
 def get_dataset_external_url(account_id: str, dataset_id: str) -> str | None:
     ds = get_dataset(account_id, dataset_id)
     return ds.get("externalUrl") or ds.get("external_url")
+
+
 def try_download_external_url(url: str, out_dir: str):
     if not url:
         return None
@@ -140,6 +163,8 @@ def try_download_external_url(url: str, out_dir: str):
             delay_seconds = min(delay_seconds * 2.0, 16.0)
     # Give up gracefully; caller logs a warning
     return None
+
+
 def _try_extract_jsonls(bundle_path: str, out_dir: str) -> list[str]:
     extracted: list[str] = []
     try:
@@ -198,6 +223,8 @@ def _try_extract_jsonls(bundle_path: str, out_dir: str) -> list[str]:
     except Exception:
         pass
     return extracted
+
+
 def _combine_jsonls(root_dir: str, out_path: str) -> int:
     jsonl_files: list[str] = []
     for r, _dirs, files in os.walk(root_dir):
@@ -223,6 +250,8 @@ def _combine_jsonls(root_dir: str, out_path: str) -> int:
                 except Exception:
                     continue
     return lines
+
+
 def poll_until_done(account_id: str, job_name: str, poll_seconds: int = 15):
     """Poll a batch job until terminal state.
 
@@ -242,6 +271,8 @@ def poll_until_done(account_id: str, job_name: str, poll_seconds: int = 15):
         if state in ("COMPLETED", "FAILED", "EXPIRED"):
             return job
         time.sleep(max(1, int(poll_seconds)))
+
+
 def main():
     load_dotenv()
     ap = argparse.ArgumentParser()
@@ -259,7 +290,8 @@ def main():
         return
     out_ds_id = job.get("outputDatasetId") or job.get("output_dataset_id")
     if not out_ds_id:
-        print("No outputDatasetId present on job."); return
+        print("No outputDatasetId present on job.")
+        return
     ds = get_dataset(args.account, out_ds_id.split("/")[-1])
     ext = ds.get("externalUrl") or ds.get("external_url")
     if ext:
@@ -277,5 +309,7 @@ def main():
     with open(os.path.join(args.out_dir, "OUTPUT_DATASET_ID.txt"), "w", encoding="utf-8") as f:
         f.write(out_ds_id)
     print("Wrote OUTPUT_DATASET_ID.txt for manual download via UI.")
+
+
 if __name__ == "__main__":
     main()

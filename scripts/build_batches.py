@@ -1,7 +1,11 @@
 from __future__ import annotations
-import os, json, argparse, yaml
+import os
+import json
+import argparse
+import yaml
 from tqdm import tqdm
 from config.schema import load_config
+
 
 def read_lines(path: str):
     rows = []
@@ -16,11 +20,14 @@ def read_lines(path: str):
                     continue
     return rows
 
+
 def assemble_user_open(instructions: str, context: str, question: str) -> str:
     return f"{instructions}\n\nCONTEXT:\n{context}\n\nQUESTION:\n{question}"
 
+
 def assemble_user_closed(instructions: str, question: str) -> str:
     return f"{instructions}\n\nQUESTION:\n{question}"
+
 
 def build_line(custom_id: str, system_text: str, user_text: str, stop: list[str] | None = None):
     body = {
@@ -34,9 +41,11 @@ def build_line(custom_id: str, system_text: str, user_text: str, stop: list[str]
         body["stop"] = list(stop)
     return {"custom_id": custom_id, "body": body}
 
+
 def format_temp_label(t: float) -> str:
     s = f"{float(t):.1f}"
     return "0" if s == "0.0" else s.replace(".", "")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -150,6 +159,7 @@ def main():
             print(
                 f"De-dup summary @ T={float(t):.1f}: skipped {skipped_control} duplicate custom_id(s) in control, {skipped_treat} in treatment."
             )
+
 
 if __name__ == "__main__":
     main()

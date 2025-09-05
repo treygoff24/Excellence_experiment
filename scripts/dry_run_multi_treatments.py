@@ -20,7 +20,8 @@ def _copy_first_n(src: str, dst: str, n: int) -> None:
             s = line.strip()
             if not s:
                 continue
-            fout.write(s + "\n"); cnt += 1
+            fout.write(s + "\n")
+            cnt += 1
             if cnt >= max(1, int(n)):
                 break
 
@@ -129,7 +130,8 @@ def main() -> None:
         "--max_concurrent_jobs", str(int(args.max_concurrent_jobs)),
     ]
 
-    print("+", " ".join(cmd)); sys.stdout.flush()
+    print("+", " ".join(cmd))
+    sys.stdout.flush()
     try:
         subprocess.check_call(cmd)
     finally:

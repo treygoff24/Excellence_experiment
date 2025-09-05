@@ -1,5 +1,11 @@
 from __future__ import annotations
-import os, sys, json, time, argparse, subprocess, shutil
+import os
+import sys
+import json
+import time
+import argparse
+import subprocess
+import shutil
 from typing import Dict, Any
 from config.schema import load_config
 
@@ -12,7 +18,8 @@ def _copy_first_n(src: str, dst: str, n: int) -> None:
             s = line.strip()
             if not s:
                 continue
-            fout.write(s + "\n"); cnt += 1
+            fout.write(s + "\n")
+            cnt += 1
             if cnt >= max(1, int(n)):
                 break
 

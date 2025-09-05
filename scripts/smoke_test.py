@@ -1,5 +1,12 @@
 from __future__ import annotations
-import os, argparse, json, time, csv, hashlib, traceback, tempfile
+import os
+import argparse
+import json
+import time
+import csv
+import hashlib
+import traceback
+import tempfile
 from typing import List, Dict, Any, Tuple
 from dotenv import load_dotenv
 import yaml
@@ -41,6 +48,7 @@ def get_base_url() -> str:
         return base
     # Prefer explicit inference/v1 path
     return f"{base.rstrip('/')}/inference/v1"
+
 
 def _flow_mode(args) -> None:
     """Offline, end-to-end smoke covering build → parse → score → stats → cost.
@@ -89,7 +97,8 @@ def _flow_mode(args) -> None:
                     for line in fin:
                         s = line.strip()
                         if not s: continue
-                        fout.write(s + "\n"); cnt += 1
+                        fout.write(s + "\n")
+                        cnt += 1
                         if cnt >= max(1, int(args.n)):
                             break
             _copy_first_n(src_ob, dst_ob, args.n)
@@ -121,7 +130,8 @@ def _flow_mode(args) -> None:
         yaml.safe_dump(cfg_override, f)
 
     # Build minimal batches (temps fixed to 0.0; use default prompt set)
-    import subprocess, sys
+    import subprocess
+    import sys
     subprocess.check_call([sys.executable, "-m", "scripts.build_batches", "--config", tmp_cfg_path, "--temps", "0.0"])  # validation: raises on failure
     print("build_batches: ok (t=0.0, K=1)")
 
@@ -141,10 +151,10 @@ def _flow_mode(args) -> None:
         for path, target in [(os.path.join(prep_dir, "open_book.jsonl"), ob), (os.path.join(prep_dir, "closed_book.jsonl"), cb)]:
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
-                    line=line.strip();
+                    line = line.strip()
                     if not line: continue
-                    row=json.loads(line)
-                    target[f"{row.get('dataset')}|{row.get('id')}"]=row
+                    row = json.loads(line)
+                    target[f"{row.get('dataset')}|{row.get('id')}"] = row
         return ob, cb
 
     open_canon, closed_canon = _load_canon(prepared_dir)
@@ -191,7 +201,8 @@ def _flow_mode(args) -> None:
     print(f"simulate_results: ok ({total} responses)")
 
     # Parse → Score → Stats → Costs
-    import subprocess, sys
+    import subprocess
+    import sys
     subprocess.check_call([sys.executable, "-m", "fireworks.parse_results", "--results_jsonl", results_jsonl, "--out_csv", os.path.join(results_dir, "predictions.csv")])
     print("parse_results: ok")
     subprocess.check_call([sys.executable, "-m", "scoring.score_predictions", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", prepared_dir, "--out_dir", results_dir, "--config", tmp_cfg_path])
@@ -461,7 +472,7 @@ def main():
         with open(debug_csv, "w", encoding="utf-8", newline="") as fdbg:
             dbg_writer = csv.writer(fdbg)
             dbg_writer.writerow([
-                "dataset","id","condition","temp","type","request_id","finish_reason","pred_len","prompt_len","system_sha1"
+                "dataset", "id", "condition", "temp", "type", "request_id", "finish_reason", "pred_len", "prompt_len", "system_sha1"
             ])
 
             if do_closed:

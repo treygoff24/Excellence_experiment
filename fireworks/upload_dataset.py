@@ -1,11 +1,19 @@
 from __future__ import annotations
-import os, sys, json, httpx, argparse, random, time
+import os
+import sys
+import json
+import httpx
+import argparse
+import random
+import time
 from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv
 API_BASE = os.environ.get("FIREWORKS_API_BASE", "https://api.fireworks.ai")
 DATASETS_BASE = f"{API_BASE}/v1"
 MB_150 = 150 * 1024 * 1024
 _newly_created_datasets: set[str] = set()
+
+
 def normalize_dataset_id(display_name: str) -> str:
     """Derive a stable dataset id from a display name.
 
@@ -29,6 +37,8 @@ def normalize_dataset_id(display_name: str) -> str:
     if len(base_id) > 63:
         base_id = base_id[:63].rstrip("-")
     return base_id
+
+
 def dataset_exists(account_id: str, dataset_id: str) -> bool:
     """Return True if the dataset resource already exists (HTTP 200), False if 404.
 
@@ -54,13 +64,19 @@ def dataset_exists(account_id: str, dataset_id: str) -> bool:
         # Be conservative: if we cannot confirm due to a transient network error,
         # assume it does not exist so the subsequent create/upload path can proceed
         return False
+
+
 def auth_headers():
     key = os.environ.get("FIREWORKS_API_KEY")
     if not key: raise RuntimeError("FIREWORKS_API_KEY not set")
     return {"Authorization": f"Bearer {key}"}
+
+
 def _sleep_with_jitter(seconds: float) -> None:
     jitter = min(0.5, seconds * 0.25)
     time.sleep(max(0.0, seconds) + random.random() * jitter)
+
+
 def _post_json_with_retries(url: str, headers: dict, json_payload: dict | None, max_attempts: int = 6, base_delay: float = 1.0, params: dict | None = None) -> httpx.Response:
     attempt = 0
     delay_seconds = base_delay
@@ -104,6 +120,8 @@ def _post_json_with_retries(url: str, headers: dict, json_payload: dict | None, 
     if last_exc:
         raise last_exc
     raise RuntimeError(f"POST {url} failed after {max_attempts} attempts")
+
+
 def _post_multipart_with_retries(url: str, headers: dict, files: dict, max_attempts: int = 6, base_delay: float = 1.0) -> httpx.Response:
     attempt = 0
     delay_seconds = base_delay
@@ -164,6 +182,7 @@ def _post_multipart_with_retries(url: str, headers: dict, files: dict, max_attem
         raise last_exc
     raise RuntimeError(f"POST {url} failed after {max_attempts} attempts")
 
+
 def _get_dataset(account_id: str, dataset_id: str) -> dict:
     url = f"{DATASETS_BASE}/accounts/{account_id}/datasets/{dataset_id}"
     with httpx.Client(timeout=30.0) as client:
@@ -184,6 +203,7 @@ def _get_dataset(account_id: str, dataset_id: str) -> dict:
     resp.raise_for_status()
     return {}
 
+
 def _get_dataset_state(account_id: str, dataset_id: str) -> str | None:
     try:
         ds = _get_dataset(account_id, dataset_id)
@@ -192,6 +212,7 @@ def _get_dataset_state(account_id: str, dataset_id: str) -> str | None:
         if e.response is not None and e.response.status_code == 404:
             return None
         raise
+
 
 def _wait_until_ready(account_id: str, dataset_id: str, timeout_s: float = 900.0, poll_s: float = 2.0) -> None:
     deadline = time.time() + timeout_s
@@ -210,6 +231,7 @@ def _wait_until_ready(account_id: str, dataset_id: str, timeout_s: float = 900.0
         _sleep_with_jitter(poll_s)
     raise TimeoutError(f"Dataset {dataset_id} did not become READY within {int(timeout_s)}s")
 
+
 def _request_signed_url(account_id: str, dataset_id: str, filename: str, size_bytes: int) -> str:
     url = f"{DATASETS_BASE}/accounts/{account_id}/datasets/{dataset_id}:getUploadEndpoint"
     payload = {"filenameToSize": {os.path.basename(filename): int(size_bytes)}}
@@ -226,14 +248,16 @@ def _request_signed_url(account_id: str, dataset_id: str, filename: str, size_by
         raise RuntimeError("Signed URL not returned by getUploadEndpoint")
     return signed
 
+
 def _required_signed_headers_from_url(signed_url: str) -> list[str]:
     """Return the lowercased list of headers that the signed URL requires."""
     q = parse_qs(urlparse(signed_url).query)
     sh = q.get("X-Goog-SignedHeaders") or q.get("x-goog-signedheaders") \
-         or q.get("X-Amz-SignedHeaders") or q.get("x-amz-signedheaders") or []
+        or q.get("X-Amz-SignedHeaders") or q.get("x-amz-signedheaders") or []
     if not sh:
         return []
     return [h.strip().lower() for h in sh[0].split(";") if h.strip()]
+
 
 def _put_file_to_signed_url(signed_url: str, local_path: str) -> None:
     # Note: No Fireworks auth header when PUT-ing to the storage signed URL
@@ -282,9 +306,12 @@ def _put_file_to_signed_url(signed_url: str, local_path: str) -> None:
     except Exception:
         pass
 
+
 def _validate_upload(account_id: str, dataset_id: str) -> None:
     url = f"{DATASETS_BASE}/accounts/{account_id}/datasets/{dataset_id}:validateUpload"
     _post_json_with_retries(url, headers=auth_headers(), json_payload={})
+
+
 def create_dataset(display_name: str, account_id: str) -> str:
     url = f"{DATASETS_BASE}/accounts/{account_id}/datasets"
     base_id = normalize_dataset_id(display_name)
@@ -364,6 +391,8 @@ def create_dataset(display_name: str, account_id: str) -> str:
         return name.split("/")[-1]
     # Fallback to the intended id if API returns 200 with an empty body
     return base_id
+
+
 def upload_dataset_file(account_id: str, dataset_id: str, local_path: str, filename=None):
     """Upload a dataset file, choosing the correct workflow by size.
 
@@ -448,6 +477,8 @@ def upload_dataset_file(account_id: str, dataset_id: str, local_path: str, filen
     except Exception:
         pass
     return {"status": "uploaded", "method": "signed_url", "datasetId": dataset_id}
+
+
 def main():
     load_dotenv()
     ap = argparse.ArgumentParser()
@@ -459,5 +490,7 @@ def main():
     result = upload_dataset_file(args.account, dsid, args.file)
     # Machine-readable output; keep stdout clean of extra logs
     print(json.dumps(result))
+
+
 if __name__ == "__main__":
     main()
