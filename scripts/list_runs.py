@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-List all archived experiment runs in the experiments directory.
+List experiment runs and show run_state status and archive metadata.
 """
 
 from __future__ import annotations
@@ -9,6 +9,9 @@ import json
 import argparse
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Any
+
+from scripts.state_utils import load_run_state
 
 
 def load_archive_manifest(experiment_path: str) -> dict:
@@ -30,8 +33,23 @@ def format_datetime(iso_string: str) -> str:
         return iso_string
 
 
+def _overall_status(phases: Dict[str, Dict[str, Any]]) -> str:
+    statuses = [str(v.get("status", "not_started")) for v in (phases or {}).values()]
+    if not statuses:
+        return "unknown"
+    if any(s == "failed" for s in statuses):
+        return "failed"
+    if all(s == "completed" for s in statuses):
+        return "completed"
+    if any(s == "in_progress" for s in statuses):
+        return "in_progress"
+    if any(s == "stopped" for s in statuses):
+        return "stopped"
+    return "not_started"
+
+
 def list_experiments(experiments_dir: str = "experiments", verbose: bool = False):
-    """List all experiments in the experiments directory."""
+    """List all experiments under experiments_dir, reading run_state.json when present."""
     if not os.path.exists(experiments_dir):
         print(f"No experiments directory found at: {experiments_dir}")
         return
@@ -39,9 +57,12 @@ def list_experiments(experiments_dir: str = "experiments", verbose: bool = False
     experiments = []
     for item in os.listdir(experiments_dir):
         exp_path = os.path.join(experiments_dir, item)
-        if os.path.isdir(exp_path):
-            manifest = load_archive_manifest(exp_path)
-            experiments.append((item, exp_path, manifest))
+        if not os.path.isdir(exp_path):
+            continue
+        # Consider any directory (run_*, archived experiment, etc.)
+        manifest = load_archive_manifest(exp_path)
+        state = load_run_state(exp_path)
+        experiments.append((item, exp_path, manifest, state))
 
     if not experiments:
         print(f"No experiments found in {experiments_dir}")
@@ -53,10 +74,22 @@ def list_experiments(experiments_dir: str = "experiments", verbose: bool = False
     if verbose:
         print("EXPERIMENT RUNS:")
         print("=" * 80)
-        for exp_name, exp_path, manifest in experiments:
+        for exp_name, exp_path, manifest, state in experiments:
             print(f"\n📁 {exp_name}")
             print(f"   Path: {exp_path}")
-
+            if state:
+                print("   Run State:")
+                print(f"     Overall: {_overall_status(state.get('phases', {}))}")
+                mig = bool(state.get("migrated"))
+                print(f"     Migrated: {mig}")
+                print(f"     Config Hash: {state.get('config_hash', 'unknown')}")
+                # Brief phase summary
+                phases = state.get("phases", {})
+                if phases:
+                    pkeys = ["prepare","build","submit","poll","parse","score","stats","costs","report"]
+                    for p in pkeys:
+                        if p in phases:
+                            print(f"       - {p}: {phases[p].get('status', 'unknown')}")
             if manifest:
                 config = manifest.get("config", {})
                 print(f"   Temperature: {config.get('temperature', 'unknown')}")
@@ -80,22 +113,18 @@ def list_experiments(experiments_dir: str = "experiments", verbose: bool = False
     else:
         # Compact table format
         print("EXPERIMENT RUNS:")
-        print("-" * 70)
-        print(f"{'Name':<25} {'Temp':<6} {'Status':<12} {'Archived':<16}")
-        print("-" * 70)
+        print("-" * 90)
+        print(f"{'Name':<28} {'Overall':<12} {'Migrated':<9} {'CfgHash…':<10} {'Arch.Status':<12} {'Archived':<16}")
+        print("-" * 90)
 
-        for exp_name, exp_path, manifest in experiments:
-            if manifest:
-                config = manifest.get("config", {})
-                temp = config.get("temperature", "?")
-                status = manifest.get("status", "unknown")
-                archived = format_datetime(manifest.get("archived_date", ""))
-            else:
-                temp = "?"
-                status = "no-manifest"
-                archived = "unknown"
-
-            print(f"{exp_name:<25} {temp:<6} {status:<12} {archived:<16}")
+        for exp_name, exp_path, manifest, state in experiments:
+            overall = _overall_status((state or {}).get("phases", {})) if state else "unknown"
+            migrated = str(bool((state or {}).get("migrated", False))) if state else "-"
+            ch = (state or {}).get("config_hash") or ""
+            ch_short = (ch[:8] + "…") if ch else "-"
+            arch_status = (manifest or {}).get("status", "-")
+            archived = format_datetime((manifest or {}).get("archived_date", "")) if manifest else "-"
+            print(f"{exp_name:<28} {overall:<12} {migrated:<9} {ch_short:<10} {arch_status:<12} {archived:<16}")
 
 
 def main():
