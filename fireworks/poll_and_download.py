@@ -10,6 +10,7 @@ import tarfile
 import gzip
 import shutil
 from dotenv import load_dotenv
+from scripts import manifest_v2 as mf
 API_BASE = os.environ.get("FIREWORKS_API_BASE", "https://api.fireworks.ai")
 V1 = f"{API_BASE}/v1"
 
@@ -305,6 +306,16 @@ def main():
                 n = _combine_jsonls(args.out_dir, combined)
                 if n > 0:
                     print(f"Combined {n} records into {combined}")
+                    # Update manifest stage if a trial_manifest.json is nearby
+                    manifest_path = os.path.join(args.out_dir, "trial_manifest.json")
+                    if os.path.isfile(manifest_path):
+                        try:
+                            st = mf.compute_stage_statuses(args.out_dir)
+                            man, _ = mf.load_manifest(manifest_path)
+                            man["stage_status"] = st
+                            mf.write_manifest(manifest_path, man)
+                        except Exception:
+                            pass
                 return
     with open(os.path.join(args.out_dir, "OUTPUT_DATASET_ID.txt"), "w", encoding="utf-8") as f:
         f.write(out_ds_id)

@@ -3,6 +3,9 @@ import os
 import json
 import argparse
 import csv
+from typing import Tuple
+
+from scripts import manifest_v2 as mf
 
 
 def parse_custom_id(cid: str):
@@ -40,6 +43,16 @@ def extract_text_from_body(body: dict) -> str:
 def process_results(results_jsonl: str, out_csv: str):
     fieldnames = ["custom_id", "dataset", "item_id", "condition", "temp", "sample_index", "type", "request_id", "finish_reason", "response_text", "prompt_tokens", "completion_tokens", "total_tokens"]
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    # Idempotency: if up-to-date and counts match, skip
+    results_mtime = os.path.getmtime(results_jsonl) if os.path.exists(results_jsonl) else 0.0
+    if os.path.isfile(out_csv) and os.path.getmtime(out_csv) >= results_mtime:
+        # Validate row count vs unique IDs in results
+        expected = _count_unique_custom_ids(results_jsonl)
+        actual = _count_rows(out_csv)
+        if expected == actual and actual > 0:
+            print(f"Idempotent skip: predictions.csv is up-to-date ({actual} rows)")
+            _update_manifest_parsed(out_csv, actual)
+            return
     with open(out_csv, "w", encoding="utf-8", newline="") as fcsv:
         w = csv.DictWriter(fcsv, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL, escapechar='\\')
         w.writeheader()
@@ -76,6 +89,56 @@ def process_results(results_jsonl: str, out_csv: str):
                 "completion_tokens": usage.get("completion_tokens"),
                 "total_tokens": usage.get("total_tokens"),
             })
+    # Validate outcome and update manifest
+    expected = _count_unique_custom_ids(results_jsonl)
+    actual = _count_rows(out_csv)
+    if expected != actual:
+        raise SystemExit(f"Parsed row count mismatch: expected {expected} (unique custom_id in combined results) but wrote {actual}")
+    _update_manifest_parsed(out_csv, actual)
+
+
+def _count_unique_custom_ids(path: str) -> int:
+    seen: set[str] = set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    continue
+                cid = obj.get("custom_id") or obj.get("customId")
+                if cid:
+                    seen.add(str(cid))
+    except Exception:
+        return 0
+    return len(seen)
+
+
+def _count_rows(csv_path: str) -> int:
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            r = csv.reader(f)
+            return max(0, sum(1 for _ in r) - 1)
+    except Exception:
+        return 0
+
+
+def _update_manifest_parsed(out_csv: str, n_rows: int) -> None:
+    results_dir = os.path.dirname(out_csv)
+    manifest_path = os.path.join(results_dir, "trial_manifest.json")
+    if os.path.isfile(manifest_path):
+        try:
+            mf.update_stage_status(
+                manifest_path,
+                "parsed",
+                "completed",
+                {"predictions_csv": os.path.relpath(out_csv, results_dir), "row_count": int(n_rows)},
+            )
+        except Exception:
+            pass
 
 
 def main():
