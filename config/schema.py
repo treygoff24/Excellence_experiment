@@ -107,6 +107,14 @@ class EvalConfigModel(BaseModel):
             return v
 
     unsupported: UnsupportedModel = Field(default_factory=UnsupportedModel)
+    # Optional analyses feature flags
+    class OptionalAnalysesModel(BaseModel):
+        enable_unsupported_sensitivity: bool = Field(default=True)
+        enable_mixed_effects: bool = Field(default=True)
+        enable_power_analysis: bool = Field(default=True)
+        enable_cost_effectiveness: bool = Field(default=True)
+
+    optional: OptionalAnalysesModel = Field(default_factory=OptionalAnalysesModel)
     # Statistical settings
     class StatsModel(BaseModel):
         bootstrap_samples: int = Field(default=5000)
