@@ -120,6 +120,8 @@ The pipeline executes these steps automatically:
 - `--lines_per_part N`: alternatively, target lines per part (overrides parts_per_dataset).
 - `--max_concurrent_jobs M`: how many Fireworks batch jobs run at once.
 - `--resume`: resume an interrupted run based on per‑trial manifests (skips finished parts).
+- `--only_step X` / `--from_step X` / `--to_step Y`: phase gating to run only a subset.
+- `--plan_only`: print which phases would run/skip (with reasons) and exit.
 - `--limit_items N`: cap items read from each input (useful for dev sanity checks).
 - `--skip_prepare`/`--skip_build`: reuse existing `prepared/` or `batch_inputs/`.
 - `--dry_run`: synthesize completed jobs and results locally; exercises full parse/score/report flow offline.
@@ -173,12 +175,16 @@ python -m scripts.smoke_test --mode flow --n 2 --out_dir results/smoke
 
 1) Classic “flow” smoke (offline scoring pipeline): build_batches → simulate results → parse → score → stats → cost → report under `results/smoke/<ts>/results/`.
 
-2) New orchestration smoke (dry‑run end‑to‑end with the orchestrator):
+2) New orchestration smoke (dry‑run end‑to‑end with STOP/resume injection):
 
 ```
-python -m scripts.smoke_orchestration --n 3 --prompt_set operational_only
+python -m scripts.smoke_orchestration --n 3 --prompt_set operational_only --dry_run --stop_point pre_parse
 # Add --keep to inspect outputs; default auto‑cleans its artifacts
 ```
+
+This runs the full orchestrator in `--dry_run`, injects a STOP at a chosen checkpoint (post_build | pre_submit | pre_poll | pre_parse), then resumes (`--resume`) and verifies no duplicate predictions.
+
+Makefile: `make smoke` runs the same dry‑run orchestration.
 
 ### Prompt Audit
 
@@ -364,11 +370,25 @@ All datasets are automatically downloaded and normalized into consistent JSONL f
 ### Running Tests
 ```bash
 # Smoke test with small subset
-python -m scripts.smoke_test
+make smoke
 
 # Check configuration validation
 python -c "from config.schema import EvalConfig; EvalConfig.from_file('config/eval_config.yaml')"
+
+# Unit tests (fast, offline)
+pytest -q
 ```
+
+### Resume and Stop
+
+- State file: `experiments/run_<RUN_ID>/run_state.json` tracks phase statuses and timestamps.
+- Per‑trial manifest: `experiments/run_<RUN_ID>/<trial-slug>/results/trial_manifest.json` (schema_version=2) records prompts, temps, datasets, job names, and stage_status.
+- STOP semantics: creating `experiments/run_<RUN_ID>/STOP_REQUESTED` or sending SIGINT/SIGTERM triggers a cooperative stop between phases. Resume with `--resume`.
+
+Troubleshooting:
+- If manifests are legacy or corrupted, the system auto‑upgrades/synthesizes to v2 on load.
+- Use `--plan_only` to preview gating; non‑selected phases show "not selected"; already‑done phases show "already done".
+- For missing downloads on resume, the orchestrator attempts repair via recorded OUTPUT_DATASET_ID/job.json lineages.
 
 ### Adding New Datasets
 1. Add dataset download logic to `scripts/prepare_data.py`

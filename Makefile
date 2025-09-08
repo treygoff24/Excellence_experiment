@@ -29,7 +29,10 @@ report:
 eval:
 	$(PY) -m scripts.run_all
 smoke:
-	$(PY) -m scripts.smoke_test --config config/eval_config.yaml --mode flow --n 2 --out_dir results/smoke
+	$(PY) -m scripts.smoke_orchestration --n 3 --prompt_set operational_only --dry_run
+
+plan:
+	$(PY) -m scripts.run_all --config config/eval_config.yaml --plan_only
 
 # Audit prompt token lengths and approximate input cost deltas
 audit:
