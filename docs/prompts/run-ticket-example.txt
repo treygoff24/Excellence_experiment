@@ -1,0 +1,36 @@
+Example: Run Ticket 003 End‑to‑End (Reference)
+
+Context
+- Ticket: 003 — Responses Stream Handling
+- Branch: feat/gpt5-003-responses-stream
+- Ticket file: ./codex/tickets/003-responses-stream-handling.md
+- Log file: ./codex/logs/003.md
+
+Instructions (use with the Agent Implementation Prompt)
+1) Read ./codex/tickets/003-responses-stream-handling.md and AGENTS.md.
+2) Create branch feat/gpt5-003-responses-stream off feat/gpt5-002-openai-adapter (stacked).
+3) Implement streaming support in the OpenAI adapter and normalizer per the ticket scope.
+4) Add Playwright Node-only tests under ./tests:
+   - openai.stream.spec.ts (normal streaming)
+   - openai.stream.abort.spec.ts (abort behavior)
+5) Update ./codex/logs/003.md with Action Plan, What I Did, Commands Run, Files Touched, Test Results, Next Steps.
+
+RUN & ITERATE UNTIL GREEN
+- Detect package manager by lockfile and run install + tests:
+  - pnpm: pnpm install && pnpm test
+  - yarn: yarn && yarn test
+  - npm: npm install && npm run test
+- Iterate until all Playwright tests pass. Keep changes scoped.
+
+Final JSON Summary (print last line only)
+{
+  "ticket": "003",
+  "branch": "feat/gpt5-003-responses-stream",
+  "status": "success",
+  "changed_files": ["src/llm/providers/openai.ts","src/llm/normalize.ts","tests/openai.stream.spec.ts","tests/openai.stream.abort.spec.ts","codex/logs/003.md"],
+  "tests": {"runner":"playwright","docs":"pass"},
+  "notes": "Streaming and abort behavior implemented; tests green"
+}
+
+BEGIN.
+
