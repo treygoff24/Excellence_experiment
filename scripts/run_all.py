@@ -596,13 +596,48 @@ def main():
                 pass
 
     # Helpers to compute simple done-predicates from on-disk artifacts
+    def _sha256_file(path: str) -> str:
+        import hashlib
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
     def _prepared_done() -> bool:
         pdir = cfg["paths"]["prepared_dir"]
+        man = os.path.join(pdir, "prepared_manifest.json")
+        try:
+            with open(man, "r", encoding="utf-8") as f:
+                m = json.load(f)
+            ds = m.get("datasets", {}) or {}
+            ok = True
+            for key, fname in (("open_book", "open_book.jsonl"), ("closed_book", "closed_book.jsonl")):
+                entry = ds.get(key, {}) or {}
+                path = os.path.join(pdir, entry.get("path") or fname)
+                if not os.path.isfile(path):
+                    return False
+                want = str(entry.get("sha256") or "").strip()
+                if not want or _sha256_file(path) != want:
+                    ok = False
+                    break
+            if ok:
+                return True
+        except Exception:
+            pass
         open_b = os.path.join(pdir, "open_book.jsonl")
         closed_b = os.path.join(pdir, "closed_book.jsonl")
         return os.path.isfile(open_b) and os.path.getsize(open_b) > 0 and os.path.isfile(closed_b) and os.path.getsize(closed_b) > 0
 
     def _build_done() -> bool:
+        bdir = cfg["paths"]["batch_inputs_dir"]
+        man = os.path.join(bdir, "build_manifest.json")
+        manifest: dict | None = None
+        try:
+            with open(man, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except Exception:
+            manifest = None
         prompt_sets_cfg = cfg.get("prompt_sets") or {}
         default_ps = cfg.get("default_prompt_set") or (sorted(list(prompt_sets_cfg.keys()))[0] if prompt_sets_cfg else "default")
         temps_per_ps: dict[str, set[float]] = {}
@@ -614,9 +649,18 @@ def main():
             for t in sorted(tset):
                 t_str = _format_temp_label(float(t))
                 for cond in ("control","treatment"):
-                    fpath = os.path.join(cfg["paths"]["batch_inputs_dir"], f"t{t_str}{suffix}_{cond}.jsonl")
+                    fname = f"t{t_str}{suffix}_{cond}.jsonl"
+                    fpath = os.path.join(bdir, fname)
                     if not (os.path.isfile(fpath) and os.path.getsize(fpath) > 0):
                         return False
+                    if manifest is not None:
+                        try:
+                            meta = (manifest.get("shards", {}) or {}).get(fname) or {}
+                            want = str(meta.get("sha256") or "").strip()
+                            if not want or _sha256_file(fpath) != want:
+                                return False
+                        except Exception:
+                            return False
         return True
 
     def _trial_dirs() -> list[tuple[dict, str, str]]:
@@ -738,7 +782,10 @@ def main():
                 update_phase(state, "prepare", status="in_progress")
                 write_json_atomic(run_state_path(run_root), state)
         stop_token.check()
-        run_cmd([sys.executable, "-m", "scripts.prepare_data", "--config", effective_config_path])
+        _cmd = [sys.executable, "-m", "scripts.prepare_data", "--config", effective_config_path]
+        if args.resume:
+            _cmd.append("--resume")
+        run_cmd(_cmd)
         if state is not None:
             with RunStateLock(run_root):
                 update_phase(state, "prepare", status="completed")
@@ -762,7 +809,10 @@ def main():
             temps_per_ps.setdefault(psn, set()).update(float(t) for t in (tr.get("temps") or cfg.get("temps") or [0.0]))
         for psn, tset in temps_per_ps.items():
             temps_arg = ",".join(str(t) for t in sorted(tset))
-            run_cmd([sys.executable, "-m", "scripts.build_batches", "--config", effective_config_path, "--prompt_set", psn, "--temps", temps_arg])
+            _cmd = [sys.executable, "-m", "scripts.build_batches", "--config", effective_config_path, "--prompt_set", psn, "--temps", temps_arg]
+            if args.resume:
+                _cmd.append("--resume")
+            run_cmd(_cmd)
         if state is not None:
             with RunStateLock(run_root):
                 update_phase(state, "build", status="completed")
@@ -1423,23 +1473,51 @@ def main():
         else:
             print("Gating: skipping stats (already done or not selected)")
 
-        # Optional analyses (always safe, not tracked in run_state)
-        try:
-            run_cmd([sys.executable, "-m", "scripts.unsupported_sensitivity", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", effective_config_path, "--out_path", os.path.join(results_dir, "unsupported_sensitivity.json")])
-        except Exception:
-            pass
-        try:
-            run_cmd([sys.executable, "-m", "scripts.mixed_effects", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", effective_config_path, "--out_path", os.path.join(results_dir, "mixed_models.json")])
-        except Exception:
-            pass
-        try:
-            run_cmd([sys.executable, "-m", "scripts.power_analysis", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", effective_config_path, "--out_path", os.path.join(results_dir, "power_analysis.json")])
-        except Exception:
-            pass
-        try:
-            run_cmd([sys.executable, "-m", "scripts.cost_effectiveness", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "cost_effectiveness.json")])
-        except Exception:
-            pass
+        # Optional analyses (gated via config.optional.* with artifact-based done predicates)
+        opt_cfg = (cfg.get("optional") or {})
+        def _opt_done(file_name: str) -> bool:
+            p = os.path.join(results_dir, file_name)
+            try:
+                if not (os.path.isfile(p) and os.path.getsize(p) > 0):
+                    return False
+                with open(p, "r", encoding="utf-8") as f:
+                    json.load(f)
+                return True
+            except Exception:
+                return False
+
+        if bool(opt_cfg.get("enable_unsupported_sensitivity", True)):
+            if not _opt_done("unsupported_sensitivity.json"):
+                try:
+                    run_cmd([sys.executable, "-m", "scripts.unsupported_sensitivity", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", effective_config_path, "--out_path", os.path.join(results_dir, "unsupported_sensitivity.json")])
+                except Exception:
+                    pass
+            else:
+                print("Gating: skipping optional unsupported_sensitivity (already done)")
+        if bool(opt_cfg.get("enable_mixed_effects", True)):
+            if not _opt_done("mixed_models.json"):
+                try:
+                    run_cmd([sys.executable, "-m", "scripts.mixed_effects", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", effective_config_path, "--out_path", os.path.join(results_dir, "mixed_models.json")])
+                except Exception:
+                    pass
+            else:
+                print("Gating: skipping optional mixed_effects (already done)")
+        if bool(opt_cfg.get("enable_power_analysis", True)):
+            if not _opt_done("power_analysis.json"):
+                try:
+                    run_cmd([sys.executable, "-m", "scripts.power_analysis", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", effective_config_path, "--out_path", os.path.join(results_dir, "power_analysis.json")])
+                except Exception:
+                    pass
+            else:
+                print("Gating: skipping optional power_analysis (already done)")
+        if bool(opt_cfg.get("enable_cost_effectiveness", True)):
+            if not _opt_done("cost_effectiveness.json"):
+                try:
+                    run_cmd([sys.executable, "-m", "scripts.cost_effectiveness", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "cost_effectiveness.json")])
+                except Exception:
+                    pass
+            else:
+                print("Gating: skipping optional cost_effectiveness (already done)")
 
         # Costs (gated)
         if "costs" in selected_phases and not _costs_done():
