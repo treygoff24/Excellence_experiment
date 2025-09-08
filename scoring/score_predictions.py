@@ -7,6 +7,7 @@ from collections import defaultdict
 from . import squad_v2, triviaqa, nq_open
 from .unsupported import is_unsupported
 from config.schema import load_config
+from scripts import manifest_v2 as mf
 
 
 def load_jsonl(path: str):
@@ -113,11 +114,38 @@ def main():
     out_csv = os.path.join(args.out_dir, "per_item_scores.csv")
     import csv
     fieldnames = sorted({k for r in rows for k in r.keys()})
+    # Idempotency: if per_item_scores.csv exists and is newer than preds, skip
+    preds_mtime = os.path.getmtime(args.pred_csv) if os.path.exists(args.pred_csv) else 0.0
+    if os.path.isfile(out_csv) and os.path.getmtime(out_csv) >= preds_mtime:
+        print(f"Idempotent skip: per_item_scores.csv up-to-date")
+        _update_manifest_scored(out_csv)
+        return
     with open(out_csv, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in rows: w.writerow(r)
     print("Wrote", out_csv)
+    _update_manifest_scored(out_csv)
+
+
+def _update_manifest_scored(per_item_csv: str) -> None:
+    results_dir = os.path.dirname(per_item_csv)
+    manifest_path = os.path.join(results_dir, "trial_manifest.json")
+    if os.path.isfile(manifest_path):
+        try:
+            import csv as _csv
+            n_rows = 0
+            with open(per_item_csv, "r", encoding="utf-8") as f:
+                r = _csv.reader(f)
+                n_rows = max(0, sum(1 for _ in r) - 1)
+            mf.update_stage_status(
+                manifest_path,
+                "scored",
+                "completed",
+                {"per_item_scores_csv": os.path.relpath(per_item_csv, results_dir), "row_count": int(n_rows)},
+            )
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

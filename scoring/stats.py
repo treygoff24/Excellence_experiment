@@ -11,6 +11,7 @@ import numpy as np
 from scipy import stats
 
 from config.schema import load_config
+from scripts import manifest_v2 as mf
 
 
 def load_per_item(path: str) -> list[dict]:
@@ -530,6 +531,12 @@ def main():
     ap.add_argument("--out_path", default="results/significance.json")
     args = ap.parse_args()
     cfg = load_config(args.config)
+    # Idempotency
+    per_item_mtime = os.path.getmtime(args.per_item_csv) if os.path.exists(args.per_item_csv) else 0.0
+    if os.path.isfile(args.out_path) and os.path.getmtime(args.out_path) >= per_item_mtime:
+        print("Idempotent skip: significance.json up-to-date")
+        _update_manifest_stats(args.out_path)
+        return
     results = compute_stats(args.per_item_csv, cfg)
     os.makedirs(os.path.dirname(args.out_path), exist_ok=True)
     with open(args.out_path, "w", encoding="utf-8") as f:
@@ -540,6 +547,22 @@ def main():
             "results": results,
         }, f, indent=2)
     print("Wrote", args.out_path)
+    _update_manifest_stats(args.out_path)
+
+
+def _update_manifest_stats(sig_path: str) -> None:
+    results_dir = os.path.dirname(sig_path)
+    manifest_path = os.path.join(results_dir, "trial_manifest.json")
+    if os.path.isfile(manifest_path):
+        try:
+            mf.update_stage_status(
+                manifest_path,
+                "stats",
+                "completed",
+                {"significance_json": os.path.relpath(sig_path, results_dir)},
+            )
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

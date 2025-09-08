@@ -19,7 +19,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from dotenv import load_dotenv
 from fireworks.upload_dataset import create_dataset, upload_dataset_file
-from fireworks.poll_and_download import poll_until_done, get_dataset, try_download_external_url
+from fireworks.poll_and_download import poll_until_done, get_dataset, try_download_external_url, _try_extract_jsonls
+from scripts import manifest_v2 as mf
 from fireworks.batch_queue_manager import QueueManager
 from scripts.state_utils import StopToken
 from config.schema import load_config
@@ -259,8 +260,8 @@ def run_cmd(args: list[str]):
 def _validate_manifest_schema(data: dict) -> bool:
     """Validate manifest structure and required fields.
 
-    Supports two manifest types:
-    - Per-trial manifest (includes temps, samples_per_item, trial block)
+    Supports:
+    - Per-trial manifest v1 (legacy) and v2 (schema_version=2)
     - Multi-trial summary (includes trials list and num_trials)
     """
     try:
@@ -282,33 +283,52 @@ def _validate_manifest_schema(data: dict) -> bool:
                     return False
             return True
 
-        # Per-trial manifest
-        required_fields = ["created_utc", "run_id", "temps", "samples_per_item"]
-        for field in required_fields:
-            if field not in data:
-                print(f"Manifest validation failed: missing field '{field}'")
+        # Per-trial manifest v2
+        if int(data.get("schema_version", 0)) == 2:
+            ts = data.get("timestamps", {}) or {}
+            if not isinstance(ts, dict) or not ts.get("created_at"):
+                print("Manifest validation failed: v2 requires timestamps.created_at")
+                return False
+            if not isinstance(data.get("stage_status", {}), dict):
+                print("Manifest validation failed: v2 requires stage_status dict")
+                return False
+            trial = data.get("trial", {})
+            if not isinstance(trial, dict) or ("model_id" not in trial or "prompt_set" not in trial):
+                print("Manifest validation failed: v2 missing trial metadata")
+                return False
+            if not isinstance(data.get("temps", []), list):
+                print("Manifest validation failed: v2 requires temps list")
+                return False
+            return True
+
+        # Per-trial manifest v1 (legacy)
+        else:
+            required_fields = ["created_utc", "run_id", "temps", "samples_per_item"]
+            for field in required_fields:
+                if field not in data:
+                    print(f"Manifest validation failed: missing field '{field}'")
+                    return False
+
+            # Validate trial structure
+            trial = data.get("trial", {})
+            trial_fields = ["model_id", "prompt_set"]
+            for field in trial_fields:
+                if field not in trial:
+                    print(f"Manifest validation failed: missing trial field '{field}'")
+                    return False
+
+            # Validate temps is a list
+            if not isinstance(data.get("temps"), list):
+                print(f"Manifest validation failed: 'temps' must be a list")
                 return False
 
-        # Validate trial structure
-        trial = data.get("trial", {})
-        trial_fields = ["model_id", "prompt_set"]
-        for field in trial_fields:
-            if field not in trial:
-                print(f"Manifest validation failed: missing trial field '{field}'")
+            # Validate job_status structure (if exists)
+            job_status = data.get("job_status", {})
+            if job_status and not isinstance(job_status, dict):
+                print(f"Manifest validation failed: 'job_status' must be a dict")
                 return False
 
-        # Validate temps is a list
-        if not isinstance(data.get("temps"), list):
-            print(f"Manifest validation failed: 'temps' must be a list")
-            return False
-
-        # Validate job_status structure (if exists)
-        job_status = data.get("job_status", {})
-        if job_status and not isinstance(job_status, dict):
-            print(f"Manifest validation failed: 'job_status' must be a dict")
-            return False
-
-        return True
+            return True
     except Exception as e:
         print(f"Manifest validation error: {e}")
         return False
@@ -843,18 +863,16 @@ def main():
         manifest_path_pre = os.path.join(results_dir, "trial_manifest.json")
         if args.resume and os.path.isfile(manifest_path_pre):
             try:
-                with open(manifest_path_pre, "r", encoding="utf-8") as _mf:
-                    existing_manifest = json.load(_mf)
-                # Validate existing manifest structure
-                if existing_manifest and not _validate_manifest_schema(existing_manifest):
-                    print(f"Warning: Invalid existing manifest at {manifest_path_pre}, starting fresh")
-                    existing_manifest = None
+                existing_manifest, upgraded = mf.load_manifest(manifest_path_pre)
+                if upgraded:
+                    print(f"Upgraded manifest to v2 at {manifest_path_pre}")
             except Exception as e:
-                print(f"Warning: Could not load existing manifest: {e}")
+                print(f"Warning: Could not load/upgrade existing manifest: {e}")
                 existing_manifest = None
 
         trial_manifest = existing_manifest or {
-            "created_utc": datetime.utcnow().isoformat() + "Z",
+            "schema_version": 2,
+            "timestamps": {"created_at": datetime.utcnow().isoformat() + "Z", "updated_at": datetime.utcnow().isoformat() + "Z"},
             "run_id": run_id,
             "trial": {
                 "model_id": model_id,
@@ -871,6 +889,8 @@ def main():
             },
             "datasets": {},
             "jobs": {},
+            "job_status": {},
+            "stage_status": {},
         }
 
         for temp in temps:
@@ -968,7 +988,39 @@ def main():
                                 print(f"Resume: skipping already completed part {jkey_resume} (results verified)")
                                 continue
                             else:
-                                print(f"Resume: part {jkey_resume} marked completed but missing results, will retry")
+                                # Attempt repair via OUTPUT_DATASET_ID or job.json instead of requeueing
+                                print(f"Resume: part {jkey_resume} marked completed but missing results; attempting repair download")
+                                try:
+                                    ds_id_txt = os.path.join(results_dir, f"{jkey_resume}_OUTPUT_DATASET_ID.txt")
+                                    job_json = os.path.join(results_dir, f"{jkey_resume}_job.json")
+                                    dsid = None
+                                    if os.path.isfile(ds_id_txt):
+                                        with open(ds_id_txt, "r", encoding="utf-8") as f:
+                                            dsid = (f.read() or "").strip()
+                                    if (not dsid) and os.path.isfile(job_json):
+                                        try:
+                                            with open(job_json, "r", encoding="utf-8") as f:
+                                                jj = json.load(f)
+                                            dsid = jj.get("outputDatasetId") or jj.get("output_dataset_id")
+                                        except Exception:
+                                            pass
+                                    if dsid:
+                                        try:
+                                            ds = get_dataset(account_id, str(dsid).split("/")[-1])
+                                            ext = ds.get("externalUrl") or ds.get("external_url")
+                                        except Exception:
+                                            ext = None
+                                        if ext:
+                                            job_dir = os.path.join(results_dir, jkey_resume)
+                                            os.makedirs(job_dir, exist_ok=True)
+                                            bundle = try_download_external_url(ext, job_dir)
+                                            if bundle:
+                                                extracted = _try_extract_jsonls(bundle, job_dir)
+                                                if extracted:
+                                                    print(f"Repair successful: downloaded results for {jkey_resume}")
+                                                    continue
+                                except Exception as _e:
+                                    print(f"WARNING: repair attempt failed for {jkey_resume}: {_e}")
                     # Create a safe, short dataset display name (<64 chars) to satisfy API constraints
                     ds_name = _make_dataset_display_name(ps_name, t_str, cond, run_id, part_number)
                     if args.dry_run:
@@ -987,7 +1039,7 @@ def main():
                     jkey = f"t{t_str}_{cond}_p{part_number:02d}"
                     trial_manifest["job_status"][jkey] = "pending"
                 # Persist the manifest immediately (early state)
-                write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+                mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
 
                 # Dry-run path: simulate queue concurrency lifecycle (no API calls)
                 if args.dry_run:
@@ -1040,7 +1092,7 @@ def main():
                         with open(os.path.join(results_dir, f"{jkey}_OUTPUT_DATASET_ID.txt"), "w", encoding="utf-8") as of:
                             of.write(f"dry-{jkey}")
                     # Persist updated manifest after dry-run synthesis
-                    write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+                    mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
                 else:
                     # Real queue run with simple progress callback that updates the manifest
                     def _progress_cb(ev: dict):
@@ -1072,7 +1124,7 @@ def main():
                                     trial_manifest["job_status"][jkey] = "completed"
                                 elif ev.get("event") == "download_pending":
                                     trial_manifest["job_status"][jkey] = "completed"
-                            write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+                            mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
                         except Exception:
                             pass
                     queue.progress_cb = _progress_cb  # type: ignore[attr-defined]
@@ -1089,7 +1141,7 @@ def main():
                     trial_manifest["jobs"][f"t{t_str}_{cond}"] = jnames
 
         # Write per-trial manifest
-        write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+        mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
         print("Trial manifest written:", os.path.join(results_dir, "trial_manifest.json"))
         if state is not None:
             with RunStateLock(run_root):
@@ -1247,10 +1299,9 @@ def main():
 
         manifest_path = os.path.join(results_dir, "trial_manifest.json")
         try:
-            with open(manifest_path, "r", encoding="utf-8") as f:
-                manifest = json.load(f)
-        except Exception:
-            print(f"WARNING: Missing trial manifest at {manifest_path}; skipping this trial")
+            manifest, _ = mf.load_manifest(manifest_path)
+        except Exception as e:
+            print(f"WARNING: Missing or invalid trial manifest at {manifest_path}: {e}; skipping this trial")
             continue
 
         # Polling and download step (gated)
@@ -1320,6 +1371,14 @@ def main():
                         continue
 
         print(f"Combined {combined_lines} unique items into {combined_path}")
+        # Update manifest stage_status.downloaded based on current files
+        try:
+            st = mf.compute_stage_statuses(results_dir)
+            man, _ = mf.load_manifest(os.path.join(results_dir, "trial_manifest.json"))
+            man["stage_status"] = st
+            mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), man)
+        except Exception as _e:
+            print(f"WARNING: failed to update manifest stage_status.downloaded: {_e}")
         if combined_lines == 0:
             print("No parseable results found (.jsonl with custom_id). Skipping parse/score/stats/costs for this trial.")
             continue

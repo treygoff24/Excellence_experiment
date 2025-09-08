@@ -9,6 +9,7 @@ from math import sqrt
 from scipy.stats import t as student_t
 
 from config.schema import load_config
+from scripts import manifest_v2 as mf
 
 
 def read_manifest(path: str) -> dict:
@@ -457,6 +458,7 @@ def main():
     ap.add_argument("--config", default="config/eval_config.yaml")
     ap.add_argument("--results_dir", default="results")
     ap.add_argument("--reports_dir", default="reports")
+    ap.add_argument("--force", action="store_true", help="Force regenerate report even if up-to-date")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -474,8 +476,32 @@ def main():
         manifest = {}
 
     out_path = os.path.join(args.reports_dir, "report.md")
+    # Idempotency: if report exists and newer than inputs and not --force, skip
+    newest_input = 0.0
+    for p in [per_item_csv, sig_path, costs_path]:
+        if os.path.exists(p):
+            newest_input = max(newest_input, os.path.getmtime(p))
+    if (not args.force) and os.path.isfile(out_path) and os.path.getmtime(out_path) >= newest_input:
+        print("Idempotent skip: report.md up-to-date (use --force to regenerate)")
+        _update_manifest_report(args.results_dir, out_path)
+        return
     write_report(cfg, manifest, means, significance, costs, out_path, series=series, counts=counts)
     print("Wrote", out_path)
+    _update_manifest_report(args.results_dir, out_path)
+
+
+def _update_manifest_report(results_dir: str, report_path: str) -> None:
+    manifest_path = os.path.join(results_dir, "trial_manifest.json")
+    if os.path.isfile(manifest_path):
+        try:
+            mf.update_stage_status(
+                manifest_path,
+                "report",
+                "completed",
+                {"report_md": os.path.relpath(report_path, os.path.dirname(results_dir))},
+            )
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
