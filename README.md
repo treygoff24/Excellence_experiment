@@ -42,6 +42,20 @@ make eval
 - **Cost Tracking**: Token usage monitoring with batch discount application
 - **Reproducibility**: Complete run manifests with prompts, parameters, and job IDs
 
+## Docs & Prompts
+
+- Guides
+  - [GPT‑5 Prompting Best Practices](docs/guides/gpt5-prompting-best-practices-guide.md) — Responses API, tool calling, structured outputs, MCP, long‑context prompting, observability/evals, and safety.
+  - [GPT‑5 Agentic Workflow Guide](docs/guides/gpt5-agentic-workflow-guide.md) — design patterns with the Agents SDK, verbosity/reasoning controls, tracing/guardrails, and worked examples.
+- Prompts & Templates
+  - [Agent Implementation Prompt](docs/prompts/agent-implementation.md) — run an end‑to‑end ticket in Codex CLI (branching, logs, tests, JSON summary).
+  - [Agent Reviewer Prompt](docs/prompts/agent-reviewer.md) — checklist and constraints for PR validation (comments‑only).
+  - [Release Manager Prompt](docs/prompts/agent-release-manager.md) — stacked‑PR etiquette, rebase flow, rollout guidance.
+  - [Run Ticket Example](docs/prompts/run-ticket-example.txt) — reference flow and expected summary format.
+  - [Ticket Template](codex/TICKET_TEMPLATE.md) and [Log Template](codex/LOG_TEMPLATE.md) — standardize tickets and operational logs.
+- Orchestration Planning
+  - [Stop/Resume Design](docs/planning/stop_resume_design.md) — run_state.json schema, per‑trial manifest v2, and idempotent phase gating for `scripts.run_all`.
+
 ## Setup
 
 ### Prerequisites
