@@ -66,9 +66,8 @@ class QueueManager:
     _lock: threading.RLock = field(default_factory=threading.RLock)
     _submission_semaphore: Optional[threading.Semaphore] = None
     quota_blocked: bool = False  # pause submissions until at least one running job completes
-    # Optional cooperative stop event (expects is_set() -> bool); when set, stop
-    # submitting new jobs and exit once no running jobs remain.
-    stop_event: Optional[object] = None
+    # Optional cooperative stop event (expects is_set() -> bool)
+    stop_event: Optional[object] = None  # supports is_set()
 
     def __post_init__(self):
         """Initialize semaphore after dataclass creation"""
@@ -390,7 +389,6 @@ class QueueManager:
                 stop_requested = (self.stop_event is not None and getattr(self.stop_event, "is_set", lambda: False)())
             except Exception:
                 stop_requested = False
-
             # Submit new jobs if possible
             while (not stop_requested) and self.can_submit_more() and not self.quota_blocked:
                 next_job = self.get_next_pending()
@@ -423,6 +421,17 @@ class QueueManager:
             if all_done:
                 print("\n✓ All jobs completed!")
                 break
+            if stop_requested:
+                # If stopping, exit when no running jobs remain
+                with self._lock:
+                    running_left = bool(self.running_jobs)
+                if not running_left:
+                    self._safe_progress_callback({
+                        "event": "stopped",
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                    print("Cooperative stop: no running jobs; exiting queue loop.")
+                    break
 
             if stop_requested:
                 # If stopping, exit when no running jobs remain
@@ -477,7 +486,12 @@ class QueueManager:
         max_running_peak = 0
         while True:
             # Submit up to max_concurrent pending jobs
-            while self.can_submit_more():
+            should_stop = False
+            try:
+                should_stop = (self.stop_event is not None and getattr(self.stop_event, "is_set", lambda: False)())
+            except Exception:
+                should_stop = False
+            while (not should_stop) and self.can_submit_more():
                 next_job = self.get_next_pending()
                 if next_job is None:
                     break
