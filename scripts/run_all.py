@@ -22,6 +22,16 @@ from fireworks.upload_dataset import create_dataset, upload_dataset_file
 from fireworks.poll_and_download import poll_until_done, get_dataset, try_download_external_url
 from fireworks.batch_queue_manager import QueueManager
 from config.schema import load_config
+from scripts.state_utils import (
+    RunStateLock,
+    write_json_atomic,
+    init_run_state,
+    load_run_state,
+    update_phase,
+    run_state_path,
+    StopToken,
+    compute_config_hash,
+)
 
 
 def _split_list_arg(val) -> list[str]:
@@ -476,7 +486,16 @@ def main():
     ap.add_argument("--models", nargs="+", help="Models or aliases (space or comma separated)")
     ap.add_argument("--prompt_sets", nargs="+", help="Prompt set names (space or comma separated)")
     ap.add_argument("--temps", nargs="+", help="Temperatures override (space or comma separated)")
-    ap.add_argument("--plan_only", action="store_true", help="Show expanded trial plan and exit")
+    ap.add_argument("--plan_only", action="store_true", help="Show phase plan and exit")
+    ap.add_argument("--only_step", choices=[
+        "prepare","build","submit","poll","parse","score","stats","costs","report"
+    ], help="Run only the specified phase")
+    ap.add_argument("--from_step", choices=[
+        "prepare","build","submit","poll","parse","score","stats","costs","report"
+    ], help="Start from this phase (inclusive)")
+    ap.add_argument("--to_step", choices=[
+        "prepare","build","submit","poll","parse","score","stats","costs","report"
+    ], help="Stop after this phase (inclusive)")
     ap.add_argument("--archive", action="store_true", help="Archive results after completion")
     ap.add_argument("--max_concurrent_jobs", type=int, default=4, help="Max concurrent Fireworks batch jobs (default: 4)")
     ap.add_argument("--parts_per_dataset", type=int, default=None, help="How many parts to split each input into (decoupled from concurrency)")
@@ -513,16 +532,207 @@ def main():
         except Exception as e:
             print(f"WARNING: Failed to write effective config: {e}. Using original config.")
 
-    # Plan-only mode prints the trial matrix then exits
+    # Compute the ordered phases and gating selection
+    PHASES = ["prepare","build","submit","poll","parse","score","stats","costs","report"]
+    def _compute_phase_selection() -> list[str]:
+        if args.only_step:
+            return [args.only_step]
+        if args.from_step and args.to_step:
+            si = PHASES.index(args.from_step)
+            ei = PHASES.index(args.to_step)
+            if si > ei:
+                raise SystemExit("Invalid gating: --from_step must be <= --to_step")
+            return PHASES[si:ei+1]
+        if args.from_step:
+            return PHASES[PHASES.index(args.from_step):]
+        if args.to_step:
+            return PHASES[:PHASES.index(args.to_step)+1]
+        return PHASES[:]
+
+    selected_phases = _compute_phase_selection()
+
+    # Initialize run-level state and stop token
+    stop_token = StopToken(run_root or os.getcwd())
+    state = None
+    if use_exp_root:
+        # Ensure run root exists
+        os.makedirs(run_root, exist_ok=True)
+        state = load_run_state(run_root)
+        if args.resume and state is None:
+            print(f"ERROR: --resume requested but missing run_state.json at {run_state_path(run_root)}")
+            print("Hint: Try --plan_only to inspect, or run without --resume for a new run.")
+            raise SystemExit(2)
+        if state is None:
+            state = init_run_state(run_root, run_id, cfg)
+            with RunStateLock(run_root):
+                write_json_atomic(run_state_path(run_root), state)
+        else:
+            # Best-effort config hash check
+            try:
+                cfg_hash = compute_config_hash(cfg)
+                if cfg_hash != state.get("config_hash"):
+                    print("WARNING: Effective config differs from recorded config_hash; proceed with caution for resume.")
+            except Exception:
+                pass
+
+    # Helpers to compute simple done-predicates from on-disk artifacts
+    def _prepared_done() -> bool:
+        pdir = cfg["paths"]["prepared_dir"]
+        open_b = os.path.join(pdir, "open_book.jsonl")
+        closed_b = os.path.join(pdir, "closed_book.jsonl")
+        return os.path.isfile(open_b) and os.path.getsize(open_b) > 0 and os.path.isfile(closed_b) and os.path.getsize(closed_b) > 0
+
+    def _build_done() -> bool:
+        prompt_sets_cfg = cfg.get("prompt_sets") or {}
+        default_ps = cfg.get("default_prompt_set") or (sorted(list(prompt_sets_cfg.keys()))[0] if prompt_sets_cfg else "default")
+        temps_per_ps: dict[str, set[float]] = {}
+        for tr in trials:
+            psn = tr.get("prompt_set") or default_ps
+            temps_per_ps.setdefault(psn, set()).update(float(t) for t in (tr.get("temps") or cfg.get("temps") or [0.0]))
+        for psn, tset in temps_per_ps.items():
+            suffix = f"_{psn}" if (len(prompt_sets_cfg) > 1 or psn not in ("default", None)) else ""
+            for t in sorted(tset):
+                t_str = _format_temp_label(float(t))
+                for cond in ("control","treatment"):
+                    fpath = os.path.join(cfg["paths"]["batch_inputs_dir"], f"t{t_str}{suffix}_{cond}.jsonl")
+                    if not (os.path.isfile(fpath) and os.path.getsize(fpath) > 0):
+                        return False
+        return True
+
+    def _trial_dirs() -> list[tuple[dict, str, str]]:
+        prompt_sets_cfg = cfg.get("prompt_sets") or {}
+        default_ps = cfg.get("default_prompt_set") or (sorted(list(prompt_sets_cfg.keys()))[0] if prompt_sets_cfg else "default")
+        out: list[tuple[dict, str, str]] = []
+        for trial in trials:
+            model_id = trial["model_id"]
+            ps_name = trial.get("prompt_set") or default_ps
+            top_p = trial.get("top_p", cfg.get("top_p"))
+            top_k = trial.get("top_k", cfg.get("top_k"))
+            mx = trial.get("max_new_tokens") or cfg.get("max_new_tokens", {"closed_book": 1024, "open_book": 1024})
+            if os.path.exists(experiments_dir):
+                slug = _trial_slug(model_id, ps_name, top_p, top_k, mx, aliases=cfg.get("model_aliases") or {})
+                trial_root = os.path.join(experiments_dir, f"run_{run_id}", slug)
+                results_dir = os.path.join(trial_root, "results")
+                reports_dir = os.path.join(trial_root, "reports")
+            else:
+                results_dir = cfg["paths"]["results_dir"]
+                reports_dir = cfg["paths"]["reports_dir"]
+            out.append((trial, results_dir, reports_dir))
+        return out
+
+    def _submit_done() -> bool:
+        # Minimal check: manifests exist and have jobs entries
+        for _trial, results_dir, _reports_dir in _trial_dirs():
+            mp = os.path.join(results_dir, "trial_manifest.json")
+            try:
+                with open(mp, "r", encoding="utf-8") as f:
+                    m = json.load(f)
+                jobs = m.get("jobs") or {}
+                if not jobs:
+                    return False
+            except Exception:
+                return False
+        return True
+
+    def _poll_done() -> bool:
+        # Done if any results JSONL detected or combined exists and has content
+        for _trial, results_dir, _reports_dir in _trial_dirs():
+            combined = os.path.join(results_dir, "results_combined.jsonl")
+            if os.path.isfile(combined) and os.path.getsize(combined) > 0:
+                continue
+            any_jsonl = False
+            for root, _d, files in os.walk(results_dir):
+                if any(nm.lower().endswith('.jsonl') for nm in files):
+                    any_jsonl = True
+                    break
+            if not any_jsonl:
+                return False
+        return True
+
+    def _parse_done() -> bool:
+        for _trial, results_dir, _reports_dir in _trial_dirs():
+            if not os.path.isfile(os.path.join(results_dir, "predictions.csv")):
+                return False
+        return True
+
+    def _score_done() -> bool:
+        for _trial, results_dir, _reports_dir in _trial_dirs():
+            if not os.path.isfile(os.path.join(results_dir, "per_item_scores.csv")):
+                return False
+        return True
+
+    def _stats_done() -> bool:
+        for _trial, results_dir, _reports_dir in _trial_dirs():
+            if not os.path.isfile(os.path.join(results_dir, "significance.json")):
+                return False
+        return True
+
+    def _costs_done() -> bool:
+        for _trial, results_dir, _reports_dir in _trial_dirs():
+            if not os.path.isfile(os.path.join(results_dir, "costs.json")):
+                return False
+        return True
+
+    def _report_done() -> bool:
+        for _trial, _results_dir, reports_dir in _trial_dirs():
+            if not os.path.isfile(os.path.join(reports_dir, "report.md")):
+                return False
+        return True
+
+    phase_done_fn = {
+        "prepare": _prepared_done,
+        "build": _build_done,
+        "submit": _submit_done,
+        "poll": _poll_done,
+        "parse": _parse_done,
+        "score": _score_done,
+        "stats": _stats_done,
+        "costs": _costs_done,
+        "report": _report_done,
+    }
+
+    # Plan-only mode prints the phase plan and exits
     if args.plan_only:
-        plan = {"created_utc": datetime.utcnow().isoformat() + "Z", "run_id": run_id, "num_trials": len(trials), "trials": trials}
-        print(json.dumps(plan, indent=2))
+        plan_lines: list[str] = []
+        plan_lines.append(f"Run ID: {run_id}")
+        plan_lines.append(f"Config hash: {compute_config_hash(cfg)}")
+        plan_lines.append("Phases:")
+        for ph in PHASES:
+            selected = (ph in selected_phases)
+            try:
+                done = phase_done_fn[ph]()
+            except Exception:
+                done = False
+            action = "skip" if (not selected or done) else "execute"
+            reason = "not selected" if not selected else ("already done" if done else "pending")
+            plan_lines.append(f"- {ph}: {action} ({reason})")
+        print("\n".join(plan_lines))
         return
 
     ensure_dirs(cfg)
-    if not args.skip_prepare:
+
+    # Phase: prepare
+    if "prepare" in selected_phases and not _prepared_done():
+        if state is not None:
+            with RunStateLock(run_root):
+                update_phase(state, "prepare", status="in_progress")
+                write_json_atomic(run_state_path(run_root), state)
+        stop_token.check()
         run_cmd([sys.executable, "-m", "scripts.prepare_data", "--config", effective_config_path])
-    if not args.skip_build:
+        if state is not None:
+            with RunStateLock(run_root):
+                update_phase(state, "prepare", status="completed")
+                write_json_atomic(run_state_path(run_root), state)
+    else:
+        print("Gating: skipping prepare (already done or not selected)")
+
+    # Phase: build
+    if "build" in selected_phases and not _build_done():
+        if state is not None:
+            with RunStateLock(run_root):
+                update_phase(state, "build", status="in_progress")
+                write_json_atomic(run_state_path(run_root), state)
+        stop_token.check()
         # Build once per prompt set with union of temps across trials
         temps_per_ps: dict[str, set[float]] = {}
         prompt_sets_cfg = cfg.get("prompt_sets") or {}
@@ -533,6 +743,12 @@ def main():
         for psn, tset in temps_per_ps.items():
             temps_arg = ",".join(str(t) for t in sorted(tset))
             run_cmd([sys.executable, "-m", "scripts.build_batches", "--config", effective_config_path, "--prompt_set", psn, "--temps", temps_arg])
+        if state is not None:
+            with RunStateLock(run_root):
+                update_phase(state, "build", status="completed")
+                write_json_atomic(run_state_path(run_root), state)
+    else:
+        print("Gating: skipping build (already done or not selected)")
     if args.skip_batch:
         # Write a minimal multi-trial plan and exit
         plan = {"created_utc": datetime.utcnow().isoformat() + "Z", "run_id": run_id, "num_trials": len(trials), "trials": trials}
@@ -581,7 +797,13 @@ def main():
     # Submit datasets and jobs per trial and write per-trial manifests
     prompt_sets_cfg = cfg.get("prompt_sets") or {}
     default_ps = cfg.get("default_prompt_set") or (sorted(list(prompt_sets_cfg.keys()))[0] if prompt_sets_cfg else "default")
-    for trial in trials:
+    if "submit" in selected_phases and not _submit_done():
+        if state is not None:
+            with RunStateLock(run_root):
+                update_phase(state, "submit", status="in_progress")
+                write_json_atomic(run_state_path(run_root), state)
+        for trial in trials:
+            stop_token.check()
         model_id = trial["model_id"]
         ps_name = trial.get("prompt_set") or default_ps
         temps = trial.get("temps") or (cfg.get("temps") or [0.0])
@@ -674,6 +896,7 @@ def main():
                     temperature=float(temp),
                     condition=cond,
                     run_id=run_id,
+                    stop_event=stop_token,
                 )
                 # If resuming and this temp/cond appears complete in manifest, skip queueing
                 resume_key = f"t{t_str}_{cond}"
@@ -854,6 +1077,12 @@ def main():
         # Write per-trial manifest
         write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
         print("Trial manifest written:", os.path.join(results_dir, "trial_manifest.json"))
+        if state is not None:
+            with RunStateLock(run_root):
+                update_phase(state, "submit", status="completed")
+                write_json_atomic(run_state_path(run_root), state)
+    else:
+        print("Gating: skipping submit (already done or not selected)")
 
     # Helpers to extract any JSONL files from downloaded bundles
     def _try_extract_jsonls(bundle_path: str, out_dir: str) -> list[str]:
@@ -981,7 +1210,7 @@ def main():
         except Exception as e:
             print(f"WARNING: failed to download dataset for {job_key}: {e}")
 
-    # Iterate trials for polling and reporting
+    # Iterate trials for polling, parsing, scoring, stats, costs, reporting
     prompt_sets_cfg = cfg.get("prompt_sets") or {}
     default_ps = cfg.get("default_prompt_set") or (sorted(list(prompt_sets_cfg.keys()))[0] if prompt_sets_cfg else "default")
     all_trial_summaries: list[dict] = []
@@ -1010,25 +1239,37 @@ def main():
             print(f"WARNING: Missing trial manifest at {manifest_path}; skipping this trial")
             continue
 
-        # Flatten jobs
-        flat_jobs: list[tuple[str, str]] = []
-        for k, v in manifest["jobs"].items():
-            if isinstance(v, list):
-                for i, name in enumerate(v, start=1):
-                    if not name:
-                        continue
-                    flat_jobs.append((f"{k}_p{i:02d}", name))
-            else:
-                if v:
-                    flat_jobs.append((k, v))
-        with ThreadPoolExecutor(max_workers=min(4, len(flat_jobs)) or 1) as ex:
-            futures = {ex.submit(_process_job, k, v, results_dir): k for k, v in flat_jobs}
-            for fut in as_completed(futures):
-                _k = futures[fut]
-                try:
-                    fut.result()
-                except Exception as e:
-                    print(f"WARNING: polling/downloading failed for {_k}: {e}")
+        # Polling and download step (gated)
+        if "poll" in selected_phases and not _poll_done():
+            if state is not None:
+                with RunStateLock(run_root):
+                    update_phase(state, "poll", status="in_progress")
+                    write_json_atomic(run_state_path(run_root), state)
+            stop_token.check()
+            flat_jobs: list[tuple[str, str]] = []
+            for k, v in manifest["jobs"].items():
+                if isinstance(v, list):
+                    for i, name in enumerate(v, start=1):
+                        if not name:
+                            continue
+                        flat_jobs.append((f"{k}_p{i:02d}", name))
+                else:
+                    if v:
+                        flat_jobs.append((k, v))
+            with ThreadPoolExecutor(max_workers=min(4, len(flat_jobs)) or 1) as ex:
+                futures = {ex.submit(_process_job, k, v, results_dir): k for k, v in flat_jobs}
+                for fut in as_completed(futures):
+                    _k = futures[fut]
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        print(f"WARNING: polling/downloading failed for {_k}: {e}")
+            if state is not None:
+                with RunStateLock(run_root):
+                    update_phase(state, "poll", status="completed")
+                    write_json_atomic(run_state_path(run_root), state)
+        else:
+            print("Gating: skipping poll for this trial (already done or not selected)")
 
         # Locate and combine all results JSONL files for parsing (per-trial)
         jsonl_files: list[str] = []
@@ -1069,42 +1310,92 @@ def main():
             print("No parseable results found (.jsonl with custom_id). Skipping parse/score/stats/costs for this trial.")
             continue
 
-        # Parse predictions → CSV
-        run_cmd([sys.executable, "-m", "fireworks.parse_results", "--results_jsonl", combined_path, "--out_csv", os.path.join(results_dir, "predictions.csv")])
-        # Score per-item
-        run_cmd([sys.executable, "-m", "scoring.score_predictions", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--out_dir", results_dir, "--config", effective_config_path])
-        # Stats (tolerate optional SciPy not installed in some environments)
-        try:
-            run_cmd([sys.executable, "-m", "scoring.stats", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "significance.json")])
-        except Exception:
-            # Write an empty file so downstream report generation still works
+        # Parse predictions → CSV (gated)
+        if "parse" in selected_phases and not _parse_done():
+            if state is not None:
+                with RunStateLock(run_root):
+                    update_phase(state, "parse", status="in_progress")
+                    write_json_atomic(run_state_path(run_root), state)
+            stop_token.check()
+            run_cmd([sys.executable, "-m", "fireworks.parse_results", "--results_jsonl", combined_path, "--out_csv", os.path.join(results_dir, "predictions.csv")])
+            if state is not None:
+                with RunStateLock(run_root):
+                    update_phase(state, "parse", status="completed")
+                    write_json_atomic(run_state_path(run_root), state)
+        else:
+            print("Gating: skipping parse (already done or not selected)")
+
+        # Score per-item (gated)
+        if "score" in selected_phases and not _score_done():
+            if state is not None:
+                with RunStateLock(run_root):
+                    update_phase(state, "score", status="in_progress")
+                    write_json_atomic(run_state_path(run_root), state)
+            stop_token.check()
+            run_cmd([sys.executable, "-m", "scoring.score_predictions", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--out_dir", results_dir, "--config", effective_config_path])
+            if state is not None:
+                with RunStateLock(run_root):
+                    update_phase(state, "score", status="completed")
+                    write_json_atomic(run_state_path(run_root), state)
+        else:
+            print("Gating: skipping score (already done or not selected)")
+
+        # Stats (tolerate optional SciPy not installed in some environments) (gated)
+        if "stats" in selected_phases and not _stats_done():
             try:
-                with open(os.path.join(results_dir, "significance.json"), "w", encoding="utf-8") as _sf:
-                    json.dump({}, _sf)
+                if state is not None:
+                    with RunStateLock(run_root):
+                        update_phase(state, "stats", status="in_progress")
+                        write_json_atomic(run_state_path(run_root), state)
+                stop_token.check()
+                run_cmd([sys.executable, "-m", "scoring.stats", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "significance.json")])
             except Exception:
-                pass
-        # Unsupported sensitivity analysis (Phase 4)
+                # Write an empty file so downstream report generation still works
+                try:
+                    with open(os.path.join(results_dir, "significance.json"), "w", encoding="utf-8") as _sf:
+                        json.dump({}, _sf)
+                except Exception:
+                    pass
+            finally:
+                if state is not None:
+                    with RunStateLock(run_root):
+                        update_phase(state, "stats", status="completed")
+                        write_json_atomic(run_state_path(run_root), state)
+        else:
+            print("Gating: skipping stats (already done or not selected)")
+
+        # Optional analyses (always safe, not tracked in run_state)
         try:
             run_cmd([sys.executable, "-m", "scripts.unsupported_sensitivity", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", effective_config_path, "--out_path", os.path.join(results_dir, "unsupported_sensitivity.json")])
         except Exception:
             pass
-        # Mixed-effects robustness models (optional)
         try:
             run_cmd([sys.executable, "-m", "scripts.mixed_effects", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", effective_config_path, "--out_path", os.path.join(results_dir, "mixed_models.json")])
         except Exception:
             pass
-        # Power/MDE analysis (optional)
         try:
             run_cmd([sys.executable, "-m", "scripts.power_analysis", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--config", effective_config_path, "--out_path", os.path.join(results_dir, "power_analysis.json")])
         except Exception:
             pass
-        # Cost-effectiveness summary (optional)
         try:
             run_cmd([sys.executable, "-m", "scripts.cost_effectiveness", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "cost_effectiveness.json")])
         except Exception:
             pass
-        # Costs
-        run_cmd([sys.executable, "-m", "scripts.summarize_costs", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "costs.json")])
+
+        # Costs (gated)
+        if "costs" in selected_phases and not _costs_done():
+            if state is not None:
+                with RunStateLock(run_root):
+                    update_phase(state, "costs", status="in_progress")
+                    write_json_atomic(run_state_path(run_root), state)
+            stop_token.check()
+            run_cmd([sys.executable, "-m", "scripts.summarize_costs", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "costs.json")])
+            if state is not None:
+                with RunStateLock(run_root):
+                    update_phase(state, "costs", status="completed")
+                    write_json_atomic(run_state_path(run_root), state)
+        else:
+            print("Gating: skipping costs (already done or not selected)")
         # Generate a concise Markdown report
         report_path = os.path.join(reports_dir, "report.md")
 
@@ -1236,8 +1527,20 @@ def main():
             if costs.get("batch_discount_applied"):
                 lines.append("- Batch discount applied")
             lines.append("")
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+        if "report" in selected_phases and not _report_done():
+            if state is not None:
+                with RunStateLock(run_root):
+                    update_phase(state, "report", status="in_progress")
+                    write_json_atomic(run_state_path(run_root), state)
+            stop_token.check()
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            if state is not None:
+                with RunStateLock(run_root):
+                    update_phase(state, "report", status="completed")
+                    write_json_atomic(run_state_path(run_root), state)
+        else:
+            print("Gating: skipping report (already done or not selected)")
 
         print("Trial complete. Parsed predictions, scored, computed stats and costs, and wrote report.")
         all_trial_summaries.append({"trial": trial, "results_dir": results_dir, "reports_dir": reports_dir, "report_path": report_path})

@@ -66,6 +66,7 @@ class QueueManager:
     _lock: threading.RLock = field(default_factory=threading.RLock)
     _submission_semaphore: Optional[threading.Semaphore] = None
     quota_blocked: bool = False  # pause submissions until at least one running job completes
+    stop_event: Optional[object] = None  # supports is_set()
 
     def __post_init__(self):
         """Initialize semaphore after dataclass creation"""
@@ -96,6 +97,12 @@ class QueueManager:
 
     def submit_job(self, job: JobInfo) -> bool:
         """Submit a single job (thread-safe with semaphore)"""
+        # If a stop has been requested, do not submit new jobs
+        try:
+            if self.stop_event is not None and getattr(self.stop_event, "is_set", lambda: False)():
+                return False
+        except Exception:
+            pass
         # Acquire semaphore to limit concurrent submissions
         if not self._submission_semaphore.acquire(timeout=30.0):
             print(f"✗ Timeout acquiring semaphore for P{job.part_number:02d}")
@@ -375,8 +382,14 @@ class QueueManager:
         print(f"Starting queue processing with max {self.max_concurrent} concurrent jobs")
 
         while True:
+            # Respect cooperative stop: do not submit new jobs
+            stop_requested = False
+            try:
+                stop_requested = (self.stop_event is not None and getattr(self.stop_event, "is_set", lambda: False)())
+            except Exception:
+                stop_requested = False
             # Submit new jobs if possible
-            while self.can_submit_more() and not self.quota_blocked:
+            while (not stop_requested) and self.can_submit_more() and not self.quota_blocked:
                 next_job = self.get_next_pending()
                 if next_job is None:
                     break  # No more pending jobs
@@ -402,11 +415,22 @@ class QueueManager:
             # Print status
             self.print_status()
 
-            # Check if we're done
+            # Check if we're done or stopping
             all_done = all(j.status in ("completed", "failed") for j in self.jobs)
             if all_done:
                 print("\n✓ All jobs completed!")
                 break
+            if stop_requested:
+                # If stopping, exit when no running jobs remain
+                with self._lock:
+                    running_left = bool(self.running_jobs)
+                if not running_left:
+                    self._safe_progress_callback({
+                        "event": "stopped",
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                    print("Cooperative stop: no running jobs; exiting queue loop.")
+                    break
 
             # Wait before next check
             if self.running_jobs:
@@ -449,7 +473,12 @@ class QueueManager:
         max_running_peak = 0
         while True:
             # Submit up to max_concurrent pending jobs
-            while self.can_submit_more():
+            should_stop = False
+            try:
+                should_stop = (self.stop_event is not None and getattr(self.stop_event, "is_set", lambda: False)())
+            except Exception:
+                should_stop = False
+            while (not should_stop) and self.can_submit_more():
                 next_job = self.get_next_pending()
                 if next_job is None:
                     break
