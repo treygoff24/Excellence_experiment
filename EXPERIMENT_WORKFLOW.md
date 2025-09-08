@@ -62,6 +62,17 @@ python scripts/run_all.py --run_id my_custom_run --archive
 python -m scripts.run_all --skip_prepare --skip_build --archive
 ```
 
+**Phase gating and planning:**
+```bash
+# Run only parse
+python -m scripts.run_all --only_step parse --plan_only
+
+# Start at parse and stop after score
+python -m scripts.run_all --from_step parse --to_step score --plan_only
+```
+
+Selected phases will show "execute" or "skip (already done)"; unselected ones show "skip (not selected)".
+
 **Manual archiving:**
 ```bash
 python scripts/archive_run.py --experiment_name t15_custom_experiment
@@ -89,6 +100,9 @@ Main experiment runner with new isolation features:
 - `--run_id`: Custom run identifier
 - `--archive`: Automatically archive results after completion
 - Automatically creates experiment-specific directories when `experiments/` exists
+- `--resume`: Resume idempotently from `run_state.json` and per‑trial manifests
+- `--only_step/--from_step/--to_step`: Gate which phases run
+- `--plan_only`: Print the phase plan with reasons and exit
 
 ### `scripts/list_runs.py`
 List and inspect archived experiments:
@@ -142,3 +156,18 @@ python scripts/compare_runs.py --run1 t1_r20250821 --run2 t05_r20250825123456
 ```
 
 This system ensures clean separation between experiments and provides easy tools for managing and comparing results.
+
+## Stop/Resume Semantics
+
+- The orchestrator installs signal handlers (SIGINT/SIGTERM) and also watches for a STOP file at `experiments/run_<RUN_ID>/STOP_REQUESTED`.
+- A STOP is honored between phases and major loops (e.g., between submit and poll, before parse/score/stats/report).
+- To resume safely, rerun with `--resume` and the same effective config. The system verifies config drift and upgrades any legacy manifests to v2.
+
+Artifacts:
+- `experiments/run_<RUN_ID>/run_state.json`: phase machine with timestamps and last_error.
+- `experiments/run_<RUN_ID>/<trial-slug>/results/trial_manifest.json`: schema_version=2 with `stage_status` reflecting on‑disk artifacts.
+
+Troubleshooting:
+- If a part shows completed but results are missing, the resume path attempts repair using `*_OUTPUT_DATASET_ID.txt` or `*_job.json` metadata.
+- Use `scripts/list_runs.py -v` to inspect run status and migration flags.
+- For manual downloads, use Fireworks CLI: `firectl download dataset <OUTPUT_DATASET_ID> --output-dir <results_dir>`.
