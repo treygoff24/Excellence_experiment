@@ -11,6 +11,9 @@ import shutil
 import argparse
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Any
+
+from scripts.state_utils import load_run_state
 
 
 def get_run_info_from_manifest(manifest_path: str) -> dict:
@@ -84,7 +87,7 @@ def create_experiment_archive(
                 print(f"Moved directory: {source_path} -> {dest_path}")
 
     # Create archive manifest
-    archive_manifest = {
+    archive_manifest: Dict[str, Any] = {
         "experiment_id": experiment_name,
         "description": f"Temperature={run_info['temperature']} experiment run",
         "archived_date": datetime.utcnow().isoformat() + "Z",
@@ -98,6 +101,16 @@ def create_experiment_archive(
         "status": "archived",
         "notes": "Experiment archived using archive_run.py script"
     }
+
+    # Enrich with run_state if present
+    run_root = os.path.join("experiments", f"run_{run_info['run_id']}")
+    st = load_run_state(run_root)
+    if st:
+        archive_manifest["state"] = {
+            "migrated": bool(st.get("migrated", False)),
+            "config_hash": st.get("config_hash"),
+            "phases": st.get("phases", {}),
+        }
 
     manifest_path = os.path.join(archive_path, "archive_manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as f:
@@ -116,6 +129,7 @@ def main():
     ap.add_argument("--experiment_name", help="Custom experiment name (auto-generated if not provided)")
     ap.add_argument("--manifest", default="results/run_manifest.json", help="Run manifest file")
     ap.add_argument("--dry_run", action="store_true", help="Show what would be archived without moving files")
+    ap.add_argument("--allow_incomplete", action="store_true", help="Allow archiving even if run_state not fully completed")
     ap.add_argument("--yes", action="store_true", help="Proceed without interactive confirmation")
 
     args = ap.parse_args()
@@ -127,6 +141,18 @@ def main():
         sys.exit(1)
 
     print(f"Found run: Temperature={run_info['temperature']}, Run ID={run_info['run_id']}")
+
+    # Gate by run_state.json if present
+    run_root = os.path.join("experiments", f"run_{run_info['run_id']}")
+    state = load_run_state(run_root)
+    if state:
+        phases = state.get("phases", {})
+        all_completed = phases and all(str(p.get("status")) == "completed" for p in phases.values())
+        report_completed = (phases.get("report", {}) or {}).get("status") == "completed"
+        if not (all_completed or report_completed) and not args.allow_incomplete:
+            print("ERROR: Run is not completed according to run_state.json; refusing to archive.")
+            print("Hint: Pass --allow_incomplete to override, or resume the run to completion.")
+            sys.exit(2)
 
     # Define source directories
     source_dirs = {

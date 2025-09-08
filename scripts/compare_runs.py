@@ -10,6 +10,7 @@ import csv
 import argparse
 from pathlib import Path
 from typing import Dict, List, Optional
+from scripts.state_utils import load_run_state
 
 
 def load_experiment_results(experiment_path: str) -> Dict:
@@ -109,6 +110,46 @@ def compare_experiments(exp1_path: str, exp2_path: str):
     print("-" * 60)
     print(f"{'Temperature':<20} {exp1_config.get('temperature', '?'):<20} {exp2_config.get('temperature', '?'):<20}")
     print(f"{'Model':<20} {exp1_config.get('model_id', '?').split('/')[-1] if '/' in str(exp1_config.get('model_id', '?')) else exp1_config.get('model_id', '?'):<20} {exp2_config.get('model_id', '?').split('/')[-1] if '/' in str(exp2_config.get('model_id', '?')) else exp2_config.get('model_id', '?'):<20}")
+
+    # State & compatibility checks
+    def _find_trial_manifests(run_root: str) -> List[str]:
+        paths: List[str] = []
+        try:
+            for name in os.listdir(run_root):
+                d = os.path.join(run_root, name, "results", "trial_manifest.json")
+                if os.path.isfile(d):
+                    paths.append(d)
+        except Exception:
+            pass
+        return sorted(paths)
+
+    exp1_state = load_run_state(exp1_path)
+    exp2_state = load_run_state(exp2_path)
+    ch1 = (exp1_state or {}).get("config_hash")
+    ch2 = (exp2_state or {}).get("config_hash")
+
+    def _schema_versions(paths: List[str]) -> List[int]:
+        vers: List[int] = []
+        for p in paths:
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                v = int(data.get("schema_version", 1))
+                if v not in vers:
+                    vers.append(v)
+            except Exception:
+                continue
+        return sorted(vers)
+
+    v1 = _schema_versions(_find_trial_manifests(exp1_path))
+    v2 = _schema_versions(_find_trial_manifests(exp2_path))
+
+    print("\nSTATE & COMPATIBILITY:")
+    print(f"{'Config hash equal':<20} {str(bool(ch1 and ch2 and ch1 == ch2)):<20}")
+    print(f"{'Run1 config hash':<20} {ch1 or 'unknown':<20}")
+    print(f"{'Run2 config hash':<20} {ch2 or 'unknown':<20}")
+    print(f"{'Run1 manifest v':<20} {','.join(str(x) for x in v1) or 'n/a':<20}")
+    print(f"{'Run2 manifest v':<20} {','.join(str(x) for x in v2) or 'n/a':<20}")
 
     # Compare metrics
     exp1_metrics = calculate_metrics(exp1_results["per_item_scores"])
