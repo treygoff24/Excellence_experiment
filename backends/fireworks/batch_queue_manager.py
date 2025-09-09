@@ -26,3 +26,31 @@ def upload_datasets(
 ) -> list[tuple[int, str]]:
     return _upload_datasets(account_id, dataset_files, base_name, temp_label, condition)
 
+
+def create_queue(
+    *,
+    account_id: str,
+    model_id: str,
+    config: dict,
+    max_concurrent: int,
+    temp_label: str,
+    temperature: float,
+    condition: str,
+    run_id: str,
+    stop_event: object | None = None,
+) -> QueueManager:
+    """Factory adapter to satisfy the BatchExecutor.create_queue surface.
+
+    Returns a QueueManager configured with the provided arguments.
+    """
+    return QueueManager(
+        account_id=account_id,
+        model_id=model_id,
+        config=config,
+        max_concurrent=max_concurrent,
+        temp_label=temp_label,
+        temperature=temperature,
+        condition=condition,
+        run_id=run_id,
+        stop_event=stop_event,
+    )

@@ -14,3 +14,4 @@ tiktoken>=0.7.0
 jsonlines>=4.0.0
 openai
 autopep8
+llama-cpp-python>=0.2.0
