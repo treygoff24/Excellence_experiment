@@ -239,9 +239,9 @@ def main():
             "size": int(os.path.getsize(out_treat)),
             "sha256": _sha256_file(out_treat),
         }
-        manifest.setdefault("prompt_sets", {}).setdefault(ps_name, set())
-        # sets are not JSON serializable; we’ll maintain temps separately as sorted list
-        manifest.setdefault("temps", sorted(list(set([float(x) for x in (manifest.get("temps") or [])] + [float(t)]))))
+        # Maintain temps list as sorted unique values
+        manifest.setdefault("temps", [])
+        manifest["temps"] = sorted(list(set([float(x) for x in (manifest.get("temps") or [])] + [float(t)])))
         shards = manifest.setdefault("shards", {})
         shards[os.path.basename(out_control)] = ctrl_meta
         shards[os.path.basename(out_treat)] = trt_meta
