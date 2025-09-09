@@ -937,6 +937,10 @@ def main():
             "job_status": {},
             "stage_status": {},
         }
+        # Ensure required keys exist when loading an existing manifest that may be minimal
+        trial_manifest.setdefault("datasets", {})
+        trial_manifest.setdefault("jobs", {})
+        trial_manifest.setdefault("job_status", {})
 
         for temp in temps:
             t_str = _format_temp_label(float(temp))
@@ -974,12 +978,18 @@ def main():
                 # If resuming and this temp/cond appears complete in manifest, skip queueing
                 resume_key = f"t{t_str}_{cond}"
                 if args.resume and existing_manifest:
+                    # If the per-trial combined results already exist with content, consider parts downloaded
+                    combined_path = os.path.join(results_dir, "results_combined.jsonl")
+                    combined_ok = os.path.isfile(combined_path) and os.path.getsize(combined_path) > 0
                     jobs_map = (existing_manifest or {}).get("jobs", {}) or {}
                     job_status = (existing_manifest or {}).get("job_status", {}) or {}
                     names = jobs_map.get(resume_key) or []
                     if names and len(names) == len(part_files):
                         # Check that all parts appear completed AND have downloaded results
                         def _is_completed_and_downloaded(jkey: str) -> bool:
+                            # Shortcut: if we have combined results for the trial, treat this part as done
+                            if combined_ok:
+                                return True
                             status = (str(job_status.get(jkey, "")).lower())
                             if not (("complete" in status) or (status == "completed") or (status == "downloaded")):
                                 return False
@@ -989,10 +999,8 @@ def main():
                             if os.path.exists(results_path) and os.path.getsize(results_path) > 0:
                                 return True
 
-                            # Check for combined results file
-                            combined_path = os.path.join(results_dir, "results_combined.jsonl")
+                            # Check for combined results file (fallback scan if shortcut disabled)
                             if os.path.exists(combined_path):
-                                # Verify this job's results are in the combined file
                                 try:
                                     with open(combined_path, 'r', encoding='utf-8') as f:
                                         for line in f:
@@ -1033,6 +1041,11 @@ def main():
                                 print(f"Resume: skipping already completed part {jkey_resume} (results verified)")
                                 continue
                             else:
+                                # If trial-level combined results are present, skip repair attempts
+                                _combined = os.path.join(results_dir, "results_combined.jsonl")
+                                if os.path.isfile(_combined) and os.path.getsize(_combined) > 0:
+                                    print(f"Resume: combined results present; skipping repair for {jkey_resume}")
+                                    continue
                                 # Attempt repair via OUTPUT_DATASET_ID or job.json instead of requeueing
                                 print(f"Resume: part {jkey_resume} marked completed but missing results; attempting repair download")
                                 try:
