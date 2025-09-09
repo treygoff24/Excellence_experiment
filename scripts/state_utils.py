@@ -198,8 +198,9 @@ class StopToken:
                 if age_sec > (self.stale_minutes * 60):
                     # Best-effort: rename the stale STOP so it won't keep tripping future runs
                     try:
+                        base = f"{STOP_FILENAME}.stale"
                         ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                        new_name = os.path.join(self.run_root, f"{STOP_FILENAME}.stale.{ts}")
+                        new_name = os.path.join(self.run_root, f"{base}.{ts}")
                         os.replace(path, new_name)
                         try:
                             print(f"Ignoring stale STOP file (> {self.stale_minutes}m old); renamed to {os.path.basename(new_name)}")

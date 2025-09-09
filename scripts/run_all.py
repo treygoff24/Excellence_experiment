@@ -516,7 +516,11 @@ def main():
     ], help="Stop after this phase (inclusive)")
     ap.add_argument("--archive", action="store_true", help="Archive results after completion")
     # Stop/Resume behavior controls
-    ap.add_argument("--ignore_stop", action="store_true", help="Ignore STOP_REQUESTED sentinel (still honors Ctrl-C for this process)")
+    ap.add_argument(
+        "--ignore_stop",
+        action="store_true",
+        help="Ignore STOP_REQUESTED sentinel and OS stop file (still honors Ctrl-C during this process)",
+    )
     ap.add_argument("--stop_stale_minutes", type=int, default=60, help="Treat STOP_REQUESTED older than N minutes as stale and ignore (default: 60)")
     ap.add_argument("--max_concurrent_jobs", type=int, default=4, help="Max concurrent Fireworks batch jobs (default: 4)")
     ap.add_argument("--parts_per_dataset", type=int, default=None, help="How many parts to split each input into (decoupled from concurrency)")
@@ -584,6 +588,66 @@ def main():
         return PHASES[:]
 
     selected_phases = _compute_phase_selection()
+
+    # Helpers to extract any JSONL files from downloaded bundles
+    def _try_extract_jsonls(bundle_path: str, out_dir: str) -> list[str]:
+        extracted: list[str] = []
+        try:
+            if zipfile.is_zipfile(bundle_path):
+                with zipfile.ZipFile(bundle_path) as zf:
+                    for info in zf.infolist():
+                        if info.filename.lower().endswith('.jsonl'):
+                            target_path = os.path.join(out_dir, os.path.basename(info.filename))
+                            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                            with zf.open(info, 'r') as src, open(target_path, 'wb') as dst:
+                                shutil.copyfileobj(src, dst)
+                            extracted.append(target_path)
+                return extracted
+            if tarfile.is_tarfile(bundle_path):
+                with tarfile.open(bundle_path, 'r:*') as tf:
+                    for member in tf.getmembers():
+                        if member.isfile() and member.name.lower().endswith('.jsonl'):
+                            target_path = os.path.join(out_dir, os.path.basename(member.name))
+                            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                            with tf.extractfile(member) as src, open(target_path, 'wb') as dst:
+                                if src is not None:
+                                    shutil.copyfileobj(src, dst)
+                                    extracted.append(target_path)
+                return extracted
+            # Try gzip → plain file
+            with open(bundle_path, 'rb') as f:
+                head = f.read(2)
+            if head == b"\x1f\x8b":
+                decomp_path = os.path.join(out_dir, os.path.splitext(os.path.basename(bundle_path))[0])
+                try:
+                    with gzip.open(bundle_path, 'rb') as src, open(decomp_path, 'wb') as dst:
+                        shutil.copyfileobj(src, dst)
+                    # If the decompressed file is a tar, recurse; else if it's jsonl, keep it
+                    if tarfile.is_tarfile(decomp_path):
+                        extracted.extend(_try_extract_jsonls(decomp_path, out_dir))
+                    elif decomp_path.lower().endswith('.jsonl'):
+                        extracted.append(decomp_path)
+                    return extracted
+                except Exception:
+                    pass
+            # As a last resort, if it's actually a JSONL, copy/rename it
+            try:
+                with open(bundle_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        s = line.strip()
+                        if not s:
+                            continue
+                        json.loads(s)  # validate JSONL
+                        break
+                candidate = os.path.join(out_dir, 'results.jsonl')
+                shutil.copyfile(bundle_path, candidate)
+                extracted.append(candidate)
+            except Exception:
+                # not a text JSONL; ignore
+                pass
+        except Exception:
+            pass
+        return extracted
 
     # Initialize run-level state and stop token (honors STOP file semantics)
     stop_token = StopToken(
@@ -1227,65 +1291,6 @@ def main():
     else:
         print("Gating: skipping submit (already done or not selected)")
 
-    # Helpers to extract any JSONL files from downloaded bundles
-    def _try_extract_jsonls(bundle_path: str, out_dir: str) -> list[str]:
-        extracted: list[str] = []
-        try:
-            if zipfile.is_zipfile(bundle_path):
-                with zipfile.ZipFile(bundle_path) as zf:
-                    for info in zf.infolist():
-                        if info.filename.lower().endswith(".jsonl"):
-                            target_path = os.path.join(out_dir, os.path.basename(info.filename))
-                            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                            with zf.open(info, 'r') as src, open(target_path, 'wb') as dst:
-                                shutil.copyfileobj(src, dst)
-                            extracted.append(target_path)
-                return extracted
-            if tarfile.is_tarfile(bundle_path):
-                with tarfile.open(bundle_path, 'r:*') as tf:
-                    for member in tf.getmembers():
-                        if member.isfile() and member.name.lower().endswith('.jsonl'):
-                            target_path = os.path.join(out_dir, os.path.basename(member.name))
-                            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                            with tf.extractfile(member) as src, open(target_path, 'wb') as dst:
-                                if src is not None:
-                                    shutil.copyfileobj(src, dst)
-                                    extracted.append(target_path)
-                return extracted
-            # Try gzip → plain file
-            with open(bundle_path, 'rb') as f:
-                head = f.read(2)
-            if head == b"\x1f\x8b":
-                decomp_path = os.path.join(out_dir, os.path.splitext(os.path.basename(bundle_path))[0])
-                try:
-                    with gzip.open(bundle_path, 'rb') as src, open(decomp_path, 'wb') as dst:
-                        shutil.copyfileobj(src, dst)
-                    # If the decompressed file is a tar, recurse; else if it's jsonl, keep it
-                    if tarfile.is_tarfile(decomp_path):
-                        extracted.extend(_try_extract_jsonls(decomp_path, out_dir))
-                    elif decomp_path.lower().endswith('.jsonl'):
-                        extracted.append(decomp_path)
-                    return extracted
-                except Exception:
-                    pass
-            # As a last resort, if it's actually a JSONL, copy/rename it
-            try:
-                with open(bundle_path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        s = line.strip()
-                        if not s:
-                            continue
-                        json.loads(s)  # validate JSONL
-                        break
-                candidate = os.path.join(out_dir, 'results.jsonl')
-                shutil.copyfile(bundle_path, candidate)
-                extracted.append(candidate)
-            except Exception:
-                # not a text JSONL; ignore
-                pass
-        except Exception:
-            pass
-        return extracted
 
     # Poll and download results for each job (per trial below)
     def _process_job(job_key: str, job_name: str, results_dir: str):
@@ -1357,6 +1362,13 @@ def main():
     prompt_sets_cfg = cfg.get("prompt_sets") or {}
     default_ps = cfg.get("default_prompt_set") or (sorted(list(prompt_sets_cfg.keys()))[0] if prompt_sets_cfg else "default")
     all_trial_summaries: list[dict] = []
+    # Run-level stage tracking: mark phases in_progress/completed once across all trials
+    poll_started = False
+    parse_started = False
+    score_started = False
+    stats_started = False
+    costs_started = False
+    report_started = False
     for trial in trials:
         model_id = trial["model_id"]
         ps_name = trial.get("prompt_set") or default_ps
@@ -1383,10 +1395,11 @@ def main():
 
         # Polling and download step (gated)
         if "poll" in selected_phases and not _poll_done():
-            if state is not None:
+            if state is not None and not poll_started:
                 with RunStateLock(run_root):
                     update_phase(state, "poll", status="in_progress")
                     write_json_atomic(run_state_path(run_root), state)
+                poll_started = True
             stop_token.check()
             flat_jobs: list[tuple[str, str]] = []
             for k, v in manifest["jobs"].items():
@@ -1406,10 +1419,7 @@ def main():
                         fut.result()
                     except Exception as e:
                         print(f"WARNING: polling/downloading failed for {_k}: {e}")
-            if state is not None:
-                with RunStateLock(run_root):
-                    update_phase(state, "poll", status="completed")
-                    write_json_atomic(run_state_path(run_root), state)
+            # Defer marking poll completed until after all trials
         else:
             print("Gating: skipping poll for this trial (already done or not selected)")
 
@@ -1462,41 +1472,38 @@ def main():
 
         # Parse predictions → CSV (gated)
         if "parse" in selected_phases and not _parse_done():
-            if state is not None:
+            if state is not None and not parse_started:
                 with RunStateLock(run_root):
                     update_phase(state, "parse", status="in_progress")
                     write_json_atomic(run_state_path(run_root), state)
+                parse_started = True
             stop_token.check()
             run_cmd([sys.executable, "-m", "fireworks.parse_results", "--results_jsonl", combined_path, "--out_csv", os.path.join(results_dir, "predictions.csv")])
-            if state is not None:
-                with RunStateLock(run_root):
-                    update_phase(state, "parse", status="completed")
-                    write_json_atomic(run_state_path(run_root), state)
+            # Defer marking parse completed until after all trials
         else:
             print("Gating: skipping parse (already done or not selected)")
 
         # Score per-item (gated)
         if "score" in selected_phases and not _score_done():
-            if state is not None:
+            if state is not None and not score_started:
                 with RunStateLock(run_root):
                     update_phase(state, "score", status="in_progress")
                     write_json_atomic(run_state_path(run_root), state)
+                score_started = True
             stop_token.check()
             run_cmd([sys.executable, "-m", "scoring.score_predictions", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--prepared_dir", cfg["paths"]["prepared_dir"], "--out_dir", results_dir, "--config", effective_config_path])
-            if state is not None:
-                with RunStateLock(run_root):
-                    update_phase(state, "score", status="completed")
-                    write_json_atomic(run_state_path(run_root), state)
+            # Defer marking score completed until after all trials
         else:
             print("Gating: skipping score (already done or not selected)")
 
         # Stats (tolerate optional SciPy not installed in some environments) (gated)
         if "stats" in selected_phases and not _stats_done():
             try:
-                if state is not None:
+                if state is not None and not stats_started:
                     with RunStateLock(run_root):
                         update_phase(state, "stats", status="in_progress")
                         write_json_atomic(run_state_path(run_root), state)
+                    stats_started = True
                 stop_token.check()
                 run_cmd([sys.executable, "-m", "scoring.stats", "--per_item_csv", os.path.join(results_dir, "per_item_scores.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "significance.json")])
             except Exception:
@@ -1506,11 +1513,7 @@ def main():
                         json.dump({}, _sf)
                 except Exception:
                     pass
-            finally:
-                if state is not None:
-                    with RunStateLock(run_root):
-                        update_phase(state, "stats", status="completed")
-                        write_json_atomic(run_state_path(run_root), state)
+            # Defer marking stats completed until after all trials
         else:
             print("Gating: skipping stats (already done or not selected)")
 
@@ -1562,16 +1565,14 @@ def main():
 
         # Costs (gated)
         if "costs" in selected_phases and not _costs_done():
-            if state is not None:
+            if state is not None and not costs_started:
                 with RunStateLock(run_root):
                     update_phase(state, "costs", status="in_progress")
                     write_json_atomic(run_state_path(run_root), state)
+                costs_started = True
             stop_token.check()
             run_cmd([sys.executable, "-m", "scripts.summarize_costs", "--pred_csv", os.path.join(results_dir, "predictions.csv"), "--config", effective_config_path, "--out_path", os.path.join(results_dir, "costs.json")])
-            if state is not None:
-                with RunStateLock(run_root):
-                    update_phase(state, "costs", status="completed")
-                    write_json_atomic(run_state_path(run_root), state)
+            # Defer marking costs completed until after all trials
         else:
             print("Gating: skipping costs (already done or not selected)")
         # Generate a concise Markdown report
@@ -1706,22 +1707,47 @@ def main():
                 lines.append("- Batch discount applied")
             lines.append("")
         if "report" in selected_phases and not _report_done():
-            if state is not None:
+            if state is not None and not report_started:
                 with RunStateLock(run_root):
                     update_phase(state, "report", status="in_progress")
                     write_json_atomic(run_state_path(run_root), state)
+                report_started = True
             stop_token.check()
             with open(report_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
-            if state is not None:
-                with RunStateLock(run_root):
-                    update_phase(state, "report", status="completed")
-                    write_json_atomic(run_state_path(run_root), state)
+            # Defer marking report completed until after all trials
         else:
             print("Gating: skipping report (already done or not selected)")
 
         print("Trial complete. Parsed predictions, scored, computed stats and costs, and wrote report.")
         all_trial_summaries.append({"trial": trial, "results_dir": results_dir, "reports_dir": reports_dir, "report_path": report_path})
+
+    # After processing all trials, mark run-level phases as completed if they were started
+    if state is not None:
+        if poll_started:
+            with RunStateLock(run_root):
+                update_phase(state, "poll", status="completed")
+                write_json_atomic(run_state_path(run_root), state)
+        if parse_started:
+            with RunStateLock(run_root):
+                update_phase(state, "parse", status="completed")
+                write_json_atomic(run_state_path(run_root), state)
+        if score_started:
+            with RunStateLock(run_root):
+                update_phase(state, "score", status="completed")
+                write_json_atomic(run_state_path(run_root), state)
+        if stats_started:
+            with RunStateLock(run_root):
+                update_phase(state, "stats", status="completed")
+                write_json_atomic(run_state_path(run_root), state)
+        if costs_started:
+            with RunStateLock(run_root):
+                update_phase(state, "costs", status="completed")
+                write_json_atomic(run_state_path(run_root), state)
+        if report_started:
+            with RunStateLock(run_root):
+                update_phase(state, "report", status="completed")
+                write_json_atomic(run_state_path(run_root), state)
 
     # Write multi-trial summary
     multi_summary = {"created_utc": datetime.utcnow().isoformat() + "Z", "run_id": run_id, "num_trials": len(trials), "trials": all_trial_summaries}
