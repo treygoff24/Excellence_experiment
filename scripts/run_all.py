@@ -18,11 +18,8 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from dotenv import load_dotenv
-from fireworks.upload_dataset import create_dataset, upload_dataset_file
-from fireworks.poll_and_download import poll_until_done, get_dataset, try_download_external_url, _try_extract_jsonls
 from scripts import manifest_v2 as mf
-from fireworks.batch_queue_manager import QueueManager
-from scripts.state_utils import StopToken
+# Backend-specific imports are resolved inside main() based on config.backend
 from config.schema import load_config
 from scripts.state_utils import (
     RunStateLock,
@@ -529,6 +526,19 @@ def main():
     ap.add_argument("--dry_run", action="store_true", help="Offline mode: do not hit Fireworks; synthesize completed jobs and results for testing")
     args = ap.parse_args()
     cfg = load_config(args.config)
+
+    # Resolve backend adapters lazily based on config
+    backend = (cfg.get("backend") or "fireworks").strip().lower()
+    if backend == "fireworks":
+        # Import Fireworks adapters (thin shims) to decouple orchestrator
+        from backends.fireworks.upload_dataset import create_dataset, upload_dataset_file  # type: ignore
+        from backends.fireworks.poll_and_download import poll_until_done, get_dataset, try_download_external_url  # type: ignore
+        from backends.fireworks.batch_queue_manager import QueueManager  # type: ignore
+    else:
+        # Local backends are introduced in follow-up tickets
+        raise SystemExit(
+            "Unsupported backend: {b}. Only 'fireworks' is available now; set backend: fireworks in your config.".format(b=backend)
+        )
 
     # Generate or use provided run_id
     run_id = args.run_id or datetime.utcnow().strftime("r%Y%m%d%H%M%S")
