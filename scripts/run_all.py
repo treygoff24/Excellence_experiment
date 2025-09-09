@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from fireworks.upload_dataset import create_dataset, upload_dataset_file
 from fireworks.poll_and_download import poll_until_done, get_dataset, try_download_external_url
 from fireworks.batch_queue_manager import QueueManager
+from scripts.state_utils import StopToken
 from config.schema import load_config
 
 
@@ -478,6 +479,9 @@ def main():
     ap.add_argument("--temps", nargs="+", help="Temperatures override (space or comma separated)")
     ap.add_argument("--plan_only", action="store_true", help="Show expanded trial plan and exit")
     ap.add_argument("--archive", action="store_true", help="Archive results after completion")
+    # Stop/Resume behavior controls
+    ap.add_argument("--ignore_stop", action="store_true", help="Ignore STOP_REQUESTED sentinel (still honors Ctrl-C for this process)")
+    ap.add_argument("--stop_stale_minutes", type=int, default=60, help="Treat STOP_REQUESTED older than N minutes as stale and ignore (default: 60)")
     ap.add_argument("--max_concurrent_jobs", type=int, default=4, help="Max concurrent Fireworks batch jobs (default: 4)")
     ap.add_argument("--parts_per_dataset", type=int, default=None, help="How many parts to split each input into (decoupled from concurrency)")
     ap.add_argument("--lines_per_part", type=int, default=None, help="Alternatively, target number of lines per part (overrides parts_per_dataset)")
@@ -520,6 +524,8 @@ def main():
         return
 
     ensure_dirs(cfg)
+    # Initialize cooperative stop token for this run root
+    stop_token = StopToken(run_root or os.getcwd(), ignore_file=bool(args.ignore_stop), stale_minutes=int(args.stop_stale_minutes) if args.stop_stale_minutes is not None else None)
     if not args.skip_prepare:
         run_cmd([sys.executable, "-m", "scripts.prepare_data", "--config", effective_config_path])
     if not args.skip_build:
@@ -674,6 +680,7 @@ def main():
                     temperature=float(temp),
                     condition=cond,
                     run_id=run_id,
+                    stop_event=stop_token,
                 )
                 # If resuming and this temp/cond appears complete in manifest, skip queueing
                 resume_key = f"t{t_str}_{cond}"
@@ -845,6 +852,12 @@ def main():
                         except Exception:
                             pass
                     queue.progress_cb = _progress_cb  # type: ignore[attr-defined]
+                    # Respect cooperative stop before running queue
+                    try:
+                        stop_token.check()
+                    except Exception:
+                        print("Stop requested before queue; skipping remaining submissions for this condition")
+                        continue
                     queue.run_queue(results_dir)
                 # Persist the job name (if available) for bookkeeping
                 jnames = [j.job_name for j in queue.jobs if j.job_name]
