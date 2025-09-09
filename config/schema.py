@@ -4,7 +4,7 @@ import os
 from typing import Dict, List, Optional
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, ConfigDict
 
 
 def _format_temp_key(t: float | str) -> str:
@@ -64,6 +64,7 @@ class SweepModel(BaseModel):
 
 
 class TrialModel(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
     id: Optional[str] = None
     model: Optional[str] = None
     model_id: Optional[str] = None
@@ -80,6 +81,8 @@ class TrialModel(BaseModel):
 
 
 class EvalConfigModel(BaseModel):
+    # Allow fields starting with "model_" (e.g., model_id, model_aliases) without warnings
+    model_config = ConfigDict(protected_namespaces=())
     model_id: str
     temps: List[float] = Field(default_factory=lambda: [0.0, 0.7])
     samples_per_item: Dict[str, int]
@@ -158,6 +161,14 @@ class EvalConfigModel(BaseModel):
     sweep: Optional[SweepModel] = None
     trials: Optional[List[TrialModel]] = None
 
+    # Backend selection and local settings (Ticket 116)
+    backend: str = Field(default="fireworks", description="Backend to use: 'fireworks' or 'local'")
+    local_engine: Optional[str] = Field(default=None, description="Local engine: 'ollama' or 'llama_cpp'")
+    local_endpoint: Optional[str] = Field(default=None, description="Endpoint for local HTTP engines (e.g., Ollama)")
+    local_model: Optional[str] = Field(default=None, description="Local model identifier (Ollama tag or GGUF path)")
+    max_concurrent_requests: int = Field(default=1, description="Max concurrent local requests")
+    tokenizer: Optional[str] = Field(default=None, description="Tokenizer hint for accounting, e.g., 'llama' or 'hf:<repo>'")
+
     @field_validator("samples_per_item")
     @classmethod
     def _normalize_samples(cls, v: Dict[str | float, int], info):  # type: ignore[override]
@@ -183,6 +194,37 @@ class EvalConfigModel(BaseModel):
         if not (0.0 <= v <= 1.0):
             raise ValueError("unsupported_threshold must be in [0,1]")
         return float(v)
+
+    @field_validator("backend")
+    @classmethod
+    def _validate_backend(cls, v: str):  # type: ignore[override]
+        allowed = {"fireworks", "local"}
+        vv = (v or "").strip().lower()
+        if vv not in allowed:
+            raise ValueError(f"backend must be one of {sorted(allowed)}")
+        return vv
+
+    @field_validator("local_engine")
+    @classmethod
+    def _validate_local_engine(cls, v: Optional[str]):  # type: ignore[override]
+        if v is None:
+            return None
+        allowed = {"ollama", "llama_cpp"}
+        vv = (v or "").strip().lower()
+        if vv not in allowed:
+            raise ValueError(f"local_engine must be one of {sorted(allowed)}")
+        return vv
+
+    @field_validator("max_concurrent_requests")
+    @classmethod
+    def _validate_max_concurrent(cls, v: int):  # type: ignore[override]
+        try:
+            iv = int(v)
+        except Exception:
+            raise ValueError("max_concurrent_requests must be an integer")
+        if iv <= 0:
+            raise ValueError("max_concurrent_requests must be > 0")
+        return iv
 
 
 def load_config(path: str) -> dict:
@@ -228,4 +270,8 @@ def load_config(path: str) -> dict:
             cfg["unsupported"]["threshold"] = float(cfg.get("unsupported_threshold"))
     except Exception:
         pass
+
+    # Normalize/expand local endpoint if present
+    if cfg.get("local_endpoint"):
+        cfg["local_endpoint"] = os.path.expanduser(os.path.expandvars(cfg["local_endpoint"]))
     return cfg
