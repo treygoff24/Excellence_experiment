@@ -875,13 +875,8 @@ def main():
     # Submit datasets and jobs per trial and write per-trial manifests
     prompt_sets_cfg = cfg.get("prompt_sets") or {}
     default_ps = cfg.get("default_prompt_set") or (sorted(list(prompt_sets_cfg.keys()))[0] if prompt_sets_cfg else "default")
-    if "submit" in selected_phases and not _submit_done():
-        if state is not None:
-            with RunStateLock(run_root):
-                update_phase(state, "submit", status="in_progress")
-                write_json_atomic(run_state_path(run_root), state)
-        for trial in trials:
-            stop_token.check()
+    # Submit phase: iterate over trials correctly (fixes loop scoping bug)
+    def _submit_one_trial(trial: dict) -> None:
         model_id = trial["model_id"]
         ps_name = trial.get("prompt_set") or default_ps
         temps = trial.get("temps") or (cfg.get("temps") or [0.0])
@@ -1193,6 +1188,15 @@ def main():
         # Write per-trial manifest
         mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
         print("Trial manifest written:", os.path.join(results_dir, "trial_manifest.json"))
+
+    if "submit" in selected_phases and not _submit_done():
+        if state is not None:
+            with RunStateLock(run_root):
+                update_phase(state, "submit", status="in_progress")
+                write_json_atomic(run_state_path(run_root), state)
+        for trial in trials:
+            stop_token.check()
+            _submit_one_trial(trial)
         if state is not None:
             with RunStateLock(run_root):
                 update_phase(state, "submit", status="completed")
