@@ -1,6 +1,10 @@
 from __future__ import annotations
 import os
 import json
+try:
+    import fcntl  # POSIX-only; calls are already best-effort guarded below
+except Exception:  # pragma: no cover
+    fcntl = None  # type: ignore
 import hashlib
 import tempfile
 import signal
@@ -8,11 +12,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional
 import yaml
-try:
-    import fcntl  # POSIX-only; guarded at call sites
-except Exception:  # pragma: no cover
-    fcntl = None  # type: ignore
-
 RUN_STATE_FILENAME = "run_state.json"
 STATE_LOCK_FILENAME = ".state.lock"
 STOP_FILENAME = "STOP_REQUESTED"

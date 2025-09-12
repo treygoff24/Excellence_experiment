@@ -168,6 +168,9 @@ class EvalConfigModel(BaseModel):
     local_model: Optional[str] = Field(default=None, description="Local model identifier (Ollama tag or GGUF path)")
     max_concurrent_requests: int = Field(default=1, description="Max concurrent local requests")
     tokenizer: Optional[str] = Field(default=None, description="Tokenizer hint for accounting, e.g., 'llama' or 'hf:<repo>'")
+    # Optional llama.cpp tuning
+    local_n_ctx: Optional[int] = Field(default=None, description="llama.cpp context window (tokens)")
+    local_n_gpu_layers: Optional[int] = Field(default=None, description="llama.cpp number of GPU layers (-1 for all)")
 
     @field_validator("samples_per_item")
     @classmethod

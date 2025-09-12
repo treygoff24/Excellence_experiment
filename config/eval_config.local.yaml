@@ -1,0 +1,34 @@
+backend: local
+local_engine: ollama
+local_endpoint: "http://127.0.0.1:11434"
+# Use an Ollama tag that fits 16GB VRAM comfortably
+model_id: "llama3.1:8b-instruct-q4_K_M"
+local_model: "llama3.1:8b-instruct-q4_K_M"
+
+temps: [0.0]
+samples_per_item:
+  "0.0": 1
+max_new_tokens:
+  closed_book: 1024
+  open_book: 1024
+top_p: 1.0
+top_k: 50
+stop: []
+
+max_concurrent_requests: 1
+
+paths:
+  raw_dir: "data/raw"
+  prepared_dir: "data/prepared"
+  batch_inputs_dir: "data/batch_inputs"
+  results_dir: "results"
+  reports_dir: "reports"
+  run_manifest: "results/run_manifest.json"
+  experiments_dir: "experiments"
+
+prompt_sets:
+  default:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/treatment_system.txt
+default_prompt_set: default
+

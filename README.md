@@ -162,6 +162,26 @@ python -m scoring.score_predictions --pred_csv results/predictions.csv --prepare
 python -m scoring.stats --per_item_csv results/per_item_scores.csv --config config/eval_config.yaml --out_path results/significance.json
 ```
 
+## Windows + Local (Ollama / llama.cpp)
+
+To run locally on Windows with an RTX-class GPU, use the example configs and Windows docs:
+- Example configs: `config/eval_config.local.yaml` (Ollama) and `config/eval_config.local.llamacpp.yaml` (llama.cpp)
+- Guide: `docs/windows.md`
+
+Quick start (PowerShell):
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\bootstrap.ps1
+.\.venv\Scripts\Activate.ps1
+
+# Ollama: start the server and pull a model
+ollama serve
+ollama pull llama3.1:8b-instruct-q4_K_M
+
+# Plan → small end-to-end local run (Ollama)
+python -m scripts.run_all --config config\eval_config.local.yaml --plan_only
+python -m scripts.run_all --config config\eval_config.local.yaml --archive --limit_items 200 --parts_per_dataset 3
+```
+
 ## Datasets and Preparation
 
 Built-in datasets

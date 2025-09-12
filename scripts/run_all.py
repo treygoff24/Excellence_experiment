@@ -13,7 +13,10 @@ import tarfile
 import zipfile
 import gzip
 import shutil
-import fcntl
+try:
+    import fcntl  # POSIX-only; guarded where used
+except Exception:  # pragma: no cover
+    fcntl = None  # type: ignore
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -352,8 +355,12 @@ def write_manifest(path: str, data: dict):
         ) as temp_file:
             temp_path = temp_file.name
 
-            # Acquire exclusive lock on temp file
-            fcntl.flock(temp_file.fileno(), fcntl.LOCK_EX)
+            # Acquire exclusive lock on temp file (best-effort on non-POSIX)
+            try:
+                if fcntl is not None:
+                    fcntl.flock(temp_file.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                pass
 
             # Write data to temp file
             json.dump(data, temp_file, indent=2)
@@ -533,15 +540,18 @@ def main():
 
     # Resolve backend adapters lazily based on config
     backend = (cfg.get("backend") or "fireworks").strip().lower()
+    is_local_backend = backend == "local"
     if backend == "fireworks":
         # Import Fireworks adapters (thin shims) to decouple orchestrator
         from backends.fireworks.upload_dataset import create_dataset, upload_dataset_file  # type: ignore
         from backends.fireworks.poll_and_download import poll_until_done, get_dataset, try_download_external_url  # type: ignore
         from backends.fireworks.batch_queue_manager import QueueManager  # type: ignore
+    elif backend == "local":
+        from backends.local.local_batch import create_queue as LocalCreateQueue  # type: ignore
+        from backends.local.local_batch import split_jsonl as local_split_jsonl  # type: ignore
     else:
-        # Local backends are introduced in follow-up tickets
         raise SystemExit(
-            "Unsupported backend: {b}. Only 'fireworks' is available now; set backend: fireworks in your config.".format(b=backend)
+            "Unsupported backend: {b}. Use 'fireworks' or 'local' in your config.backend.".format(b=backend)
         )
 
     # Generate or use provided run_id
@@ -944,7 +954,10 @@ def main():
             "Unable to determine Fireworks account id. Set FIREWORKS_ACCOUNT_ID to your account slug (e.g., 'my-team'), not an email."
         )
 
-    account_id = _derive_account_id(args.account_id) if not args.dry_run else "dryrun"
+    if is_local_backend:
+        account_id = "local"
+    else:
+        account_id = _derive_account_id(args.account_id) if not args.dry_run else "dryrun"
     conditions: list[str] = [args.condition] if args.condition in ("control", "treatment") else ["control", "treatment"]
     # Submit datasets and jobs per trial and write per-trial manifests
     prompt_sets_cfg = cfg.get("prompt_sets") or {}
@@ -1026,29 +1039,49 @@ def main():
                 if not os.path.isfile(jsonl_path):
                     raise SystemExit(f"Missing input file: {jsonl_path}")
 
-                # Split the dataset into up to max_concurrent parts for parallel jobs
+                # Split the dataset into parts (local or Fireworks)
                 base_prefix = f"t{t_str}{suffix}_{cond}"
-                part_files = _split_jsonl_file(
-                    jsonl_path,
-                    cfg["paths"]["batch_inputs_dir"],
-                    base_prefix,
-                    parts=(int(args.parts_per_dataset) if (args.lines_per_part is None and args.parts_per_dataset is not None) else None),
-                    lines_per_part=(int(args.lines_per_part) if args.lines_per_part is not None else None),
-                    limit_items=(int(args.limit_items) if args.limit_items is not None else None),
-                )
-
-                # Enforce Fireworks batch concurrency via QueueManager
-                queue = QueueManager(
-                    account_id=account_id,
-                    model_id=model_id,
-                    config=cfg,
-                    max_concurrent=int(args.max_concurrent_jobs) if args.max_concurrent_jobs else 4,
-                    temp_label=t_str,
-                    temperature=float(temp),
-                    condition=cond,
-                    run_id=run_id,
-                    stop_event=stop_token,
-                )
+                if is_local_backend:
+                    part_files = local_split_jsonl(
+                        jsonl_path,
+                        cfg["paths"]["batch_inputs_dir"],
+                        base_prefix,
+                        parts=(int(args.parts_per_dataset) if (args.lines_per_part is None and args.parts_per_dataset is not None) else None),
+                        lines_per_part=(int(args.lines_per_part) if args.lines_per_part is not None else None),
+                        limit_items=(int(args.limit_items) if args.limit_items is not None else None),
+                    )
+                    queue = LocalCreateQueue(
+                        account_id=account_id,
+                        model_id=model_id,
+                        config=cfg,
+                        max_concurrent=int(cfg.get("max_concurrent_requests", 1)),
+                        temp_label=t_str,
+                        temperature=float(temp),
+                        condition=cond,
+                        run_id=run_id,
+                        stop_event=stop_token,
+                    )
+                else:
+                    part_files = _split_jsonl_file(
+                        jsonl_path,
+                        cfg["paths"]["batch_inputs_dir"],
+                        base_prefix,
+                        parts=(int(args.parts_per_dataset) if (args.lines_per_part is None and args.parts_per_dataset is not None) else None),
+                        lines_per_part=(int(args.lines_per_part) if args.lines_per_part is not None else None),
+                        limit_items=(int(args.limit_items) if args.limit_items is not None else None),
+                    )
+                    # Enforce Fireworks batch concurrency via QueueManager
+                    queue = QueueManager(
+                        account_id=account_id,
+                        model_id=model_id,
+                        config=cfg,
+                        max_concurrent=int(args.max_concurrent_jobs) if args.max_concurrent_jobs else 4,
+                        temp_label=t_str,
+                        temperature=float(temp),
+                        condition=cond,
+                        run_id=run_id,
+                        stop_event=stop_token,
+                    )
                 # If resuming and this temp/cond appears complete in manifest, skip queueing
                 resume_key = f"t{t_str}_{cond}"
                 if args.resume and existing_manifest:
@@ -1099,7 +1132,7 @@ def main():
                             trial_manifest.setdefault("jobs", {}).setdefault(resume_key, names)
                             continue
 
-                # Upload each part as a separate dataset and enqueue a job
+                # Upload each part (Fireworks) or enqueue local work
                 dsids_for_cond: list[str] = []
                 planned_jobs: list[tuple[int, str]] = []
                 for part_number, part_path in part_files:
@@ -1153,17 +1186,34 @@ def main():
                                                     continue
                                 except Exception as _e:
                                     print(f"WARNING: repair attempt failed for {jkey_resume}: {_e}")
-                    # Create a safe, short dataset display name (<64 chars) to satisfy API constraints
-                    ds_name = _make_dataset_display_name(ps_name, t_str, cond, run_id, part_number)
-                    if args.dry_run:
-                        dsid = f"dryrun-{ds_name}"
+                    if is_local_backend:
+                        # Local path: enqueue directly and record placeholder name
+                        jkey_local = f"t{t_str}_{cond}_p{part_number:02d}"
+                        if args.dry_run:
+                            # Create empty results file for pipeline continuity
+                            job_dir = os.path.join(results_dir, jkey_local)
+                            os.makedirs(job_dir, exist_ok=True)
+                            open(os.path.join(job_dir, "results.jsonl"), "w", encoding="utf-8").close()
+                        else:
+                            queue.add_job(part_number, part_path)
+                        # Track placeholder in manifest to aid resume logic
+                        trial_manifest.setdefault("jobs", {}).setdefault(f"t{t_str}_{cond}", [])
+                        arr = trial_manifest["jobs"][f"t{t_str}_{cond}"]
+                        while len(arr) < part_number:
+                            arr.append(None)
+                        arr[part_number - 1] = jkey_local
                     else:
-                        dsid = create_dataset(ds_name, account_id)
-                        remote_fname = os.path.basename(part_path)
-                        upload_dataset_file(account_id, dsid, part_path, filename=remote_fname)
-                    dsids_for_cond.append(dsid)
-                    queue.add_job(part_number, "", dsid)
-                    planned_jobs.append((part_number, dsid))
+                        # Fireworks path: upload dataset and enqueue by dataset id
+                        ds_name = _make_dataset_display_name(ps_name, t_str, cond, run_id, part_number)
+                        if args.dry_run:
+                            dsid = f"dryrun-{ds_name}"
+                        else:
+                            dsid = create_dataset(ds_name, account_id)
+                            remote_fname = os.path.basename(part_path)
+                            upload_dataset_file(account_id, dsid, part_path, filename=remote_fname)
+                        dsids_for_cond.append(dsid)
+                        queue.add_job(part_number, "", dsid)
+                        planned_jobs.append((part_number, dsid))
                 trial_manifest["datasets"][f"t{t_str}_{cond}"] = dsids_for_cond
                 # Initialize manifest job_status entries before running the queue
                 trial_manifest.setdefault("job_status", {})
@@ -1173,8 +1223,8 @@ def main():
                 # Persist the manifest immediately (early state)
                 mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
 
-                # Dry-run path: simulate queue concurrency lifecycle (no API calls)
-                if args.dry_run:
+                # Dry-run path: simulate Fireworks queue lifecycle (no API calls)
+                if (not is_local_backend) and args.dry_run:
                     try:
                         # Exercise queue scheduling beyond concurrency limit without submitting real jobs
                         queue.run_queue_simulated(results_dir)
@@ -1226,51 +1276,55 @@ def main():
                     # Persist updated manifest after dry-run synthesis
                     mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
                 else:
-                    # Real queue run with simple progress callback that updates the manifest
-                    def _progress_cb(ev: dict):
-                        try:
-                            jkey = ev.get("job_key")
-                            if jkey:
-                                trial_manifest.setdefault("job_status", {})
-                                if ev.get("event") == "submitted":
-                                    trial_manifest["job_status"][jkey] = "submitted"
-                                    # Persist job name immediately for resume safety
-                                    job_name = ev.get("job_name")
-                                    # Group jobs per temp/cond key
-                                    grp = jkey.rsplit("_p", 1)[0]
-                                    trial_manifest.setdefault("jobs", {})
-                                    arr = trial_manifest["jobs"].setdefault(grp, [])
-                                    try:
-                                        # Ensure array length covers this index
-                                        idx = int(jkey.split("_p")[-1]) - 1
-                                        if idx >= len(arr):
-                                            arr.extend([None] * (idx + 1 - len(arr)))
-                                        arr[idx] = job_name
-                                    except Exception:
-                                        pass
-                                elif ev.get("event") == "state":
-                                    st = ev.get("state")
-                                    if st:
-                                        trial_manifest["job_status"][jkey] = str(st).lower()
-                                elif ev.get("event") == "downloaded":
-                                    trial_manifest["job_status"][jkey] = "completed"
-                                elif ev.get("event") == "download_pending":
-                                    trial_manifest["job_status"][jkey] = "completed"
-                            mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
-                        except Exception:
-                            pass
-                    queue.progress_cb = _progress_cb  # type: ignore[attr-defined]
-                    # Respect cooperative stop before running queue
+                    # Respect cooperative stop before running queue work
                     try:
                         stop_token.check()
                     except Exception:
                         print("Stop requested before queue; skipping remaining submissions for this condition")
                         continue
-                    queue.run_queue(results_dir)
-                # Persist the job name (if available) for bookkeeping
-                jnames = [j.job_name for j in queue.jobs if j.job_name]
-                if jnames:
-                    trial_manifest["jobs"][f"t{t_str}_{cond}"] = jnames
+
+                    if is_local_backend:
+                        # Local backend executes jobs locally; no remote progress callbacks needed
+                        if not args.dry_run:
+                            queue.run_queue(results_dir)
+                    else:
+                        # Fireworks backend: run queue with manifest updates on progress
+                        def _progress_cb(ev: dict):
+                            try:
+                                jkey = ev.get("job_key")
+                                if jkey:
+                                    trial_manifest.setdefault("job_status", {})
+                                    if ev.get("event") == "submitted":
+                                        trial_manifest["job_status"][jkey] = "submitted"
+                                        job_name = ev.get("job_name")
+                                        grp = jkey.rsplit("_p", 1)[0]
+                                        trial_manifest.setdefault("jobs", {})
+                                        arr = trial_manifest["jobs"].setdefault(grp, [])
+                                        try:
+                                            idx = int(jkey.split("_p")[-1]) - 1
+                                            if idx >= len(arr):
+                                                arr.extend([None] * (idx + 1 - len(arr)))
+                                            arr[idx] = job_name
+                                        except Exception:
+                                            pass
+                                    elif ev.get("event") == "state":
+                                        st = ev.get("state")
+                                        if st:
+                                            trial_manifest["job_status"][jkey] = str(st).lower()
+                                    elif ev.get("event") in {"downloaded", "download_pending"}:
+                                        trial_manifest["job_status"][jkey] = "completed"
+                                mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+                            except Exception:
+                                pass
+
+                        queue.progress_cb = _progress_cb  # type: ignore[attr-defined]
+                        queue.run_queue(results_dir)
+
+                # Persist the job name (if available) for bookkeeping (Fireworks only)
+                if not is_local_backend:
+                    jnames = [j.job_name for j in queue.jobs if getattr(j, "job_name", None)]
+                    if jnames:
+                        trial_manifest["jobs"][f"t{t_str}_{cond}"] = jnames
 
         # Write per-trial manifest
         mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
@@ -1394,7 +1448,7 @@ def main():
             continue
 
         # Polling and download step (gated)
-        if "poll" in selected_phases and not _poll_done():
+        if (not is_local_backend) and ("poll" in selected_phases) and (not _poll_done()):
             if state is not None and not poll_started:
                 with RunStateLock(run_root):
                     update_phase(state, "poll", status="in_progress")

@@ -77,7 +77,13 @@ def _build_client(cfg: dict) -> InferenceClient:
 
         if not model:
             raise ValueError("Config.local_model must point to a GGUF path for llama_cpp")
-        return LlamaCppClient(model_path=str(model))
+        n_ctx = cfg.get("local_n_ctx")
+        n_gpu_layers = cfg.get("local_n_gpu_layers")
+        return LlamaCppClient(
+            model_path=str(model),
+            n_ctx=int(n_ctx) if n_ctx is not None else 4096,
+            n_gpu_layers=int(n_gpu_layers) if n_gpu_layers is not None else -1,
+        )
     else:
         raise SystemExit("Unsupported or missing local_engine. Set config.local_engine to 'ollama' or 'llama_cpp'.")
 
@@ -392,4 +398,3 @@ def create_queue(
         run_id=run_id,
         stop_event=stop_event,
     )
-
