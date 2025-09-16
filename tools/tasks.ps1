@@ -11,7 +11,7 @@
     powershell -ExecutionPolicy Bypass -File tools\tasks.ps1 -Task Eval -WhatIf
 
   Tasks:
-    Data, Build, Eval, Parse, Score, Stats, Report, Plan, Smoke
+    Data, Build, Eval, Parse, Score, Stats, Costs, Report, Plan, Smoke
 #>
 
 param(
@@ -38,7 +38,8 @@ try {
     'Parse'  = @($venvPy, '-m', 'fireworks.parse_results', '--results_jsonl', 'results/results_combined.jsonl', '--out_csv', 'results/predictions.csv');
     'Score'  = @($venvPy, '-m', 'scoring.score_predictions', '--pred_csv', 'results/predictions.csv', '--prepared_dir', 'data/prepared', '--out_dir', 'results');
     'Stats'  = @($venvPy, '-m', 'scoring.stats', '--per_item_csv', 'results/per_item_scores.csv', '--config', 'config/eval_config.yaml', '--out_path', 'results/significance.json');
-    'Report' = @($venvPy, '-m', 'scripts.summarize_costs', '--pred_csv', 'results/predictions.csv', '--config', 'config/eval_config.yaml', '--out_path', 'results/costs.json');
+    'Report' = @($venvPy, '-m', 'scripts.generate_report', '--config', 'config/eval_config.yaml', '--results_dir', 'results', '--reports_dir', 'reports');
+    'Costs'  = @($venvPy, '-m', 'scripts.summarize_costs', '--pred_csv', 'results/predictions.csv', '--config', 'config/eval_config.yaml', '--out_path', 'results/costs.json');
     'Plan'   = @($venvPy, '-m', 'scripts.run_all', '--config', 'config/eval_config.yaml', '--plan_only');
     'Smoke'  = @($venvPy, '-m', 'scripts.smoke_orchestration', '--n', '3', '--prompt_set', 'operational_only', '--dry_run');
   }
@@ -82,4 +83,3 @@ try {
   Write-Err $_
   exit 1
 }
-

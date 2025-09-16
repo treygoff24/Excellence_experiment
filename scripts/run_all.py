@@ -1223,29 +1223,132 @@ def main():
                 # Persist the manifest immediately (early state)
                 mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
 
-                # Dry-run path: simulate Fireworks queue lifecycle (no API calls)
-                if (not is_local_backend) and args.dry_run:
+                if args.dry_run:
+                    import json as _json
+                    if is_local_backend:
+                        os.makedirs(results_dir, exist_ok=True)
+                        arr = trial_manifest.setdefault("jobs", {}).setdefault(f"t{t_str}_{cond}", [])
+                        if len(arr) < len(part_files):
+                            arr.extend([None] * (len(part_files) - len(arr)))
+                        for part_number, part_path in part_files:
+                            jkey = f"t{t_str}_{cond}_p{part_number:02d}"
+                            job_dir = os.path.join(results_dir, jkey)
+                            os.makedirs(job_dir, exist_ok=True)
+                            results_path = os.path.join(job_dir, "results.jsonl")
+                            if os.path.exists(results_path) and os.path.getsize(results_path) > 0:
+                                trial_manifest["job_status"][jkey] = "completed"
+                                if len(arr) >= part_number and not arr[part_number - 1]:
+                                    arr[part_number - 1] = f"local-dryrun-{jkey}"
+                                continue
+                            count = 0
+                            with open(results_path, "w", encoding="utf-8") as rf:
+                                try:
+                                    with open(part_path, "r", encoding="utf-8") as fin:
+                                        for line in fin:
+                                            s = line.strip()
+                                            if not s:
+                                                continue
+                                            obj = _json.loads(s)
+                                            cid = obj.get("custom_id") or obj.get("customId")
+                                            if not cid:
+                                                continue
+                                            payload = {
+                                                "custom_id": cid,
+                                                "response": {
+                                                    "body": {
+                                                        "choices": [
+                                                            {
+                                                                "message": {"content": "dummy"},
+                                                                "finish_reason": "stop",
+                                                            }
+                                                        ],
+                                                        "usage": {
+                                                            "prompt_tokens": 1,
+                                                            "completion_tokens": 1,
+                                                            "total_tokens": 2,
+                                                        },
+                                                        "id": f"local-dryrun-{jkey}-{count}",
+                                                    },
+                                                    "usage": {
+                                                        "prompt_tokens": 1,
+                                                        "completion_tokens": 1,
+                                                        "total_tokens": 2,
+                                                    },
+                                                    "request_id": f"local-dryrun-{jkey}-{count}",
+                                                    "latency_s": 0.0,
+                                                },
+                                            }
+                                            rf.write(_json.dumps(payload) + "\n")
+                                            count += 1
+                                except FileNotFoundError:
+                                    fallback = {
+                                        "custom_id": f"closed_book|dry-{part_number}|{cond}|{float(temp):.1f}|0|closed",
+                                        "response": {
+                                            "body": {
+                                                "choices": [
+                                                    {
+                                                        "message": {"content": "dummy"},
+                                                        "finish_reason": "stop",
+                                                    }
+                                                ],
+                                                "usage": {
+                                                    "prompt_tokens": 1,
+                                                    "completion_tokens": 1,
+                                                    "total_tokens": 2,
+                                                },
+                                                "id": f"local-dryrun-{jkey}-fallback",
+                                            },
+                                            "usage": {
+                                                "prompt_tokens": 1,
+                                                "completion_tokens": 1,
+                                                "total_tokens": 2,
+                                            },
+                                            "request_id": f"local-dryrun-{jkey}-fallback",
+                                            "latency_s": 0.0,
+                                        },
+                                    }
+                                    rf.write(_json.dumps(fallback) + "\n")
+                                except Exception as exc:
+                                    rf.write(_json.dumps({
+                                        "custom_id": f"error|{part_number}|{cond}|{float(temp):.1f}|0|closed",
+                                        "response": {
+                                            "body": {
+                                                "choices": [
+                                                    {
+                                                        "message": {"content": f"dry-run failed: {exc}"},
+                                                        "finish_reason": "error",
+                                                    }
+                                                ],
+                                                "usage": {},
+                                                "id": f"local-dryrun-{jkey}-error",
+                                            },
+                                            "usage": {},
+                                            "request_id": f"local-dryrun-{jkey}-error",
+                                            "latency_s": 0.0,
+                                        },
+                                    }) + "\n")
+                            trial_manifest["job_status"][jkey] = "completed"
+                            if len(arr) < part_number:
+                                arr.extend([None] * (part_number - len(arr)))
+                            arr[part_number - 1] = f"local-dryrun-{jkey}"
+                        mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+                        continue
+
                     try:
-                        # Exercise queue scheduling beyond concurrency limit without submitting real jobs
                         queue.run_queue_simulated(results_dir)
                     except Exception:
-                        # Best-effort; continue to synthesize artifacts
                         pass
 
-                    # Then synthesize completion and results for each part
-                    import json as _json
+                    # Then synthesize completion and results for each part (Fireworks dry-run)
                     os.makedirs(results_dir, exist_ok=True)
                     for part_number, dsid in planned_jobs:
                         jkey = f"t{t_str}_{cond}_p{part_number:02d}"
                         trial_manifest["job_status"][jkey] = "completed"
-                        # Create a dummy job.json and results
                         with open(os.path.join(results_dir, f"{jkey}_job.json"), "w", encoding="utf-8") as jf:
                             _json.dump({"state": "COMPLETED", "name": f"dryrun/{jkey}", "outputDatasetId": f"dry-{jkey}"}, jf, indent=2)
-                        # Place a small results file under a part dir
                         job_dir = os.path.join(results_dir, jkey)
                         os.makedirs(job_dir, exist_ok=True)
                         results_path = os.path.join(job_dir, "results.jsonl")
-                        # Use the input custom_ids to keep dataset/id alignment
                         part_input = os.path.join(cfg["paths"]["batch_inputs_dir"], f"t{t_str}{suffix}_{cond}.p{part_number:02d}.jsonl")
                         count = 0
                         with open(results_path, "w", encoding="utf-8") as rf:
@@ -1265,60 +1368,55 @@ def main():
                                         }) + "\n")
                                         count += 1
                             except FileNotFoundError:
-                                # Fallback: write a single minimal row
                                 rf.write(_json.dumps({
                                     "custom_id": f"closed_book|dry-{part_number}|{cond}|{float(temp):.1f}|0|closed",
                                     "response": {"body": {"choices": [{"message": {"content": "dummy"}, "finish_reason": "stop"}]}, "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
                                 }) + "\n")
-                        # Mark output dataset id for reference
                         with open(os.path.join(results_dir, f"{jkey}_OUTPUT_DATASET_ID.txt"), "w", encoding="utf-8") as of:
                             of.write(f"dry-{jkey}")
-                    # Persist updated manifest after dry-run synthesis
                     mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+                    continue
+
+                # Real execution path
+                try:
+                    stop_token.check()
+                except Exception:
+                    print("Stop requested before queue; skipping remaining submissions for this condition")
+                    continue
+
+                if is_local_backend:
+                    queue.run_queue(results_dir)
                 else:
-                    # Respect cooperative stop before running queue work
-                    try:
-                        stop_token.check()
-                    except Exception:
-                        print("Stop requested before queue; skipping remaining submissions for this condition")
-                        continue
+                    def _progress_cb(ev: dict):
+                        try:
+                            jkey = ev.get("job_key")
+                            if jkey:
+                                trial_manifest.setdefault("job_status", {})
+                                if ev.get("event") == "submitted":
+                                    trial_manifest["job_status"][jkey] = "submitted"
+                                    job_name = ev.get("job_name")
+                                    grp = jkey.rsplit("_p", 1)[0]
+                                    trial_manifest.setdefault("jobs", {})
+                                    arr = trial_manifest["jobs"].setdefault(grp, [])
+                                    try:
+                                        idx = int(jkey.split("_p")[-1]) - 1
+                                        if idx >= len(arr):
+                                            arr.extend([None] * (idx + 1 - len(arr)))
+                                        arr[idx] = job_name
+                                    except Exception:
+                                        pass
+                                elif ev.get("event") == "state":
+                                    st = ev.get("state")
+                                    if st:
+                                        trial_manifest["job_status"][jkey] = str(st).lower()
+                                elif ev.get("event") in {"downloaded", "download_pending"}:
+                                    trial_manifest["job_status"][jkey] = "completed"
+                            mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+                        except Exception:
+                            pass
 
-                    if is_local_backend:
-                        # Local backend executes jobs locally; no remote progress callbacks needed
-                        if not args.dry_run:
-                            queue.run_queue(results_dir)
-                    else:
-                        # Fireworks backend: run queue with manifest updates on progress
-                        def _progress_cb(ev: dict):
-                            try:
-                                jkey = ev.get("job_key")
-                                if jkey:
-                                    trial_manifest.setdefault("job_status", {})
-                                    if ev.get("event") == "submitted":
-                                        trial_manifest["job_status"][jkey] = "submitted"
-                                        job_name = ev.get("job_name")
-                                        grp = jkey.rsplit("_p", 1)[0]
-                                        trial_manifest.setdefault("jobs", {})
-                                        arr = trial_manifest["jobs"].setdefault(grp, [])
-                                        try:
-                                            idx = int(jkey.split("_p")[-1]) - 1
-                                            if idx >= len(arr):
-                                                arr.extend([None] * (idx + 1 - len(arr)))
-                                            arr[idx] = job_name
-                                        except Exception:
-                                            pass
-                                    elif ev.get("event") == "state":
-                                        st = ev.get("state")
-                                        if st:
-                                            trial_manifest["job_status"][jkey] = str(st).lower()
-                                    elif ev.get("event") in {"downloaded", "download_pending"}:
-                                        trial_manifest["job_status"][jkey] = "completed"
-                                mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
-                            except Exception:
-                                pass
-
-                        queue.progress_cb = _progress_cb  # type: ignore[attr-defined]
-                        queue.run_queue(results_dir)
+                    queue.progress_cb = _progress_cb  # type: ignore[attr-defined]
+                    queue.run_queue(results_dir)
 
                 # Persist the job name (if available) for bookkeeping (Fireworks only)
                 if not is_local_backend:
