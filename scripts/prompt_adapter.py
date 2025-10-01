@@ -187,5 +187,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import multiprocessing as mp
 
+    mp.freeze_support()
+    main()

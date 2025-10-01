@@ -8,7 +8,7 @@ This guide provides hardware-aware tuning presets and troubleshooting guidance f
 - **Model**: 8B Q4_K_M quantization
 - **Context**: 4k-8k tokens
 - **Max tokens**: 512-1024
-- **Concurrency**: 1-2 jobs
+- **Concurrency**: Ollama up to 2 workers; llama.cpp fixed to 1
 - **Use case**: Fast evaluation runs, high throughput needed
 
 ```yaml
@@ -24,7 +24,7 @@ max_new_tokens:
 - **Model**: 8B Q6_K quantization  
 - **Context**: 4k tokens
 - **Max tokens**: 512-1024
-- **Concurrency**: 1 job
+- **Concurrency**: Ollama 1 worker, llama.cpp 1 worker
 - **Use case**: Quality-focused runs, research validation
 
 ```yaml
@@ -40,7 +40,7 @@ max_new_tokens:
 - **Model**: 13B Q4_K_M quantization
 - **Context**: 4k tokens  
 - **Max tokens**: 512
-- **Concurrency**: 1 job
+- **Concurrency**: Single worker (both engines)
 - **Use case**: Testing larger models within VRAM limits
 
 ```yaml
@@ -88,7 +88,8 @@ Performance Issue?
 **Fixes (in order of preference):**
 1. **Reduce context length**: Start with 4k, go down to 2k if needed
 2. **Lower quantization**: Q6_K → Q4_K_M → Q4_K_S → Q3_K_M
-3. **Reduce concurrency**: run with `--max_concurrent_jobs 1`
+3. **Reduce concurrency**: run with `--max_concurrent_jobs 1`. The local
+   orchestrator automatically clamps llama.cpp workloads to a single worker.
 4. **Switch to smaller model**: 13B → 8B → 7B
 5. **Close other GPU applications**: Gaming software, video editors, browsers with hardware acceleration
 
@@ -178,6 +179,11 @@ nvidia-smi -l 2
 # Single snapshot
 nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw --format=csv
 ```
+
+Alternatively, enable in-run sampling by setting `enable_local_telemetry: true`
+in your local config (requires `pynvml` and NVIDIA drivers). The orchestrator
+records peak GPU memory, utilization, and temperature in each part's
+`state.json` plus the per-trial manifest under `job_counts`.
 
 **Healthy inference indicators:**
 - GPU utilization: 80-95%

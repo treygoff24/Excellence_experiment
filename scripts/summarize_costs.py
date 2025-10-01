@@ -57,4 +57,7 @@ def _update_manifest_costs(costs_path: str) -> None:
 
 
 if __name__ == "__main__":
+    import multiprocessing as mp
+
+    mp.freeze_support()
     main()

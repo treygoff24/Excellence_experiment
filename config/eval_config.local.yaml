@@ -4,6 +4,9 @@ local_endpoint: "http://127.0.0.1:11434"
 # Use an Ollama tag that fits 16GB VRAM comfortably
 model_id: "llama3.1:8b-instruct-q4_K_M"
 local_model: "llama3.1:8b-instruct-q4_K_M"
+tokenizer: "llama-3"
+# Set to true to record GPU telemetry via NVML (requires pynvml and NVIDIA drivers)
+enable_local_telemetry: false
 
 temps: [0.0]
 samples_per_item:
@@ -31,4 +34,3 @@ prompt_sets:
     control: config/prompts/control_system.txt
     treatment: config/prompts/treatment_system.txt
 default_prompt_set: default
-

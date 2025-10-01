@@ -1028,6 +1028,7 @@ def main():
         trial_manifest.setdefault("datasets", {})
         trial_manifest.setdefault("jobs", {})
         trial_manifest.setdefault("job_status", {})
+        trial_manifest.setdefault("job_counts", {})
 
         for temp in temps:
             t_str = _format_temp_label(float(temp))
@@ -1385,7 +1386,53 @@ def main():
                     continue
 
                 if is_local_backend:
-                    queue.run_queue(results_dir)
+                    def _local_progress_cb(ev: dict) -> None:
+                        try:
+                            jkey = ev.get("job_key")
+                            if not jkey:
+                                return
+                            status = str(ev.get("status") or ev.get("event") or "completed").lower()
+                            trial_manifest.setdefault("job_status", {})
+                            if status in {"completed", "completed_with_errors", "skipped"}:
+                                trial_manifest["job_status"][jkey] = "completed"
+                            elif status in {"failed", "error"}:
+                                trial_manifest["job_status"][jkey] = "failed"
+                            else:
+                                trial_manifest["job_status"][jkey] = status
+                            counts = trial_manifest.setdefault("job_counts", {})
+                            counts[jkey] = {
+                                "items_in": int(ev.get("items_in") or 0),
+                                "items_out": int(ev.get("items_out") or 0),
+                                "errors": int(ev.get("errors") or 0),
+                            }
+                            telemetry_payload = ev.get("telemetry")
+                            if telemetry_payload is not None:
+                                counts[jkey]["telemetry"] = telemetry_payload
+                            mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+                        except Exception:
+                            pass
+
+                    queue.progress_cb = _local_progress_cb  # type: ignore[attr-defined]
+                    completed_jobs = queue.run_queue(results_dir) or []
+                    mismatches = []
+                    for summary in completed_jobs:
+                        try:
+                            jkey = summary.get("job_key")
+                            items_in = int(summary.get("items_in") or 0)
+                            items_out = int(summary.get("items_out") or 0)
+                            if items_in and items_out and items_in != items_out:
+                                mismatches.append((jkey, items_in, items_out))
+                            if jkey and summary.get("telemetry"):
+                                counts = trial_manifest.setdefault("job_counts", {})
+                                counts.setdefault(jkey, {})
+                                counts[jkey]["telemetry"] = summary.get("telemetry")
+                        except Exception:
+                            continue
+                    if mismatches:
+                        print("WARNING: Local backend row mismatches detected:")
+                        for jkey, items_in, items_out in mismatches:
+                            print(f"  - {jkey}: inputs={items_in}, outputs={items_out}")
+                    mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
                 else:
                     def _progress_cb(ev: dict):
                         try:
@@ -1958,4 +2005,7 @@ def main():
 
 
 if __name__ == "__main__":
+    import multiprocessing as mp
+
+    mp.freeze_support()
     main()

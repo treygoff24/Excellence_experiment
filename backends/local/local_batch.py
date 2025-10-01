@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from backends.interfaces import InferenceClient
+from scripts.estimate_tokens import estimate_tokens
+
+try:
+    from telemetry.nvml import nvml_monitor
+except Exception:  # pragma: no cover
+    nvml_monitor = None  # type: ignore
 
 
 def _count_lines(path: str) -> int:
@@ -64,6 +71,48 @@ def _safe_atomic_write_jsonl(out_path: str, rows: List[dict]) -> None:
     os.replace(tmp, out_path)
 
 
+def _summarize_telemetry(records: List[dict]) -> Optional[dict]:
+    valid = [r for r in records if isinstance(r, dict)]
+    if not valid:
+        return None
+
+    def _safe_values(key: str) -> List[float]:
+        vals: List[float] = []
+        for entry in valid:
+            val = entry.get(key) if isinstance(entry, dict) else None
+            if val is None:
+                continue
+            try:
+                vals.append(float(val))
+            except Exception:
+                continue
+        return vals
+
+    latencies = _safe_values("latency_ms")
+    gpu_mem = _safe_values("gpu_mem_mb")
+    gpu_util = _safe_values("gpu_utilization")
+
+    summary: dict[str, float | int] = {"samples": len(valid)}
+    if latencies:
+        avg_latency = sum(latencies) / len(latencies)
+        sorted_lat = sorted(latencies)
+        if len(sorted_lat) == 1:
+            p95 = sorted_lat[0]
+        else:
+            idx = max(0, min(len(sorted_lat) - 1, int(round(0.95 * (len(sorted_lat) - 1)))))
+            p95 = sorted_lat[idx]
+        summary["avg_latency_ms"] = round(avg_latency, 3)
+        summary["max_latency_ms"] = round(max(latencies), 3)
+        summary["p95_latency_ms"] = round(p95, 3)
+
+    if gpu_mem:
+        summary["max_gpu_mem_mb"] = round(max(gpu_mem), 3)
+    if gpu_util:
+        summary["max_gpu_utilization"] = round(max(gpu_util), 3)
+
+    return summary
+
+
 def _build_client(cfg: dict) -> InferenceClient:
     engine = (cfg.get("local_engine") or "").strip().lower()
     model = cfg.get("local_model")
@@ -79,6 +128,11 @@ def _build_client(cfg: dict) -> InferenceClient:
             raise ValueError("Config.local_model must point to a GGUF path for llama_cpp")
         n_ctx = cfg.get("local_n_ctx")
         n_gpu_layers = cfg.get("local_n_gpu_layers")
+        requested = int(cfg.get("max_concurrent_requests") or 1)
+        if requested > 1:
+            print(
+                "Local llama.cpp backend detected — max_concurrent_requests will be clamped to 1 unless you run per-worker instances",
+            )
         return LlamaCppClient(
             model_path=str(model),
             n_ctx=int(n_ctx) if n_ctx is not None else 4096,
@@ -169,8 +223,15 @@ class LocalQueueManager:
         self.account_id = account_id
         self.model_id = model_id
         self.cfg = config
-        # Hard cap at 2 unless explicitly higher
-        self.max_concurrent = max(1, min(int(max_concurrent or 1), 2))
+        self.local_engine = (self.cfg.get("local_engine") or "").strip().lower()
+        requested = max(1, int(max_concurrent or 1))
+        # Hard cap at 2 for general safety; llama.cpp is clamped to 1 below.
+        self.max_concurrent = max(1, min(requested, 2))
+        if self.local_engine == "llama_cpp" and self.max_concurrent > 1:
+            print(
+                "WARNING: llama.cpp backend is not thread-safe; forcing max_concurrent_requests to 1",
+            )
+            self.max_concurrent = 1
         self.temp_label = temp_label
         self.temperature = float(temperature)
         self.condition = condition
@@ -179,9 +240,9 @@ class LocalQueueManager:
         self.jobs: list[_Job] = []
         # Lazily initialized client per run
         self._client: Optional[InferenceClient] = None
-
-    # Compatibility: used by run_all to listen to progress; optional here
-    progress_cb: Optional[Any] = None
+        self.progress_cb: Optional[Callable[[dict], None]] = None
+        self.telemetry_enabled = bool(self.cfg.get("enable_local_telemetry"))
+        self.tokenizer_hint = self.cfg.get("tokenizer")
 
     @property
     def client(self) -> InferenceClient:
@@ -195,13 +256,32 @@ class LocalQueueManager:
     # -----------------------------
     # Core execution
     # -----------------------------
-    def run_queue(self, results_dir: str) -> None:
+    def run_queue(self, results_dir: str) -> list[dict]:
+        completed: list[dict] = []
         for job in sorted(self.jobs, key=lambda j: j.part_number):
             if self.stop_event and getattr(self.stop_event, "is_set", lambda: False)():
                 break
-            self._run_one_part(job, results_dir)
+            summary = self._run_one_part(job, results_dir)
+            if summary is None:
+                continue
+            completed.append(summary)
+            if self.progress_cb:
+                payload = {
+                    "job_key": summary.get("job_key"),
+                    "event": "completed",
+                    "status": summary.get("status"),
+                    "items_in": summary.get("items_in"),
+                    "items_out": summary.get("items_out"),
+                    "errors": summary.get("errors", 0),
+                    "telemetry": summary.get("telemetry"),
+                }
+                try:
+                    self.progress_cb(payload)
+                except Exception:
+                    pass
+        return completed
 
-    def _run_one_part(self, job: _Job, results_dir: str) -> None:
+    def _run_one_part(self, job: _Job, results_dir: str) -> dict[str, Any]:
         # Output location mirrors Fireworks per-part directory
         group_key = f"t{self.temp_label}_{self.condition}"
         job_key = f"{group_key}_p{job.part_number:02d}"
@@ -216,14 +296,28 @@ class LocalQueueManager:
         out_count = _count_lines(out_jsonl)
         if in_count > 0 and out_count == in_count:
             # Already completed
-            return
+            return {
+                "job_key": job_key,
+                "status": "skipped",
+                "items_in": in_count,
+                "items_out": out_count,
+                "errors": 0,
+                "telemetry": None,
+            }
 
         # Read inputs
         rows = list(_iter_jsonl(job.input_path))
         if not rows:
             # Write empty output atomically
             _safe_atomic_write_jsonl(out_jsonl, [])
-            return
+            return {
+                "job_key": job_key,
+                "status": "completed",
+                "items_in": 0,
+                "items_out": 0,
+                "errors": 0,
+                "telemetry": None,
+            }
 
         # Prepare per-item tasks
         tasks: list[Tuple[int, dict]] = []  # (index, input_row)
@@ -233,6 +327,7 @@ class LocalQueueManager:
         # Run with bounded concurrency; collect results in-order
         results_buf: list[Optional[dict]] = [None] * len(tasks)
         errors: list[dict] = []
+        telemetry_records: list[dict] = []
 
         def _run_one(idx: int, row: dict) -> Tuple[int, dict]:
             cid = row.get("custom_id") or row.get("customId")
@@ -260,17 +355,62 @@ class LocalQueueManager:
             for attempt in range(3):
                 t0 = time.time()
                 try:
-                    resp = self.client.generate(
-                        messages=messages if messages is not None else None,
-                        prompt=prompt if (messages is None and prompt is not None) else None,
-                        model=str(self.cfg.get("local_model") or self.model_id),
-                        params=params,
-                    )
+                    monitor_ctx = None
+                    if nvml_monitor is not None and self.telemetry_enabled:
+                        monitor_ctx = nvml_monitor(enabled=True)
+                    if monitor_ctx is None:
+                        monitor_ctx = contextlib.nullcontext()
+                    with monitor_ctx as monitor:
+                        resp = self.client.generate(
+                            messages=messages if messages is not None else None,
+                            prompt=prompt if (messages is None and prompt is not None) else None,
+                            model=str(self.cfg.get("local_model") or self.model_id),
+                            params=params,
+                        )
+                        latency = float(resp.get("latency_s") or (time.time() - t0))
+                        if monitor not in (None, True):
+                            sample_fn = getattr(monitor, "sample", None)
+                            try:
+                                if callable(sample_fn):
+                                    sample_fn()
+                            except Exception:
+                                pass
+                    telemetry_snapshot: Optional[dict] = None
+                    if monitor not in (None, True):
+                        try:
+                            telemetry_snapshot = getattr(monitor, "metrics", None)
+                        except Exception:
+                            telemetry_snapshot = None
+                    if telemetry_snapshot is None:
+                        telemetry_snapshot = {"latency_ms": latency * 1000.0}
+                    else:
+                        telemetry_snapshot.setdefault("latency_ms", latency * 1000.0)
                     txt = (resp.get("text") or "").strip()
                     finish = resp.get("finish_reason") or "stop"
                     usage = resp.get("usage") or {}
                     req_id = resp.get("request_id") or str(uuid.uuid4())
-                    latency = float(resp.get("latency_s") or (time.time() - t0))
+                    telemetry_records.append(telemetry_snapshot or {"latency_ms": latency * 1000.0})
+                    if not usage:
+                        tokenizer_hint = self.tokenizer_hint
+                        prompt_messages = messages
+                        if prompt_messages is None:
+                            prompt_messages = [{"role": "user", "content": prompt or ""}]
+                        prompt_estimate = estimate_tokens(prompt_messages, tokenizer_hint)
+                        completion_messages = list(prompt_messages or []) + [
+                            {"role": "assistant", "content": txt},
+                        ]
+                        total_estimate = estimate_tokens(completion_messages, tokenizer_hint)
+                        prompt_tokens = int(prompt_estimate.get("total_tokens") or 0)
+                        total_tokens = int(total_estimate.get("total_tokens") or prompt_tokens)
+                        completion_tokens = max(total_tokens - prompt_tokens, 0)
+                        usage = {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens,
+                        }
+                    else:
+                        if telemetry_records:
+                            telemetry_records[-1].setdefault("prompt_tokens", usage.get("prompt_tokens"))
                     out_obj = {
                         "custom_id": cid,
                         "response": {
@@ -288,6 +428,7 @@ class LocalQueueManager:
                             "usage": usage,
                             "request_id": req_id,
                             "latency_s": latency,
+                            "telemetry": telemetry_snapshot,
                         },
                     }
                     return idx, out_obj
@@ -339,6 +480,17 @@ class LocalQueueManager:
         if errors:
             _safe_atomic_write_jsonl(err_jsonl, errors)
 
+        telemetry_summary = _summarize_telemetry(telemetry_records)
+        status = "completed_with_errors" if errors else "completed"
+        summary = {
+            "job_key": job_key,
+            "status": status,
+            "items_in": len(rows),
+            "items_out": len(out_rows),
+            "errors": len(errors),
+            "telemetry": telemetry_summary,
+        }
+
         # Write lightweight state for debugging
         try:
             with open(state_path, "w", encoding="utf-8") as fs:
@@ -353,12 +505,15 @@ class LocalQueueManager:
                         "max_concurrent": int(self.max_concurrent),
                         "temperature": float(self.temperature),
                         "condition": str(self.condition),
+                        "telemetry": telemetry_summary,
                     },
                     fs,
                     indent=2,
                 )
         except Exception:
             pass
+
+        return summary
 
 
 def upload_datasets(

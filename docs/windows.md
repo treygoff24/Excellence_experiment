@@ -26,6 +26,28 @@ Validate a config loads:
 python -c "from config.schema import load_config; load_config('config/eval_config.local.yaml')"
 ```
 
+## Installing llama-cpp-python on Windows
+
+GPU-enabled llama.cpp wheels are distributed separately from PyPI. Use the
+cuBLAS builds to avoid compiling locally:
+
+```powershell
+# Inside the virtual environment created by tools\bootstrap.ps1
+pip install llama-cpp-python==0.2.90 `
+  --extra-index-url https://jllllll.github.io/llama-cpp-python-cuBLAS-wheels/whl/cu121
+
+# Quick sanity check (loads bindings without running a model)
+python -c "from llama_cpp import Llama; print('llama.cpp OK')"
+```
+
+Common issues:
+- `DLL load failed` — CUDA toolkit mismatch. Install the wheel that matches
+  your driver/toolkit version (e.g., `cu118`, `cu121`).
+- `ImportError: cannot open shared object file` — ensure the Microsoft Visual
+  C++ redistributable is installed.
+- `CUDA_ERROR_NO_DEVICE` — verify an NVIDIA GPU is visible via `nvidia-smi` and
+  that drivers are up to date.
+
 ## Run Recipes (Local Backend)
 
 Ollama quick start (recommended):
@@ -51,9 +73,20 @@ python -m scripts.run_all --config config\eval_config.local.llamacpp.yaml --arch
 ```
 
 ## Concurrency and Tokens
-- Concurrency: controlled by `max_concurrent_requests` in the config (default 1; safe on 16GB VRAM).
+- Concurrency: `max_concurrent_requests` controls worker count. Ollama supports
+  up to 2 workers locally; llama.cpp is forced to 1 worker per process for
+  stability. Requesting higher values will emit a warning and clamp to 1.
 - Token limits: `max_new_tokens.closed_book|open_book` in the config.
 - Stop sequences: configure `stop: [...]` in the config to trim answers cleanly.
+- Token accounting: both local engines now emit `prompt_tokens`,
+  `completion_tokens`, and `total_tokens` in `predictions.csv`. When the engine
+  omits usage data, the orchestrator estimates counts via `scripts.estimate_tokens`.
+
+## Telemetry (Optional)
+- Set `enable_local_telemetry: true` in your config to record NVIDIA NVML
+  samples (GPU memory, utilization, peak temperature) per part. Requires
+  `pynvml` and recent NVIDIA drivers. Telemetry summaries land in
+  `state.json` under each part directory and surface in the manifest.
 
 ## Troubleshooting and Performance
 - Troubleshooting: `docs/troubleshooting_windows_local.md`.
@@ -61,5 +94,4 @@ python -m scripts.run_all --config config\eval_config.local.llamacpp.yaml --arch
 
 Notes
 - Local path writes per-part `results.jsonl` then combines them per trial. Downstream `parse → score → stats → report` are unchanged.
-- Token estimation and GPU telemetry are deferred; engines that report usage will surface tokens in predictions; others leave them blank.
-
+- Token estimation is automatic; telemetry is opt-in via config.

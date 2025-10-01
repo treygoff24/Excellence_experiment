@@ -1,0 +1,28 @@
+name: Windows Smoke
+
+on:
+  pull_request:
+    paths:
+      - '**.py'
+      - 'tools/**'
+      - 'config/**'
+      - 'docs/**'
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install repo requirements
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File tools\bootstrap.ps1
+      - name: Dry-run orchestration
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\Activate.ps1
+          python -m scripts.run_all --config config\eval_config.local.yaml --dry_run --limit_items 10 --parts_per_dataset 2

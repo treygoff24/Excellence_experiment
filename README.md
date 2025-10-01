@@ -164,9 +164,14 @@ python -m scoring.stats --per_item_csv results/per_item_scores.csv --config conf
 
 ## Windows + Local (Ollama / llama.cpp)
 
-To run locally on Windows with an RTX-class GPU, use the example configs and Windows docs:
+Status: **Supported & validated** on Windows 11 (Jan 2025). The orchestrator now
+tracks job manifests, estimates tokens automatically, and optionally records GPU
+telemetry for local runs.
+
+Reference material:
 - Example configs: `config/eval_config.local.yaml` (Ollama) and `config/eval_config.local.llamacpp.yaml` (llama.cpp)
-- Guide: `docs/windows.md`
+- Windows guide: `docs/windows.md`
+- llama.cpp install notes: see `docs/windows.md#installing-llama-cpp-python-on-windows`
 
 Quick start (PowerShell):
 ```powershell
@@ -181,6 +186,10 @@ ollama pull llama3.1:8b-instruct-q4_K_M
 python -m scripts.run_all --config config\eval_config.local.yaml --plan_only
 python -m scripts.run_all --config config\eval_config.local.yaml --archive --limit_items 200 --parts_per_dataset 3
 ```
+
+Telemetry: set `enable_local_telemetry: true` in your local config to capture
+NVML metrics (requires `pynvml`). llama.cpp workloads are automatically capped
+to a single worker for stability.
 
 ## Datasets and Preparation
 
