@@ -68,7 +68,8 @@ unsupported:
 - **Configs:** `config/eval_config.local.yaml` (Ollama), `config/eval_config.local.llamacpp.yaml` (llama.cpp).
 - **Multi-prompt workaround:** The native `--archive` flag has trial isolation issues on local backend. Use `run_all_prompts.ps1` instead to run prompt sweeps sequentially with proper archiving. See `docs/local_multi_prompt_workaround.md` for full details.
 - **Tested models (October 2025):**
-  - `llama3.1:8b-instruct-q4_K_M`, `mistral:7b-instruct-q4_K_M`, `qwen2.5:7b-instruct-q4_K_M`, `gemma2:9b-instruct-q4_K_M`, `gpt-oss:20b` (20B near VRAM limit).
+  - `llama31-8b-q4k-gpu:latest`, `mistral-7b-q4k-gpu:latest`, `qwen25-7b-q4k-gpu:latest`, `gemma2-9b-q4k-gpu:latest`, `gpt-oss-20b-gpu:latest` (20B near VRAM limit).
+  - All custom models configured with `num_gpu=999` for maximum GPU layer offloading and optimal performance.
 - **Performance:** ~72 items/min (7-9B), ~35-45 items/min (20B) on RTX 5080 (16GB VRAM).
 - **Docs:** `docs/windows.md`, `docs/troubleshooting_windows_local.md`, `docs/performance.md`, `docs/local_multi_prompt_workaround.md`.
 

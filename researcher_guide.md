@@ -407,32 +407,34 @@ For researchers without cloud API access or those wanting to test with different
 - **GPU Driver**: Recent NVIDIA drivers with CUDA support
 
 #### Tested Models (as of October 2025)
-All models tested with Q4 quantization on RTX 5080 (16GB VRAM):
+All models custom-configured with `num_gpu=999` for maximum GPU offloading, tested with Q4 quantization on RTX 5080 (16GB VRAM):
 
-1. **llama3.1:8b-instruct-q4_K_M** (~4.7GB VRAM)
+1. **llama31-8b-q4k-gpu:latest** (~4.7GB VRAM)
    - Meta's Llama 3.1, 8B parameters
    - Baseline model, good all-around performance
    - ~72 items/minute throughput
 
-2. **mistral:7b-instruct-q4_K_M** (~4.4GB VRAM)
+2. **mistral-7b-q4k-gpu:latest** (~4.4GB VRAM)
    - Mistral AI's 7B model with sliding window attention
    - Different architecture from Llama
    - ~75 items/minute throughput
 
-3. **qwen2.5:7b-instruct-q4_K_M** (~4.4GB VRAM)
+3. **qwen25-7b-q4k-gpu:latest** (~4.4GB VRAM)
    - Alibaba's Qwen 2.5, trained on multilingual data
    - Strong benchmark performance for 7B class
    - ~73 items/minute throughput
 
-4. **gemma2:9b-instruct-q4_K_M** (~5.5GB VRAM)
+4. **gemma2-9b-q4k-gpu:latest** (~5.5GB VRAM)
    - Google's Gemma 2, 9B parameters
    - Grouped-query attention, knowledge distilled from Gemini
    - ~65 items/minute throughput
 
-5. **gpt-oss:20b** (~11-12GB VRAM) ⚠️
+5. **gpt-oss-20b-gpu:latest** (~11-12GB VRAM) ⚠️
    - 20B parameter model
    - Near VRAM limit, monitor for OOM errors
    - ~35-45 items/minute throughput
+
+**Note:** The `-gpu` suffix denotes custom Ollama models configured with `num_gpu=999` to force all layers onto GPU for optimal performance.
 
 #### Setup Instructions
 
@@ -444,12 +446,18 @@ All models tested with Q4 quantization on RTX 5080 (16GB VRAM):
 # Linux: curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-**2. Pull models:**
+**2. Pull and configure models:**
 ```bash
+# Pull base models
 ollama pull llama3.1:8b-instruct-q4_K_M
 ollama pull mistral:7b-instruct-q4_K_M
 ollama pull qwen2.5:7b-instruct-q4_K_M
-# ... etc
+ollama pull gemma2:9b-instruct-q4_K_M
+ollama pull gpt-oss:20b
+
+# Create GPU-optimized versions (optional but recommended for RTX 5080)
+# Create Modelfiles with num_gpu=999 for maximum GPU offloading
+# See Ollama documentation for custom model creation
 ```
 
 **3. Bootstrap environment (Windows):**

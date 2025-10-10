@@ -70,11 +70,12 @@
 - **Configs:** `config/eval_config.local.yaml` (Ollama), `config/eval_config.local.llamacpp.yaml` (llama.cpp).
 - **Multi-prompt sweep workaround:** Use `run_all_prompts.ps1` for local backend; the built-in `--archive` multi-trial sweep has isolation issues (see `docs/local_multi_prompt_workaround.md`).
 - **Tested models (October 2025, 16GB VRAM):**
-  - `llama3.1:8b-instruct-q4_K_M` - Meta baseline
-  - `mistral:7b-instruct-q4_K_M` - Mistral AI, different architecture
-  - `qwen2.5:7b-instruct-q4_K_M` - Alibaba, multilingual training
-  - `gemma2:9b-instruct-q4_K_M` - Google, grouped-query attention
-  - `gpt-oss:20b` - 20B parameters (near VRAM limit, monitor for OOM)
+  - `llama31-8b-q4k-gpu:latest` - Meta baseline (custom GPU-optimized)
+  - `mistral-7b-q4k-gpu:latest` - Mistral AI, different architecture (custom GPU-optimized)
+  - `qwen25-7b-q4k-gpu:latest` - Alibaba, multilingual training (custom GPU-optimized)
+  - `gemma2-9b-q4k-gpu:latest` - Google, grouped-query attention (custom GPU-optimized)
+  - `gpt-oss-20b-gpu:latest` - 20B parameters (custom GPU-optimized, near VRAM limit)
+  - **Note:** Custom models configured with `num_gpu=999` to force maximum GPU layer offloading for optimal performance
 - **Performance:** ~72 items/min (7-9B models), ~35-45 items/min (20B models) on RTX 5080.
 - **Docs:** `docs/windows.md`, `docs/troubleshooting_windows_local.md`, `docs/performance.md`, `docs/local_multi_prompt_workaround.md`.
 
