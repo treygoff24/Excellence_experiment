@@ -1,37 +1,32 @@
-# Local Multi-Prompt Sweep Workaround
+# Local Multi-Prompt Sweep (Local backend)
 
-**Date:** October 9, 2025  
-**Issue:** Multi-prompt sweep with `--archive` flag fails on local backend  
-**Status:** Workaround implemented via `run_all_prompts.ps1`
+**Date:** October 10, 2025  
+**Issue:** Historically, multi-prompt sweeps on local backend could skip trials or mix outputs.  
+**Status:** Orchestrator improved; CLI can override config sweeps; `--no_sweep` available.
 
 ---
 
 ## Problem Description
 
-### Expected Behavior
+### Expected Behavior (current)
 
 When running a multi-prompt sweep with the local backend:
 
 ```powershell
-python -m scripts.run_all --config config\eval_config.local.yaml --archive --limit_items 250
+python -m scripts.run_all --config config\eval_config.local.yaml --limit_items 250 --parts_per_dataset 2
 ```
 
-The orchestrator should:
-1. Execute all prompt sets defined in `sweep.prompt_sets`
-2. Archive each trial to separate directories under `experiments/run_<RUN_ID>/`
-3. Generate unique results for each prompt set
+The orchestrator will:
+1. Execute all prompt sets from `sweep.prompt_sets` once in a single run (unless `--no_sweep`).
+2. Isolate outputs per trial under `experiments/run_<RUN_ID>/<trial-slug>/{results,reports}/`.
+3. Produce a top-level `aggregate_report.md` for the run.
 
-### Actual Behavior
+### Prior Behavior (pre-fix)
 
-What actually happens:
+- Some trials could be skipped due to shared `results/` gating.
+- Archiving could leave shared state between trials.
 
-1. **Trial planning succeeds** - All 8 prompt sets are identified and queued
-2. **Batch building succeeds** - Input files created for all prompts in `data/batch_inputs/`
-3. **Only ONE trial executes** - First prompt runs inference
-4. **Remaining trials skip** - All subsequent prompts find cached `results/` directory and skip execution with "already done" messages
-5. **No proper archiving** - The `--archive` flag doesn't isolate results between trials for local backend
-
-**Result:** Only 1 of 8 prompt sets actually runs, all share the same results.
+This has been addressed by isolating per-trial outputs under `experiments/` and improving sweep handling.
 
 ---
 
@@ -67,47 +62,21 @@ For the **local backend**:
 
 ---
 
-## Workaround Solution
+## Recommended Usage
 
-### Approach
-
-Created `run_all_prompts.ps1` that:
-1. Runs each prompt set individually in sequence
-2. Cleans working directories between runs
-3. Manually archives results to timestamped directories
-4. Preserves all outputs in isolated experiment folders
-
-### Implementation
-
-**File:** `run_all_prompts.ps1`
-
-**Key features:**
+- To run all prompts once from config sweep:
 
 ```powershell
-foreach ($prompt in $prompts) {
-    # 1. Clean working directories before each run
-    Remove-Item results, data\batch_inputs, reports -Recurse -Force
-    
-    # 2. Run single prompt set
-    python -m scripts.run_all --config config\eval_config.local.yaml `
-        --limit_items $limitItems `
-        --parts_per_dataset $partsPerDataset `
-        --prompt_sets $prompt
-    
-    # 3. Archive manually with timestamp
-    $timestamp = Get-Date -Format "yyyyMMddHHmmss"
-    $archiveDir = "experiments\run_$timestamp`_$prompt"
-    Copy-Item results -Destination "$archiveDir\results" -Recurse
-    Copy-Item reports -Destination "$archiveDir\reports" -Recurse
-}
+python -m scripts.run_all --config config\eval_config.local.yaml --limit_items 250 --parts_per_dataset 2
 ```
 
-**Benefits:**
-- ✅ Each prompt set runs fresh
-- ✅ Results isolated in separate directories
-- ✅ No cross-contamination between trials
-- ✅ Resume-safe (each prompt is independent)
-- ✅ Easy to identify which experiment is which
+- To force-disable config sweep and run only prompts/models provided on CLI:
+
+```powershell
+python -m scripts.run_all --config config\eval_config.local.yaml --no_sweep --prompt_sets operational_only,structure_without_content
+```
+
+- If both config `sweep` and CLI lists are present, CLI overrides the sweep lists. The run will log overrides.
 
 ---
 
@@ -116,10 +85,8 @@ foreach ($prompt in $prompts) {
 ### Quick Validation Run (250 items, ~55 minutes)
 
 ```powershell
-.\run_all_prompts.ps1
+python -m scripts.run_all --config config\eval_config.local.yaml --limit_items 250 --parts_per_dataset 2 --max_concurrent_jobs 1
 ```
-
-Processes all 8 prompt sets with 250 items per condition.
 
 ### Overnight Full Run (5000 items, ~8-10 hours)
 
@@ -146,22 +113,19 @@ Results are archived to timestamped directories:
 
 ```
 experiments/
-├── run_20251009183052_operational_only/
-│   ├── results/
-│   │   ├── predictions.csv
-│   │   ├── per_item_scores.csv
-│   │   ├── significance.json
-│   │   ├── costs.json
-│   │   └── ...
-│   └── reports/
-│       └── report.md
-├── run_20251009183759_structure_without_content/
-│   ├── results/
-│   └── reports/
-├── run_20251009184512_philosophy_without_instructions/
-│   ├── results/
-│   └── reports/
-... (8 total directories, one per prompt set)
+└── run_r20251010HHMMSS/
+    ├── aggregate_report.md
+    ├── batch_inputs/
+    ├── <model>-<prompt>-tp...-tk...-mx.../
+    │   ├── results/
+    │   │   ├── predictions.csv
+    │   │   ├── per_item_scores.csv
+    │   │   ├── significance.json
+    │   │   ├── costs.json
+    │   │   └── ...
+    │   └── reports/
+    │       └── report.md
+    └── ... (8 trial directories)
 ```
 
 ---
@@ -269,18 +233,11 @@ foreach ($model in $models) {
 
 ## Troubleshooting
 
-### Problem: Script skips prompts even with workaround
+### Problem: Script expands to more prompts than expected
 
-**Symptoms:** Still seeing "already done" messages after first prompt.
+**Symptoms:** A single CLI prompt still runs all prompts.
 
-**Fix:** Ensure cleanup is running:
-```powershell
-# Manually verify
-dir results, data\batch_inputs, reports
-# Should not exist between runs
-```
-
-Check script has execute permissions and Force flag is working.
+**Fix:** Use `--no_sweep` to disable config sweep. Or remove/clear `sweep` in your config.
 
 ---
 

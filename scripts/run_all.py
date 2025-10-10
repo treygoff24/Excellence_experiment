@@ -204,18 +204,56 @@ def _expand_trials(cfg: dict, args) -> list[dict]:
             trials.append(trial)
         return trials
 
-    sw = cfg.get("sweep") or {}
-    sw_models = sw.get("models") or base_models
-    sw_ps = sw.get("prompt_sets") or base_ps
-    sw_temps = sw.get("temps") or base_temps
-    sw_top_p = sw.get("top_p") or [base_top_p]
-    sw_top_k = sw.get("top_k") or [base_top_k]
-    mx_sw = sw.get("max_new_tokens")
-    if mx_sw:
-        ob_list = mx_sw.get("open_book") or [base_mx.get("open_book", 1024)]
-        cb_list = mx_sw.get("closed_book") or [base_mx.get("closed_book", 1024)]
-        mx_list = [{"open_book": int(ob), "closed_book": int(cb)} for ob in ob_list for cb in cb_list]
+    # Determine whether to use config-defined sweep. Allow explicit opt-out and CLI overrides.
+    cfg_has_sweep = bool(cfg.get("sweep"))
+    if cfg_has_sweep and getattr(args, "no_sweep", False):
+        print("INFO: --no_sweep provided; ignoring config.sweep")
+    use_cfg_sweep = cfg_has_sweep and (not getattr(args, "no_sweep", False))
+
+    if use_cfg_sweep:
+        sw = cfg.get("sweep") or {}
+        # If CLI provided lists, prefer them over config sweep entries
+        cli_models_provided = bool(cli_models)
+        cli_ps_provided = bool(cli_ps)
+        cli_temps_provided = bool(getattr(args, "temps", None))
+
+        if cli_models_provided:
+            try:
+                print(f"INFO: Overriding config.sweep.models with CLI --models: {', '.join(cli_models)}")
+            except Exception:
+                print("INFO: Overriding config.sweep.models with CLI --models")
+        if cli_ps_provided:
+            try:
+                print(f"INFO: Overriding config.sweep.prompt_sets with CLI --prompt_sets: {', '.join(cli_ps)}")
+            except Exception:
+                print("INFO: Overriding config.sweep.prompt_sets with CLI --prompt_sets")
+        if cli_temps_provided:
+            try:
+                toks = _split_list_arg(args.temps)
+                print(f"INFO: Overriding config.sweep.temps with CLI --temps: {', '.join(toks)}")
+            except Exception:
+                print("INFO: Overriding config.sweep.temps with CLI --temps")
+
+        sw_models = (cli_models if cli_models_provided else (sw.get("models") or base_models))
+        sw_ps = (cli_ps if cli_ps_provided else (sw.get("prompt_sets") or base_ps))
+        # If CLI temps supplied, base_temps already reflects them; otherwise allow sweep temps or base temps
+        sw_temps = (base_temps if cli_temps_provided else (sw.get("temps") or base_temps))
+        sw_top_p = sw.get("top_p") or [base_top_p]
+        sw_top_k = sw.get("top_k") or [base_top_k]
+        mx_sw = sw.get("max_new_tokens")
+        if mx_sw:
+            ob_list = mx_sw.get("open_book") or [base_mx.get("open_book", 1024)]
+            cb_list = mx_sw.get("closed_book") or [base_mx.get("closed_book", 1024)]
+            mx_list = [{"open_book": int(ob), "closed_book": int(cb)} for ob in ob_list for cb in cb_list]
+        else:
+            mx_list = [base_mx]
     else:
+        # No config sweep (absent or explicitly disabled) — expand across CLI/default lists
+        sw_models = base_models
+        sw_ps = base_ps
+        sw_temps = base_temps
+        sw_top_p = [base_top_p]
+        sw_top_k = [base_top_k]
         mx_list = [base_mx]
 
     for m in sw_models:
@@ -511,6 +549,11 @@ def main():
     ap.add_argument("--models", nargs="+", help="Models or aliases (space or comma separated)")
     ap.add_argument("--prompt_sets", nargs="+", help="Prompt set names (space or comma separated)")
     ap.add_argument("--temps", nargs="+", help="Temperatures override (space or comma separated)")
+    ap.add_argument(
+        "--no_sweep",
+        action="store_true",
+        help="Ignore config.sweep entirely (use CLI/defaults only); CLI lists still expand",
+    )
     ap.add_argument("--plan_only", action="store_true", help="Show phase plan and exit")
     ap.add_argument("--only_step", choices=[
         "prepare","build","submit","poll","parse","score","stats","costs","report"
