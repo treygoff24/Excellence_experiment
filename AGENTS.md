@@ -65,10 +65,24 @@
 - Per‑run directories under `experiments/run_*/` and `experiments/**/batch_inputs/` are also ignored.
 - If you must share artifacts, upload them externally and link paths in PRs.
 
+## Local Backend (Windows + Ollama/llama.cpp)
+- **Bootstrap:** `powershell -ExecutionPolicy Bypass -File tools\bootstrap.ps1` (Windows only).
+- **Configs:** `config/eval_config.local.yaml` (Ollama), `config/eval_config.local.llamacpp.yaml` (llama.cpp).
+- **Multi-prompt sweep workaround:** Use `run_all_prompts.ps1` for local backend; the built-in `--archive` multi-trial sweep has isolation issues (see `docs/local_multi_prompt_workaround.md`).
+- **Tested models (October 2025, 16GB VRAM):**
+  - `llama3.1:8b-instruct-q4_K_M` - Meta baseline
+  - `mistral:7b-instruct-q4_K_M` - Mistral AI, different architecture
+  - `qwen2.5:7b-instruct-q4_K_M` - Alibaba, multilingual training
+  - `gemma2:9b-instruct-q4_K_M` - Google, grouped-query attention
+  - `gpt-oss:20b` - 20B parameters (near VRAM limit, monitor for OOM)
+- **Performance:** ~72 items/min (7-9B models), ~35-45 items/min (20B models) on RTX 5080.
+- **Docs:** `docs/windows.md`, `docs/troubleshooting_windows_local.md`, `docs/performance.md`, `docs/local_multi_prompt_workaround.md`.
+
 ## Agent Tips
 - Prefer `make smoke` and `scripts.smoke_orchestration` to validate changes quickly; keep seeds/config deterministic.
 - When editing stats/report schemas, document fields in README and keep backward compatibility when feasible.
 - Avoid network actions unless necessary; ask for approval when required.
+- For local backend multi-model/multi-prompt runs on Windows, use `run_all_prompts.ps1` to avoid trial isolation issues.
 
 ## Fireworks CLI (firectl)
 - Overview: Fireworks’ official CLI for managing datasets, batch inference jobs, deployments, models, and LoRA adapters. Useful for quick, manual ops or debugging alongside our scripted pipeline. Docs: https://fireworks.ai/docs/tools-sdks/firectl/firectl

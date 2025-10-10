@@ -62,12 +62,23 @@ unsupported:
 - Optional: `unsupported_sensitivity.json`, `mixed_models.json`, `power_analysis.json`, `cost_effectiveness.json`.
 - Report: `reports/report.md` includes all of the above.
 
-## Do/Don’t
+## Local Backend Support (Windows + Ollama/llama.cpp)
+- **Platform:** Windows 11, Python 3.11, PowerShell 7+, NVIDIA GPU with recent drivers.
+- **Bootstrap:** `powershell -ExecutionPolicy Bypass -File tools\bootstrap.ps1`.
+- **Configs:** `config/eval_config.local.yaml` (Ollama), `config/eval_config.local.llamacpp.yaml` (llama.cpp).
+- **Multi-prompt workaround:** The native `--archive` flag has trial isolation issues on local backend. Use `run_all_prompts.ps1` instead to run prompt sweeps sequentially with proper archiving. See `docs/local_multi_prompt_workaround.md` for full details.
+- **Tested models (October 2025):**
+  - `llama3.1:8b-instruct-q4_K_M`, `mistral:7b-instruct-q4_K_M`, `qwen2.5:7b-instruct-q4_K_M`, `gemma2:9b-instruct-q4_K_M`, `gpt-oss:20b` (20B near VRAM limit).
+- **Performance:** ~72 items/min (7-9B), ~35-45 items/min (20B) on RTX 5080 (16GB VRAM).
+- **Docs:** `docs/windows.md`, `docs/troubleshooting_windows_local.md`, `docs/performance.md`, `docs/local_multi_prompt_workaround.md`.
+
+## Do/Don't
 - Do keep seeds fixed and respect validated config schemas.
 - Do use `scripts.s​moke_test.py` or `scripts.smoke_orchestration` for quick iteration.
-- Don’t commit large artifacts — any `results/`/`reports/` dirs are ignored recursively.
+- Do use `run_all_prompts.ps1` for local backend multi-prompt sweeps (not `--archive` with sweep config).
+- Don't commit large artifacts — any `results/`/`reports/` dirs are ignored recursively.
  - Per‑run under `experiments/run_<RUN_ID>/` is also ignored; reference paths in PRs instead of committing.
-- Don’t change output schema keys casually; keep backward compatibility or update docs accordingly.
+- Don't change output schema keys casually; keep backward compatibility or update docs accordingly.
 
 ## Common Tasks
 - “Upgrade stats” → edit `scoring/stats.py`, then update `scripts/generate_report.py` and README/AGENTS.

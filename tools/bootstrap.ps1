@@ -61,7 +61,7 @@ try {
   Write-Info "Installing dependencies from requirements.txt ..."
   & $venvPy -m pip install -r $reqFile
 
-  Write-Host "\n[bootstrap] Environment ready. Activate with: `\n  .\\.venv\\Scripts\\Activate.ps1`" -ForegroundColor Green
+  Write-Host "\n[bootstrap] Environment ready. Activate with:\n  .\.venv\Scripts\Activate.ps1" -ForegroundColor Green
 } catch {
   Write-Err $_
   exit 1

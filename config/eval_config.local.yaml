@@ -20,6 +20,15 @@ stop: []
 
 max_concurrent_requests: 1
 
+# Dataset size limits (null = use all available data)
+# Setting open_book to 0 to focus on closed-book tasks where effects are strongest
+sizes:
+  closed_book_max_items: null
+  open_book_max_items: 0
+  triviaqa_max_items: null
+  nq_open_max_items: null
+  squad_v2_max_items: null
+
 paths:
   raw_dir: "data/raw"
   prepared_dir: "data/prepared"
@@ -29,8 +38,70 @@ paths:
   run_manifest: "results/run_manifest.json"
   experiments_dir: "experiments"
 
+# Pricing (for local runs, used for estimating equivalent cost)
+pricing:
+  input_per_million: 0.15
+  output_per_million: 0.60
+  batch_discount: 0.5
+
+# Unsupported claim detection configuration
+unsupported:
+  strategy: overlap
+  threshold: 0.5
+  min_token_overlap: 0.6
+
 prompt_sets:
   default:
     control: config/prompts/control_system.txt
     treatment: config/prompts/treatment_system.txt
+  operational_only:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/operational_only_system.md
+  structure_without_content:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/structure_without_content_system.md
+  philosophy_without_instructions:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/philosophy_without_instructions_system.md
+  length_matched_random:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/length_matched_random_system.md
+  length_matched_best_practices:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/length_matched_best_practices_system.md
+  excellence_25_percent:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/excellence_25_percent_system.md
+  excellence_50_percent:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/excellence_50_percent_system.md
+  excellence_75_percent:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/excellence_75_percent_system.md
 default_prompt_set: default
+
+# Statistics configuration for robust analysis
+stats:
+  bootstrap_samples: 5000
+  permutation_samples: 5000
+  random_seed: 1337
+  enable_permutation: true
+  enable_fdr: true
+  risk_thresholds: [0.0, 0.25, 0.5, 0.75, 1.0]
+  tost_alpha: 0.05
+  tost_margins:
+    em: 0.01
+    f1: 0.01
+
+# Sweep configuration to test all prompts
+sweep:
+  prompt_sets:
+    - operational_only
+    - structure_without_content
+    - philosophy_without_instructions
+    - length_matched_random
+    - length_matched_best_practices
+    - excellence_25_percent
+    - excellence_50_percent
+    - excellence_75_percent
+  temps: [0.0]
