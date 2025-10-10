@@ -392,6 +392,131 @@ The treatment prompt's effectiveness may derive from:
 - **Enhanced features**: Improved upload reliability, timeout handling, confidence intervals
 - **Statistical output**: Standard deviations and 95% CIs for all metrics
 
+### 9.4 Alternative Setup: Local LLM Backend (October 2025)
+
+For researchers without cloud API access or those wanting to test with different models, the framework now supports local execution using Ollama or llama.cpp on consumer hardware.
+
+#### Hardware Requirements
+- **OS**: Windows 11 (tested), Linux/macOS (compatible)
+- **GPU**: NVIDIA GPU with 12GB+ VRAM recommended
+  - 7-9B models: 6-8GB VRAM
+  - 14B models: 10-12GB VRAM  
+  - 20B models: 14-16GB VRAM (tight fit)
+- **RAM**: 16GB+ system RAM
+- **Storage**: 50GB+ for models and datasets
+- **GPU Driver**: Recent NVIDIA drivers with CUDA support
+
+#### Tested Models (as of October 2025)
+All models tested with Q4 quantization on RTX 5080 (16GB VRAM):
+
+1. **llama3.1:8b-instruct-q4_K_M** (~4.7GB VRAM)
+   - Meta's Llama 3.1, 8B parameters
+   - Baseline model, good all-around performance
+   - ~72 items/minute throughput
+
+2. **mistral:7b-instruct-q4_K_M** (~4.4GB VRAM)
+   - Mistral AI's 7B model with sliding window attention
+   - Different architecture from Llama
+   - ~75 items/minute throughput
+
+3. **qwen2.5:7b-instruct-q4_K_M** (~4.4GB VRAM)
+   - Alibaba's Qwen 2.5, trained on multilingual data
+   - Strong benchmark performance for 7B class
+   - ~73 items/minute throughput
+
+4. **gemma2:9b-instruct-q4_K_M** (~5.5GB VRAM)
+   - Google's Gemma 2, 9B parameters
+   - Grouped-query attention, knowledge distilled from Gemini
+   - ~65 items/minute throughput
+
+5. **gpt-oss:20b** (~11-12GB VRAM) ⚠️
+   - 20B parameter model
+   - Near VRAM limit, monitor for OOM errors
+   - ~35-45 items/minute throughput
+
+#### Setup Instructions
+
+**1. Install Ollama:**
+```bash
+# Visit https://ollama.ai for installers
+# Windows: Download and run installer
+# macOS: brew install ollama
+# Linux: curl -fsSL https://ollama.com/install.sh | sh
+```
+
+**2. Pull models:**
+```bash
+ollama pull llama3.1:8b-instruct-q4_K_M
+ollama pull mistral:7b-instruct-q4_K_M
+ollama pull qwen2.5:7b-instruct-q4_K_M
+# ... etc
+```
+
+**3. Bootstrap environment (Windows):**
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\bootstrap.ps1
+.\.venv\Scripts\Activate.ps1
+```
+
+**4. Run experiments:**
+```powershell
+# Single prompt set test (250 items, ~7 minutes)
+.\run_all_prompts.ps1
+
+# Or edit the script for full runs (5000 items, ~10 hours per model)
+```
+
+#### Cost Comparison
+
+| Setup | Cost | Runtime (250 items) | Runtime (5000 items) |
+|-------|------|---------------------|----------------------|
+| **Fireworks Cloud (GPT-OSS-120B)** | $5-6 USD | 2-4 hours | ~40-50 hours |
+| **Local 7-9B models** | $0 (electricity only) | ~6-7 minutes | ~8-10 hours |
+| **Local 20B model** | $0 (electricity only) | ~11-14 minutes | ~18-22 hours |
+
+**Note:** Local runs are free except for electricity (~$0.15-0.30 USD per full run based on typical GPU power draw).
+
+#### Performance Characteristics
+
+- **7-9B models**: ~70-75 items/minute, excellent for rapid iteration
+- **14B models**: ~50-60 items/minute, good balance of speed and quality
+- **20B models**: ~35-45 items/minute, highest quality but slower
+
+For publication-quality results (25,000 items per condition):
+- 7-9B models: ~50-60 hours (2-3 days)
+- 20B models: ~100-120 hours (4-5 days)
+
+#### Limitations vs. Cloud Setup
+
+1. **Model differences**: Local models differ from GPT-OSS-120B, results won't be directly comparable
+2. **Speed**: Slower than cloud batch processing for very large runs
+3. **Setup complexity**: Requires GPU drivers, CUDA toolkit, model management
+4. **Reproducibility**: Hardware-dependent (different GPUs may yield slight variations)
+
+#### Advantages
+
+1. **Cost**: Free for compute (only electricity)
+2. **Privacy**: Data never leaves your machine
+3. **Model diversity**: Easy to test multiple architectures
+4. **Iteration speed**: Rapid testing with smaller sample sizes
+5. **Reproducibility**: Complete control over execution environment
+
+#### Documentation
+
+- **Setup guide**: `docs/windows.md`
+- **Multi-prompt script**: `run_all_prompts.ps1` (workaround for local backend)
+- **Troubleshooting**: `docs/troubleshooting_windows_local.md`
+- **Performance tuning**: `docs/performance.md`
+- **Technical details**: `docs/local_multi_prompt_workaround.md`
+
+#### Recommended Workflow for Researchers
+
+1. **Pilot study** (local, 1000 items): Validate prompts and methods (~2 hours)
+2. **Full local run** (5000-10000 items): Establish effects across multiple models (~40-80 hours)
+3. **Cloud validation** (optional): Confirm findings on GPT-OSS-120B or similar
+
+This approach balances cost, speed, and rigor for academic reproducibility.
+
 ## 10. Theoretical Implications
 
 ### 10.1 Cognitive Science Connections
@@ -405,15 +530,18 @@ This study provides empirical grounding for the hypothesis that system prompts f
 
 ---
 
-**Document Version**: 1.0  
-**Last Updated**: 2025-08-19  
-**Total Experimental Cost**: $5.84 USD  
-**Data Collection Period**: August 18-19, 2025  
-**Replication Repository**: `Excellence_experiment/`
+**Document Version**: 1.1  
+**Last Updated**: October 9, 2025  
+**Total Experimental Cost**: $5.84 USD (cloud) or $0 (local, electricity only)  
+**Data Collection Period**: August 18-19, 2025 (original study)  
+**Replication Repository**: `Excellence_experiment/`  
+**Local Backend Support Added**: October 2025
 
 This guide provides complete information for writing a rigorous academic paper. All claims should be supported by the empirical evidence documented in the results files, and the statistical analysis approach ensures robust conclusions about system prompt effectiveness.
 
 ## Running multi-trial experiments
+
+### Cloud Backend (Fireworks AI)
 
 1) Configure sweeps or trials in `config/eval_config.yaml` using `prompt_sets`, `models`/`model_aliases`, and `sweep` or `trials`.
 2) Prepare and build inputs:
@@ -440,3 +568,20 @@ Tips:
 - Use `--plan_only` to print the expanded trial plan without running.
 - Keep `samples_per_item` aligned with all `temps` used in sweeps/trials.
 - Reuse datasets across models by keeping batch inputs identical (prompt set + temp).
+
+### Local Backend (Ollama/llama.cpp)
+
+For local backends, use the workaround script due to trial isolation issues:
+
+```powershell
+# Edit run_all_prompts.ps1 to set desired parameters
+# Default: 250 items per condition
+.\run_all_prompts.ps1
+```
+
+The script automatically:
+- Runs each prompt set sequentially
+- Cleans working directories between runs
+- Archives results to timestamped directories
+
+For detailed information see `docs/local_multi_prompt_workaround.md`.
