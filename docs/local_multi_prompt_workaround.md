@@ -172,27 +172,27 @@ experiments/
 
 The following models were tested on an NVIDIA RTX 5080 (16GB VRAM) with this framework:
 
-1. **llama31-8b-q4k-gpu:latest** (~4.7GB VRAM)
+1. **llama31-8b-q4k-gpu** (~4.7GB VRAM)
    - Meta's Llama 3.1, 8B parameters, Q4 quantized
    - Baseline model for comparison
    - Custom model with `num_gpu=999` for maximum GPU offloading
 
-2. **mistral-7b-q4k-gpu:latest** (~4.4GB VRAM)
+2. **mistral-7b-q4k-gpu** (~4.4GB VRAM)
    - Mistral AI's 7B model with sliding window attention
    - Different architecture from Llama
    - Custom model with `num_gpu=999` for maximum GPU offloading
 
-3. **qwen25-7b-q4k-gpu:latest** (~4.4GB VRAM)
+3. **qwen25-7b-q4k-gpu** (~4.4GB VRAM)
    - Alibaba's Qwen 2.5, trained on multilingual data
    - Strong benchmark performance for 7B class
    - Custom model with `num_gpu=999` for maximum GPU offloading
 
-4. **gemma2-9b-q4k-gpu:latest** (~5.5GB VRAM)
+4. **gemma2-9b-q4k-gpu** (~5.5GB VRAM)
    - Google's Gemma 2, 9B parameters with grouped-query attention
    - Knowledge distilled from Gemini
    - Custom model with `num_gpu=999` for maximum GPU offloading
 
-5. **gpt-oss-20b-gpu:latest** (~11-12GB VRAM) ⚠️
+5. **gpt-oss-20b-gpu** (~11-12GB VRAM) ⚠️
    - 20B parameter model (GPT-OSS variant)
    - **Near VRAM limit** - monitor for OOM errors
    - Custom model with `num_gpu=999` for maximum GPU offloading
