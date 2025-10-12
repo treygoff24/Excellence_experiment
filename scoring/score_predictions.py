@@ -8,6 +8,7 @@ from . import squad_v2, triviaqa, nq_open
 from .unsupported import is_unsupported
 from config.schema import load_config
 from scripts import manifest_v2 as mf
+from scripts.shared_controls import gather_control_entries, iter_control_results, count_control_results
 
 
 def load_jsonl(path: str):
@@ -29,7 +30,8 @@ def load_canonical(prepared_dir: str):
 def read_preds_csv(path: str):
     with open(path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        for r in reader: yield r
+        for r in reader:
+            yield r
 
 
 def aggregate_replicates(values):
@@ -43,6 +45,80 @@ def stdev(values):
     mean_val = sum(values) / n
     var = sum((x - mean_val) ** 2 for x in values) / (n - 1)
     return var ** 0.5
+
+
+def _write_rows(rows, out_csv):
+    import csv
+    fieldnames = sorted({k for r in rows for k in r.keys()})
+    with open(out_csv, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows: w.writerow(r)
+
+
+def _load_prediction_rows(pred_csv: str, results_dir: str) -> list[dict]:
+    rows = [dict(r) for r in read_preds_csv(pred_csv)]
+    run_root, ctrl_entries, _manifest = gather_control_entries(results_dir)
+    reuse_entries = [info for info in (ctrl_entries or {}).values() if isinstance(info, dict) and info.get("mode") == "reuse"]
+    if not reuse_entries:
+        return rows
+
+    control_ids = {str(r.get("custom_id")) for r in rows if str(r.get("condition")) == "control" and r.get("custom_id")}
+    expected_controls = count_control_results(run_root, reuse_entries)
+    if expected_controls <= len(control_ids):
+        return rows
+
+    added = 0
+    for entry in reuse_entries:
+        for obj in iter_control_results(run_root, [entry]):
+            cid = obj.get("custom_id") or obj.get("customId")
+            if not cid or cid in control_ids:
+                continue
+            try:
+                dataset, item_id, condition, temp_str, sample_idx_str, typ = tuple(str(cid).split("|"))
+            except ValueError:
+                continue
+            try:
+                temp_val = float(temp_str)
+            except Exception:
+                temp_val = 0.0
+            try:
+                sample_idx = int(sample_idx_str)
+            except Exception:
+                sample_idx = 0
+            resp = obj.get("response") or {}
+            body = resp.get("body") or resp or {}
+            response_text = ""
+            finish_reason = None
+            try:
+                choices = body.get("choices") or []
+                if choices and isinstance(choices[0], dict):
+                    finish_reason = choices[0].get("finish_reason")
+                    msg = choices[0].get("message", {}) or {}
+                    response_text = (msg.get("content") or "").strip()
+            except Exception:
+                pass
+            usage = resp.get("usage") or body.get("usage") or {}
+            rows.append({
+                "custom_id": cid,
+                "dataset": dataset,
+                "item_id": item_id,
+                "condition": condition,
+                "temp": temp_val,
+                "sample_index": sample_idx,
+                "type": typ,
+                "request_id": resp.get("request_id") or resp.get("id") or body.get("id"),
+                "finish_reason": finish_reason,
+                "response_text": response_text,
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+            })
+            control_ids.add(cid)
+            added += 1
+    if added:
+        print(f"Rehydrated {added} shared control row(s) into per-item scoring inputs")
+    return rows
 
 
 def main():
@@ -64,7 +140,9 @@ def main():
     abst_bucket = defaultdict(list)
     false_ans_bucket = defaultdict(list)
     unsupported_bucket = defaultdict(list)
-    for r in read_preds_csv(args.pred_csv):
+    pred_rows = _load_prediction_rows(args.pred_csv, args.out_dir)
+
+    for r in pred_rows:
         key_item = f"{r['dataset']}|{r['item_id']}"
         typ = r["type"]
         condition = r["condition"]

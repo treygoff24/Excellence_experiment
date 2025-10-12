@@ -81,9 +81,17 @@
 
 ## Agent Tips
 - Prefer `make smoke` and `scripts.smoke_orchestration` to validate changes quickly; keep seeds/config deterministic.
+- Multi-trial sweeps write shared control batches once per `(model, dataset partition, prompt, sampling config)`. Downstream steps hydrate controls via the registry in `control_registry.json` rather than re-running control inference per trial.
 - When editing stats/report schemas, document fields in README and keep backward compatibility when feasible.
 - Avoid network actions unless necessary; ask for approval when required.
 - For local backend multi-model/multi-prompt runs on Windows, use `run_all_prompts.ps1` to avoid trial isolation issues.
+### Shared Control Cache
+- Registry refresh on startup/resume cleans/prunes stale entries before submissions.
+- Producers export control JSONL + metadata into `experiments/run_<RID>/shared_controls/<key>/` and mark registry entries `completed`.
+- When manifest entries hit an existing key, the submit step marks `mode: reuse` and skips new control jobs; downstream consumers hydrate rows directly from the shared cache (no duplicate scoring rows).
+- Resume sanitization re-queues only missing controls. To force regeneration, delete `shared_controls/<key>/` plus the matching registry entry and rerun with `--resume`.
+- Smoke validation: run two trials sharing a control configuration and confirm only one control job launches; rerun with `--resume` after deleting a cached JSONL to ensure regeneration occurs.
+- Use `scripts.shared_controls.refresh_registry` in ad-hoc tooling if you need to inspect or repair registries outside the orchestrator.
 
 ## Fireworks CLI (firectl)
 - Overview: Fireworks’ official CLI for managing datasets, batch inference jobs, deployments, models, and LoRA adapters. Useful for quick, manual ops or debugging alongside our scripted pipeline. Docs: https://fireworks.ai/docs/tools-sdks/firectl/firectl

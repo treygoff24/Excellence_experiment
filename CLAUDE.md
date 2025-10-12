@@ -35,8 +35,9 @@ This document orients Claude (and similar LLM agents) to the project’s structu
 - `--resume` (skip completed parts using per‑trial manifest)
 - `--limit_items N`, `--skip_prepare`, `--skip_build`
 - `--dry_run` (synthesize results locally for offline iteration)
+- Shared-control cache automatically skips duplicate control jobs when temps/prompts match; registry is sanitized on resume.
 
-Environment: `.env` is loaded via python‑dotenv. Prefer `--account_id=slug` or omit entirely. Avoid `--account_id "$FIREWORKS_ACCOUNT_ID"` if the shell variable may be unset.
+Environment: `.env` is loaded via python-dotenv. Prefer `--account_id=slug` or omit entirely. Avoid `--account_id "$FIREWORKS_ACCOUNT_ID"` if the shell variable may be unset. The template value `fireworks` is **not** a usable team slug; replace it with your org’s slug before hitting the real API, or pass `--dry_run` for offline smokes.
 
 ## Key Config (eval_config.yaml)
 ```yaml

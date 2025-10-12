@@ -64,7 +64,7 @@ For the **local backend**:
 
 ## Recommended Usage
 
-- To run all prompts once from config sweep:
+- To run all prompts once from config sweep (recommended):
 
 ```powershell
 python -m scripts.run_all --config config\eval_config.local.yaml --limit_items 250 --parts_per_dataset 2

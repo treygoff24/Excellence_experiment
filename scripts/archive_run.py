@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import Dict, Any
 
 from scripts.state_utils import load_run_state
+from scripts.shared_controls import (
+    refresh_registry,
+    SHARED_CONTROL_DIRNAME,
+    control_registry_path,
+    CONTROL_REGISTRY_FILENAME,
+)
 
 
 def get_run_info_from_manifest(manifest_path: str) -> dict:
@@ -49,7 +55,9 @@ def create_experiment_archive(
     source_dirs: dict,
     run_info: dict,
     experiments_dir: str = "experiments",
-    experiment_name: str = None
+    experiment_name: str | None = None,
+    *,
+    control_registry_src: str | None = None,
 ) -> str:
     """Archive experiment files to experiments directory."""
 
@@ -60,11 +68,11 @@ def create_experiment_archive(
     os.makedirs(archive_path, exist_ok=True)
 
     # Create subdirectories
-    subdirs = ["batch_inputs", "results", "reports"]
+    subdirs = ["batch_inputs", "results", "reports", SHARED_CONTROL_DIRNAME]
     for subdir in subdirs:
         os.makedirs(os.path.join(archive_path, subdir), exist_ok=True)
 
-    archived_files = {"batch_inputs": [], "results": [], "reports": []}
+    archived_files = {subdir: [] for subdir in subdirs}
 
     # Move files from each source directory
     for dest_subdir, source_dir in source_dirs.items():
@@ -79,12 +87,17 @@ def create_experiment_archive(
 
             if os.path.isfile(source_path):
                 shutil.move(source_path, dest_path)
-                archived_files[dest_subdir].append(item)
+                archived_files.setdefault(dest_subdir, []).append(item)
                 print(f"Moved: {source_path} -> {dest_path}")
             elif os.path.isdir(source_path):
                 shutil.move(source_path, dest_path)
-                archived_files[dest_subdir].append(f"{item}/")
+                archived_files.setdefault(dest_subdir, []).append(f"{item}/")
                 print(f"Moved directory: {source_path} -> {dest_path}")
+
+    if control_registry_src and os.path.exists(control_registry_src):
+        dest_path = os.path.join(archive_path, CONTROL_REGISTRY_FILENAME)
+        shutil.copy2(control_registry_src, dest_path)
+        archived_files.setdefault("root", []).append(CONTROL_REGISTRY_FILENAME)
 
     # Create archive manifest
     archive_manifest: Dict[str, Any] = {
@@ -158,9 +171,11 @@ def main():
     source_dirs = {
         "batch_inputs": args.batch_inputs_dir,
         "results": args.results_dir,
-        "reports": args.reports_dir
+        "reports": args.reports_dir,
+        SHARED_CONTROL_DIRNAME: os.path.join(run_root, SHARED_CONTROL_DIRNAME),
     }
 
+    shared_registry_src = control_registry_path(run_root)
     if args.dry_run:
         print("DRY RUN - Files that would be archived:")
         for dest_subdir, source_dir in source_dirs.items():
@@ -168,6 +183,8 @@ def main():
                 files = os.listdir(source_dir)
                 if files:
                     print(f"  {dest_subdir}/: {', '.join(files)}")
+        if os.path.exists(shared_registry_src):
+            print(f"  control_registry.json (path: {shared_registry_src})")
         return
 
     # Confirm archiving
@@ -186,11 +203,14 @@ def main():
 
     # Create archive
     try:
+        if os.path.exists(shared_registry_src):
+            refresh_registry(run_root)
         archive_path = create_experiment_archive(
             source_dirs=source_dirs,
             run_info=run_info,
             experiments_dir=args.experiments_dir,
-            experiment_name=experiment_name
+            experiment_name=experiment_name,
+            control_registry_src=shared_registry_src if os.path.exists(shared_registry_src) else None,
         )
 
         print(f"✅ Experiment archived successfully: {archive_path}")

@@ -1,10 +1,10 @@
 backend: local
 local_engine: ollama
 local_endpoint: "http://127.0.0.1:11434"
-# Use an Ollama tag that fits 16GB VRAM comfortably
-model_id: "llama3.1:8b-instruct-q4_K_M"
-local_model: "llama3.1:8b-instruct-q4_K_M"
-tokenizer: "llama-3"
+# Use the GPU-optimized GPT-OSS 20B variant configured locally
+model_id: "gpt-oss-20b-gpu"
+local_model: "gpt-oss-20b-gpu"
+tokenizer: "gpt-oss"
 # Set to true to record GPU telemetry via NVML (requires pynvml and NVIDIA drivers)
 enable_local_telemetry: false
 

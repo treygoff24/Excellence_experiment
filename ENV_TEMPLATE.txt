@@ -1,8 +1,10 @@
 FIREWORKS_API_KEY=sk-your-key-here
 # Set your Fireworks account slug, NOT an email. Examples:
-#   fireworks
 #   my-team
-# You may also set a full resource like accounts/fireworks; the scripts will extract the slug.
-FIREWORKS_ACCOUNT_ID=fireworks
+#   research-lab
+# You may also set a full resource like accounts/my-team; the scripts will extract the slug.
+# NOTE: the literal slug "fireworks" is reserved by Fireworks and will 403. Use your team slug instead.
+# For offline smoke runs, leave the slug unset and pass --dry_run to scripts.run_all.
+FIREWORKS_ACCOUNT_ID=
 # Optional override; default is https://api.fireworks.ai
 # FIREWORKS_API_BASE=https://api.fireworks.ai

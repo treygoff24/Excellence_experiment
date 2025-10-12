@@ -12,7 +12,7 @@ import csv
 import tarfile
 import zipfile
 import gzip
-import shutil
+from typing import Iterable
 try:
     import fcntl  # POSIX-only; guarded where used
 except Exception:  # pragma: no cover
@@ -33,7 +33,10 @@ from scripts.state_utils import (
     run_state_path,
     StopToken,
     compute_config_hash,
+    write_control_registry,
+    control_registry_path,
 )
+from scripts.shared_controls import refresh_registry
 
 
 def _split_list_arg(val) -> list[str]:
@@ -146,6 +149,201 @@ def _make_dataset_display_name(ps_name: str, t_label: str, cond: str, run_id: st
     return base3[:63]
 
 
+def _prompt_suffix(ps_name: str, prompt_sets_cfg: dict[str, dict]) -> str:
+    include_ps = len(prompt_sets_cfg) > 1 or (ps_name not in ("default", None))
+    return f"_{ps_name}" if include_ps else ""
+
+
+def _ensure_config_temps_and_samples(cfg: dict, temps: Iterable[float]) -> None:
+    temps_set = {float(t) for t in temps if t is not None}
+    if not temps_set:
+        return
+
+    # Normalize samples_per_item keys to stringified floats
+    raw_samples = cfg.get("samples_per_item") or {}
+    normalized: dict[str, int] = {}
+    for key, val in raw_samples.items():
+        try:
+            normalized[str(float(key))] = int(val)
+        except Exception:
+            continue
+    if not normalized:
+        normalized = {"0.0": 1}
+
+    default_k = next(iter(normalized.values()), 1)
+    updated_samples = False
+    for temp in sorted(temps_set):
+        key = str(float(temp))
+        if key not in normalized:
+            print(f"INFO: samples_per_item missing entry for T={float(temp):.1f}; defaulting to {default_k}")
+            normalized[key] = default_k
+            updated_samples = True
+
+    if updated_samples or normalized != raw_samples:
+        cfg["samples_per_item"] = normalized
+
+    prev_temps = cfg.get("temps") or []
+    prev_set = {float(t) for t in prev_temps}
+    if temps_set - prev_set:
+        cfg["temps"] = sorted(prev_set.union(temps_set))
+
+
+def _backend_tag(is_local_backend: bool) -> str:
+    return "local" if is_local_backend else "fireworks"
+
+
+def _compute_control_key(
+    *,
+    run_id: str,
+    backend: str,
+    model_id: str,
+    temp: float,
+    top_p: float | None,
+    top_k: int | None,
+    max_new_tokens: dict | None,
+    samples_per_item: dict,
+    control_prompt_sha: str,
+    input_sha: str,
+) -> str:
+    payload = {
+        "run_id": run_id,
+        "backend": backend,
+        "model_id": model_id,
+        "temp": float(temp),
+        "top_p": top_p,
+        "top_k": top_k,
+        "max_new_tokens": max_new_tokens or {},
+        "samples_per_item": samples_per_item,
+        "control_prompt_sha": control_prompt_sha,
+        "input_sha": input_sha,
+    }
+    encoded = json.dumps(payload, sort_keys=True, default=float).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+SHARED_CONTROL_DIRNAME = "shared_controls"
+
+
+def _parse_custom_id(cid: str) -> tuple[str, str, str, float, int, str]:
+    parts = cid.split("|")
+    if len(parts) != 6:
+        raise ValueError(f"Bad custom_id: {cid}")
+    dataset, item_id, condition, temp_str, sample_str, typ = parts
+    return dataset, item_id, condition, float(temp_str), int(sample_str), typ
+
+
+def _shared_control_dir(run_root: str, key: str) -> str:
+    return os.path.join(run_root, SHARED_CONTROL_DIRNAME, key)
+
+
+def _shared_control_manifest_path(shared_dir: str) -> str:
+    return os.path.join(shared_dir, "control_manifest.json")
+
+
+def _load_build_manifest(batch_dir: str) -> dict | None:
+    path = os.path.join(batch_dir, "build_manifest.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _lookup_shard_meta(manifest: dict | None, filename: str) -> dict | None:
+    if not manifest:
+        return None
+    shards = (manifest.get("shards") or {}) if isinstance(manifest, dict) else {}
+    if not shards:
+        return None
+    return shards.get(filename) or shards.get(os.path.basename(filename))
+
+
+def _control_entry_files_exist(run_root: str, entry: dict) -> bool:
+    if not entry or entry.get("status") != "completed":
+        return False
+    shared_rel = entry.get("shared_rel")
+    files = entry.get("files") or {}
+    if not shared_rel or not isinstance(files, dict):
+        return False
+    shared_dir = os.path.join(run_root, shared_rel)
+    for rel_name in files.values():
+        if not rel_name:
+            return False
+        if not os.path.isfile(os.path.join(shared_dir, rel_name)):
+            return False
+    return True
+
+
+def _filter_jsonl_by_condition(src_path: str, dest_path: str, *, condition: str, temp: float | None = None) -> int:
+    count = 0
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    try:
+        with open(src_path, "r", encoding="utf-8") as src, open(dest_path, "w", encoding="utf-8") as dst:
+            for line in src:
+                raw = line.rstrip("\n")
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+                cid = obj.get("custom_id") or obj.get("customId")
+                if not cid:
+                    continue
+                try:
+                    _dataset, _item, cond, t_val, _sample, _typ = _parse_custom_id(str(cid))
+                except Exception:
+                    cond = None
+                    t_val = None
+                if cond != condition:
+                    continue
+                if temp is not None:
+                    try:
+                        if abs(float(t_val) - float(temp)) > 1e-6:
+                            continue
+                    except Exception:
+                        continue
+                dst.write(raw + "\n")
+                count += 1
+    except FileNotFoundError:
+        return 0
+    return count
+
+
+def _export_shared_control_artifacts(*, results_dir: str, shared_dir: str, temp: float | None) -> dict:
+    os.makedirs(shared_dir, exist_ok=True)
+    export: dict[str, dict] = {"files": {}, "counts": {}}
+
+    combined_src = os.path.join(results_dir, "results_combined.jsonl")
+    combined_dest = os.path.join(shared_dir, "control_results.jsonl")
+    res_count = _filter_jsonl_by_condition(combined_src, combined_dest, condition="control", temp=temp)
+    export["files"]["results_jsonl"] = os.path.basename(combined_dest)
+    export["counts"]["results_jsonl"] = res_count
+
+    meta_path = os.path.join(shared_dir, "control_metadata.json")
+    export["files"]["metadata"] = os.path.basename(meta_path)
+    export["counts"]["metadata"] = 1
+    export["counts"]["temp"] = temp
+    export["counts"]["results_dir"] = results_dir
+    export["metadata"] = {
+        "temp": temp,
+        "created_at": _now_iso(),
+        "source_results_dir": os.path.abspath(results_dir),
+        "counts": export["counts"],
+    }
+    try:
+        with open(meta_path, "w", encoding="utf-8") as mf_out:
+            json.dump(export["metadata"], mf_out, indent=2)
+    except Exception:
+        pass
+
+    return export
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
 def _expand_trials(cfg: dict, args) -> list[dict]:
     aliases = cfg.get("model_aliases", {}) or {}
     cli_models = _split_list_arg(getattr(args, "models", None))
@@ -192,6 +390,7 @@ def _expand_trials(cfg: dict, args) -> list[dict]:
             md_full = _resolve_model_id(md, aliases)
             ps = tr.get("prompt_set") or default_ps
             temps = tr.get("temps") or base_temps
+            _ensure_config_temps_and_samples(cfg, temps)
             trial = {
                 "id": tr.get("id"),
                 "model_id": md_full,
@@ -238,6 +437,7 @@ def _expand_trials(cfg: dict, args) -> list[dict]:
         sw_ps = (cli_ps if cli_ps_provided else (sw.get("prompt_sets") or base_ps))
         # If CLI temps supplied, base_temps already reflects them; otherwise allow sweep temps or base temps
         sw_temps = (base_temps if cli_temps_provided else (sw.get("temps") or base_temps))
+        _ensure_config_temps_and_samples(cfg, sw_temps)
         sw_top_p = sw.get("top_p") or [base_top_p]
         sw_top_k = sw.get("top_k") or [base_top_k]
         mx_sw = sw.get("max_new_tokens")
@@ -256,6 +456,8 @@ def _expand_trials(cfg: dict, args) -> list[dict]:
         sw_top_k = [base_top_k]
         mx_list = [base_mx]
 
+    _ensure_config_temps_and_samples(cfg, sw_temps)
+
     for m in sw_models:
         m_full = _resolve_model_id(m, aliases)
         for ps in sw_ps:
@@ -272,6 +474,7 @@ def _expand_trials(cfg: dict, args) -> list[dict]:
                             "max_new_tokens": mx,
                         })
     if not trials:
+        _ensure_config_temps_and_samples(cfg, base_temps)
         trials.append({
             "id": None,
             "model_id": models_full[0],
@@ -601,17 +804,38 @@ def main():
     run_id = args.run_id or datetime.utcnow().strftime("r%Y%m%d%H%M%S")
 
     # Expand trials and determine run root
-    experiments_dir = cfg.get("paths", {}).get("experiments_dir", "experiments")
+    experiments_dir = (cfg.get("paths", {}) or {}).get("experiments_dir") or "experiments"
     trials = _expand_trials(cfg, args)
-    use_exp_root = os.path.exists(experiments_dir)
+    use_exp_root = bool(experiments_dir)
+    if use_exp_root:
+        try:
+            os.makedirs(experiments_dir, exist_ok=True)
+        except Exception as e:
+            print(f"WARNING: Failed to ensure experiments dir '{experiments_dir}': {e}. Falling back to shared results dir.")
+            use_exp_root = False
+    control_registry: dict | None = None
+    control_registry_dirty = False
     if use_exp_root:
         run_root = os.path.join(experiments_dir, f"run_{run_id}")
         os.makedirs(run_root, exist_ok=True)
         cfg["paths"]["batch_inputs_dir"] = os.path.join(run_root, "batch_inputs")
         multi_manifest_path = os.path.join(run_root, "multi_trial_manifest.json")
+        control_registry = refresh_registry(run_root)
+        control_registry.setdefault("controls", {})
+        os.makedirs(os.path.join(run_root, SHARED_CONTROL_DIRNAME), exist_ok=True)
     else:
         run_root = None
         multi_manifest_path = cfg["paths"]["run_manifest"]
+
+    def _flush_control_registry() -> None:
+        nonlocal control_registry_dirty
+        if not (use_exp_root and control_registry_dirty and control_registry is not None):
+            return
+        try:
+            write_control_registry(run_root, control_registry)
+            control_registry_dirty = False
+        except Exception as e:
+            print(f"WARNING: Failed to write control registry: {e}")
 
     # When using experiments dir, persist an effective config so subprocesses see updated paths
     effective_config_path = args.config
@@ -625,6 +849,11 @@ def main():
 
     # Compute the ordered phases and gating selection
     PHASES = ["prepare","build","submit","poll","parse","score","stats","costs","report"]
+    if args.dry_run:
+        selected_dry_run_skip = {"parse","score","stats","costs","report"}
+    else:
+        selected_dry_run_skip = set()
+
     def _compute_phase_selection() -> list[str]:
         if args.only_step:
             return [args.only_step]
@@ -640,7 +869,7 @@ def main():
             return PHASES[:PHASES.index(args.to_step)+1]
         return PHASES[:]
 
-    selected_phases = _compute_phase_selection()
+    selected_phases = [ph for ph in _compute_phase_selection() if ph not in selected_dry_run_skip]
 
     # Helpers to extract any JSONL files from downloaded bundles
     def _try_extract_jsonls(bundle_path: str, out_dir: str) -> list[str]:
@@ -808,7 +1037,7 @@ def main():
             top_p = trial.get("top_p", cfg.get("top_p"))
             top_k = trial.get("top_k", cfg.get("top_k"))
             mx = trial.get("max_new_tokens") or cfg.get("max_new_tokens", {"closed_book": 1024, "open_book": 1024})
-            if os.path.exists(experiments_dir):
+            if use_exp_root:
                 slug = _trial_slug(model_id, ps_name, top_p, top_k, mx, aliases=cfg.get("model_aliases") or {})
                 trial_root = os.path.join(experiments_dir, f"run_{run_id}", slug)
                 results_dir = os.path.join(trial_root, "results")
@@ -1001,12 +1230,19 @@ def main():
         account_id = "local"
     else:
         account_id = _derive_account_id(args.account_id) if not args.dry_run else "dryrun"
+        if account_id == "fireworks":
+            raise SystemExit(
+                "FIREWORKS_ACCOUNT_ID resolved to 'fireworks'.\n"
+                "That slug is reserved by Fireworks and will reject dataset uploads (HTTP 403).\n"
+                "Set FIREWORKS_ACCOUNT_ID to your team slug (e.g., 'my-team') or rerun with --dry_run for offline smoke tests."
+            )
     conditions: list[str] = [args.condition] if args.condition in ("control", "treatment") else ["control", "treatment"]
     # Submit datasets and jobs per trial and write per-trial manifests
     prompt_sets_cfg = cfg.get("prompt_sets") or {}
     default_ps = cfg.get("default_prompt_set") or (sorted(list(prompt_sets_cfg.keys()))[0] if prompt_sets_cfg else "default")
     # Submit phase: iterate over trials correctly (fixes loop scoping bug)
     def _submit_one_trial(trial: dict) -> None:
+        nonlocal control_registry_dirty
         model_id = trial["model_id"]
         ps_name = trial.get("prompt_set") or default_ps
         temps = trial.get("temps") or (cfg.get("temps") or [0.0])
@@ -1015,7 +1251,7 @@ def main():
         mx = trial.get("max_new_tokens") or cfg.get("max_new_tokens", {"closed_book": 1024, "open_book": 1024})
 
         # Trial directories
-        if os.path.exists(experiments_dir):
+        if use_exp_root:
             slug = _trial_slug(model_id, ps_name, top_p, top_k, mx, aliases=cfg.get("model_aliases") or {})
             trial_root = os.path.join(experiments_dir, f"run_{run_id}", slug)
             results_dir = os.path.join(trial_root, "results")
@@ -1072,19 +1308,102 @@ def main():
         trial_manifest.setdefault("jobs", {})
         trial_manifest.setdefault("job_status", {})
         trial_manifest.setdefault("job_counts", {})
+        trial_manifest.setdefault("control_registry", {})
+        build_manifest = _load_build_manifest(cfg["paths"]["batch_inputs_dir"])
 
         for temp in temps:
             t_str = _format_temp_label(float(temp))
             for cond in conditions:
                 suffix = f"_{ps_name}" if (len(prompt_sets_cfg) > 1 or ps_name not in ("default", None)) else ""
                 jsonl_path = os.path.join(cfg["paths"]["batch_inputs_dir"], f"t{t_str}{suffix}_{cond}.jsonl")
-                # Keep the human-readable trial display separate from dataset names (which must be short)
                 display_name = f"excellence-{ps_name}-t{t_str}-{cond}-{run_id}"
                 if not os.path.isfile(jsonl_path):
                     raise SystemExit(f"Missing input file: {jsonl_path}")
 
-                # Split the dataset into parts (local or Fireworks)
                 base_prefix = f"t{t_str}{suffix}_{cond}"
+                if use_exp_root and cond == "control":
+                    try:
+                        samples_cfg = cfg["samples_per_item"]
+                    except Exception:
+                        samples_cfg = {}
+                    ctrl_prompt_sha = trial_manifest["prompts"]["control"].get("sha256")
+                    shard_meta = _lookup_shard_meta(build_manifest, os.path.basename(jsonl_path))
+                    shard_sha = str((shard_meta or {}).get("sha256") or "").strip()
+                    if not shard_sha:
+                        shard_sha = _sha256_file(jsonl_path)
+                    ctrl_key = _compute_control_key(
+                        run_id=run_id,
+                        backend=_backend_tag(is_local_backend),
+                        model_id=model_id,
+                        temp=float(temp),
+                        top_p=top_p,
+                        top_k=top_k,
+                        max_new_tokens=mx,
+                        samples_per_item=samples_cfg,
+                        control_prompt_sha=ctrl_prompt_sha,
+                        input_sha=shard_sha,
+                    )
+                    label = f"t{t_str}"
+                    entry = trial_manifest.setdefault("control_registry", {}).setdefault(label, {})
+                    entry.update({
+                        "key": ctrl_key,
+                        "temp": float(temp),
+                    })
+                    reg_controls = control_registry.setdefault("controls", {}) if control_registry is not None else {}
+                    reg_entry = reg_controls.get(ctrl_key)
+                    shared_rel = (
+                        reg_entry.get("shared_rel")
+                        if reg_entry and reg_entry.get("shared_rel")
+                        else os.path.join(SHARED_CONTROL_DIRNAME, ctrl_key)
+                    )
+                    entry["shared_rel"] = shared_rel
+                    if reg_entry and _control_entry_files_exist(run_root, reg_entry):
+                        entry.update({
+                            "mode": "reuse",
+                            "status": reg_entry.get("status", "completed"),
+                            "source_trial": reg_entry.get("producer_trial"),
+                            "files": reg_entry.get("files", {}),
+                            "counts": reg_entry.get("counts", {}),
+                        })
+                        if not entry.get("files"):
+                            entry["files"] = reg_entry.get("files", {})
+                        if not entry.get("counts"):
+                            entry["counts"] = reg_entry.get("counts", {})
+                        trial_manifest.setdefault("datasets", {})[f"t{t_str}_{cond}"] = []
+                        trial_manifest.setdefault("jobs", {})[f"t{t_str}_{cond}"] = []
+                        trial_manifest.setdefault("job_status", {})
+                        continue
+                    else:
+                        producer_slug = slug if use_exp_root else trial_manifest["trial"].get("id")
+                        entry.update({
+                            "mode": "producer",
+                            "status": "pending",
+                            "producer_trial": producer_slug,
+                        })
+                        if control_registry is not None:
+                            reg_info = reg_entry or {}
+                            reg_info.update({
+                                "status": "pending",
+                                "shared_rel": shared_rel,
+                                "created_at": reg_info.get("created_at") or _now_iso(),
+                                "producer_trial": producer_slug,
+                                "prompt_sha": ctrl_prompt_sha,
+                                "input_sha": shard_sha,
+                                "backend": _backend_tag(is_local_backend),
+                                "model_id": model_id,
+                                "temp": float(temp),
+                            })
+                            reg_controls[ctrl_key] = reg_info
+                            control_registry_dirty = True
+
+                if use_exp_root and cond == "control":
+                    entry = trial_manifest.setdefault("control_registry", {}).get(f"t{t_str}", {})
+                    if entry.get("mode") == "reuse" and entry.get("status") == "completed":
+                        trial_manifest.setdefault("datasets", {})[f"t{t_str}_{cond}"] = []
+                        trial_manifest.setdefault("jobs", {})[f"t{t_str}_{cond}"] = []
+                        trial_manifest.setdefault("job_status", {})
+                        continue
+
                 if is_local_backend:
                     part_files = local_split_jsonl(
                         jsonl_path,
@@ -1094,17 +1413,6 @@ def main():
                         lines_per_part=(int(args.lines_per_part) if args.lines_per_part is not None else None),
                         limit_items=(int(args.limit_items) if args.limit_items is not None else None),
                     )
-                    queue = LocalCreateQueue(
-                        account_id=account_id,
-                        model_id=model_id,
-                        config=cfg,
-                        max_concurrent=int(cfg.get("max_concurrent_requests", 1)),
-                        temp_label=t_str,
-                        temperature=float(temp),
-                        condition=cond,
-                        run_id=run_id,
-                        stop_event=stop_token,
-                    )
                 else:
                     part_files = _split_jsonl_file(
                         jsonl_path,
@@ -1113,18 +1421,6 @@ def main():
                         parts=(int(args.parts_per_dataset) if (args.lines_per_part is None and args.parts_per_dataset is not None) else None),
                         lines_per_part=(int(args.lines_per_part) if args.lines_per_part is not None else None),
                         limit_items=(int(args.limit_items) if args.limit_items is not None else None),
-                    )
-                    # Enforce Fireworks batch concurrency via QueueManager
-                    queue = QueueManager(
-                        account_id=account_id,
-                        model_id=model_id,
-                        config=cfg,
-                        max_concurrent=int(args.max_concurrent_jobs) if args.max_concurrent_jobs else 4,
-                        temp_label=t_str,
-                        temperature=float(temp),
-                        condition=cond,
-                        run_id=run_id,
-                        stop_event=stop_token,
                     )
                 # If resuming and this temp/cond appears complete in manifest, skip queueing
                 resume_key = f"t{t_str}_{cond}"
@@ -1179,6 +1475,36 @@ def main():
                 # Upload each part (Fireworks) or enqueue local work
                 dsids_for_cond: list[str] = []
                 planned_jobs: list[tuple[int, str]] = []
+                queue = None
+
+                def _ensure_queue():
+                    nonlocal queue
+                    if queue is None:
+                        if is_local_backend:
+                            queue = LocalCreateQueue(
+                                account_id=account_id,
+                                model_id=model_id,
+                                config=cfg,
+                                max_concurrent=int(args.max_concurrent_jobs or 1),
+                                temp_label=t_str,
+                                temperature=float(temp),
+                                condition=cond,
+                                run_id=run_id,
+                                stop_event=stop_token,
+                            )
+                        else:
+                            queue = QueueManager(
+                                account_id=account_id,
+                                model_id=model_id,
+                                config=cfg,
+                                max_concurrent=int(args.max_concurrent_jobs or 4),
+                                temp_label=t_str,
+                                temperature=float(temp),
+                                condition=cond,
+                                run_id=run_id,
+                                stop_event=stop_token,
+                            )
+                    return queue
                 for part_number, part_path in part_files:
                     # Per-part resume: skip parts already completed AND downloaded
                     jkey_resume = f"{resume_key}_p{part_number:02d}"
@@ -1239,7 +1565,7 @@ def main():
                             os.makedirs(job_dir, exist_ok=True)
                             open(os.path.join(job_dir, "results.jsonl"), "w", encoding="utf-8").close()
                         else:
-                            queue.add_job(part_number, part_path)
+                            _ensure_queue().add_job(part_number, part_path)
                         # Track placeholder in manifest to aid resume logic
                         trial_manifest.setdefault("jobs", {}).setdefault(f"t{t_str}_{cond}", [])
                         arr = trial_manifest["jobs"][f"t{t_str}_{cond}"]
@@ -1256,8 +1582,8 @@ def main():
                             remote_fname = os.path.basename(part_path)
                             upload_dataset_file(account_id, dsid, part_path, filename=remote_fname)
                         dsids_for_cond.append(dsid)
-                        queue.add_job(part_number, "", dsid)
                         planned_jobs.append((part_number, dsid))
+                        _ensure_queue().add_job(part_number, "", dsid)
                 trial_manifest["datasets"][f"t{t_str}_{cond}"] = dsids_for_cond
                 # Initialize manifest job_status entries before running the queue
                 trial_manifest.setdefault("job_status", {})
@@ -1379,7 +1705,8 @@ def main():
                         continue
 
                     try:
-                        queue.run_queue_simulated(results_dir)
+                        if queue is not None:
+                            queue.run_queue_simulated(results_dir)
                     except Exception:
                         pass
 
@@ -1422,97 +1749,98 @@ def main():
                     continue
 
                 # Real execution path
-                try:
-                    stop_token.check()
-                except Exception:
-                    print("Stop requested before queue; skipping remaining submissions for this condition")
-                    continue
+                if queue is not None:
+                    try:
+                        stop_token.check()
+                    except Exception:
+                        print("Stop requested before queue; skipping remaining submissions for this condition")
+                        continue
 
-                if is_local_backend:
-                    def _local_progress_cb(ev: dict) -> None:
-                        try:
-                            jkey = ev.get("job_key")
-                            if not jkey:
-                                return
-                            status = str(ev.get("status") or ev.get("event") or "completed").lower()
-                            trial_manifest.setdefault("job_status", {})
-                            if status in {"completed", "completed_with_errors", "skipped"}:
-                                trial_manifest["job_status"][jkey] = "completed"
-                            elif status in {"failed", "error"}:
-                                trial_manifest["job_status"][jkey] = "failed"
-                            else:
-                                trial_manifest["job_status"][jkey] = status
-                            counts = trial_manifest.setdefault("job_counts", {})
-                            counts[jkey] = {
-                                "items_in": int(ev.get("items_in") or 0),
-                                "items_out": int(ev.get("items_out") or 0),
-                                "errors": int(ev.get("errors") or 0),
-                            }
-                            telemetry_payload = ev.get("telemetry")
-                            if telemetry_payload is not None:
-                                counts[jkey]["telemetry"] = telemetry_payload
-                            mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
-                        except Exception:
-                            pass
-
-                    queue.progress_cb = _local_progress_cb  # type: ignore[attr-defined]
-                    completed_jobs = queue.run_queue(results_dir) or []
-                    mismatches = []
-                    for summary in completed_jobs:
-                        try:
-                            jkey = summary.get("job_key")
-                            items_in = int(summary.get("items_in") or 0)
-                            items_out = int(summary.get("items_out") or 0)
-                            if items_in and items_out and items_in != items_out:
-                                mismatches.append((jkey, items_in, items_out))
-                            if jkey and summary.get("telemetry"):
-                                counts = trial_manifest.setdefault("job_counts", {})
-                                counts.setdefault(jkey, {})
-                                counts[jkey]["telemetry"] = summary.get("telemetry")
-                        except Exception:
-                            continue
-                    if mismatches:
-                        print("WARNING: Local backend row mismatches detected:")
-                        for jkey, items_in, items_out in mismatches:
-                            print(f"  - {jkey}: inputs={items_in}, outputs={items_out}")
-                    mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
-                else:
-                    def _progress_cb(ev: dict):
-                        try:
-                            jkey = ev.get("job_key")
-                            if jkey:
+                    if is_local_backend:
+                        def _local_progress_cb(ev: dict) -> None:
+                            try:
+                                jkey = ev.get("job_key")
+                                if not jkey:
+                                    return
+                                status = str(ev.get("status") or ev.get("event") or "completed").lower()
                                 trial_manifest.setdefault("job_status", {})
-                                if ev.get("event") == "submitted":
-                                    trial_manifest["job_status"][jkey] = "submitted"
-                                    job_name = ev.get("job_name")
-                                    grp = jkey.rsplit("_p", 1)[0]
-                                    trial_manifest.setdefault("jobs", {})
-                                    arr = trial_manifest["jobs"].setdefault(grp, [])
-                                    try:
-                                        idx = int(jkey.split("_p")[-1]) - 1
-                                        if idx >= len(arr):
-                                            arr.extend([None] * (idx + 1 - len(arr)))
-                                        arr[idx] = job_name
-                                    except Exception:
-                                        pass
-                                elif ev.get("event") == "state":
-                                    st = ev.get("state")
-                                    if st:
-                                        trial_manifest["job_status"][jkey] = str(st).lower()
-                                elif ev.get("event") in {"downloaded", "download_pending"}:
+                                if status in {"completed", "completed_with_errors", "skipped"}:
                                     trial_manifest["job_status"][jkey] = "completed"
-                            mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
-                        except Exception:
-                            pass
+                                elif status in {"failed", "error"}:
+                                    trial_manifest["job_status"][jkey] = "failed"
+                                else:
+                                    trial_manifest["job_status"][jkey] = status
+                                counts = trial_manifest.setdefault("job_counts", {})
+                                counts[jkey] = {
+                                    "items_in": int(ev.get("items_in") or 0),
+                                    "items_out": int(ev.get("items_out") or 0),
+                                    "errors": int(ev.get("errors") or 0),
+                                }
+                                telemetry_payload = ev.get("telemetry")
+                                if telemetry_payload is not None:
+                                    counts[jkey]["telemetry"] = telemetry_payload
+                                mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+                            except Exception:
+                                pass
 
-                    queue.progress_cb = _progress_cb  # type: ignore[attr-defined]
-                    queue.run_queue(results_dir)
+                        queue.progress_cb = _local_progress_cb  # type: ignore[attr-defined]
+                        completed_jobs = queue.run_queue(results_dir) or []
+                        mismatches = []
+                        for summary in completed_jobs:
+                            try:
+                                jkey = summary.get("job_key")
+                                items_in = int(summary.get("items_in") or 0)
+                                items_out = int(summary.get("items_out") or 0)
+                                if items_in and items_out and items_in != items_out:
+                                    mismatches.append((jkey, items_in, items_out))
+                                if jkey and summary.get("telemetry"):
+                                    counts = trial_manifest.setdefault("job_counts", {})
+                                    counts.setdefault(jkey, {})
+                                    counts[jkey]["telemetry"] = summary.get("telemetry")
+                            except Exception:
+                                continue
+                        if mismatches:
+                            print("WARNING: Local backend row mismatches detected:")
+                            for jkey, items_in, items_out in mismatches:
+                                print(f"  - {jkey}: inputs={items_in}, outputs={items_out}")
+                        mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+                    else:
+                        def _progress_cb(ev: dict):
+                            try:
+                                jkey = ev.get("job_key")
+                                if jkey:
+                                    trial_manifest.setdefault("job_status", {})
+                                    if ev.get("event") == "submitted":
+                                        trial_manifest["job_status"][jkey] = "submitted"
+                                        job_name = ev.get("job_name")
+                                        grp = jkey.rsplit("_p", 1)[0]
+                                        trial_manifest.setdefault("jobs", {})
+                                        arr = trial_manifest["jobs"].setdefault(grp, [])
+                                        try:
+                                            idx = int(jkey.split("_p")[-1]) - 1
+                                            if idx >= len(arr):
+                                                arr.extend([None] * (idx + 1 - len(arr)))
+                                            arr[idx] = job_name
+                                        except Exception:
+                                            pass
+                                    elif ev.get("event") == "state":
+                                        st = ev.get("state")
+                                        if st:
+                                            trial_manifest["job_status"][jkey] = str(st).lower()
+                                    elif ev.get("event") in {"downloaded", "download_pending"}:
+                                        trial_manifest["job_status"][jkey] = "completed"
+                                mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
+                            except Exception:
+                                pass
 
-                # Persist the job name (if available) for bookkeeping (Fireworks only)
-                if not is_local_backend:
-                    jnames = [j.job_name for j in queue.jobs if getattr(j, "job_name", None)]
-                    if jnames:
-                        trial_manifest["jobs"][f"t{t_str}_{cond}"] = jnames
+                        queue.progress_cb = _progress_cb  # type: ignore[attr-defined]
+                        queue.run_queue(results_dir)
+
+                    # Persist the job name (if available) for bookkeeping (Fireworks only)
+                    if not is_local_backend:
+                        jnames = [j.job_name for j in queue.jobs if getattr(j, "job_name", None)]
+                        if jnames:
+                            trial_manifest["jobs"][f"t{t_str}_{cond}"] = jnames
 
         # Write per-trial manifest
         mf.write_manifest(os.path.join(results_dir, "trial_manifest.json"), trial_manifest)
@@ -1530,6 +1858,7 @@ def main():
             with RunStateLock(run_root):
                 update_phase(state, "submit", status="completed")
                 write_json_atomic(run_state_path(run_root), state)
+        _flush_control_registry()
     else:
         print("Gating: skipping submit (already done or not selected)")
 
@@ -1617,7 +1946,7 @@ def main():
         top_p = trial.get("top_p", cfg.get("top_p"))
         top_k = trial.get("top_k", cfg.get("top_k"))
         mx = trial.get("max_new_tokens") or cfg.get("max_new_tokens", {"closed_book": 1024, "open_book": 1024})
-        if os.path.exists(experiments_dir):
+        if use_exp_root:
             slug = _trial_slug(model_id, ps_name, top_p, top_k, mx, aliases=cfg.get("model_aliases") or {})
             trial_root = os.path.join(experiments_dir, f"run_{run_id}", slug)
             results_dir = os.path.join(trial_root, "results")
@@ -1700,6 +2029,42 @@ def main():
                         continue
 
         print(f"Combined {combined_lines} unique items into {combined_path}")
+
+        if use_exp_root:
+            try:
+                manifest_ctrl = manifest.get("control_registry", {})
+                for label, info in manifest_ctrl.items():
+                    if info.get("mode") != "producer" or info.get("status") not in {"pending", "completed"}:
+                        continue
+                    shared_rel = info.get("shared_rel")
+                    if not shared_rel:
+                        continue
+                    shared_dir = os.path.join(run_root, shared_rel)
+                    exported = _export_shared_control_artifacts(results_dir=results_dir, shared_dir=shared_dir, temp=info.get("temp"))
+                    info.update({
+                        "status": "completed",
+                        "files": exported.get("files", {}),
+                        "counts": exported.get("counts", {}),
+                        "exported_at": _now_iso(),
+                    })
+                    manifest_ctrl[label] = info
+                    if control_registry is not None:
+                        controls = control_registry.setdefault("controls", {})
+                        reg_entry = controls.setdefault(info.get("key"), {})
+                        reg_entry.update({
+                            "status": "completed",
+                            "shared_rel": shared_rel,
+                            "files": exported.get("files", {}),
+                            "counts": exported.get("counts", {}),
+                            "completed_at": _now_iso(),
+                            "producer_trial": info.get("producer_trial") or manifest.get("trial", {}).get("id") or trial.get("id"),
+                        })
+                        control_registry_dirty = True
+                manifest["control_registry"] = manifest_ctrl
+                mf.write_manifest(manifest_path, manifest)
+            except Exception as _e:
+                print(f"WARNING: Failed to export shared control artifacts: {_e}")
+
         # Update manifest stage_status.downloaded based on current files
         try:
             st = mf.compute_stage_statuses(results_dir)
@@ -1710,6 +2075,10 @@ def main():
             print(f"WARNING: failed to update manifest stage_status.downloaded: {_e}")
         if combined_lines == 0:
             print("No parseable results found (.jsonl with custom_id). Skipping parse/score/stats/costs for this trial.")
+            continue
+
+        if args.dry_run:
+            print("Dry run: skipping parse/score/stats/costs/report phases for this trial.")
             continue
 
         # Parse predictions → CSV (gated)
@@ -1990,6 +2359,8 @@ def main():
             with RunStateLock(run_root):
                 update_phase(state, "report", status="completed")
                 write_json_atomic(run_state_path(run_root), state)
+
+    _flush_control_registry()
 
     # Write multi-trial summary
     multi_summary = {"created_utc": datetime.utcnow().isoformat() + "Z", "run_id": run_id, "num_trials": len(trials), "trials": all_trial_summaries}

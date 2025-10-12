@@ -7,6 +7,7 @@ Highlights
 - Exact causal tests (McNemar), paired bootstrap CIs, effect sizes, optional permutation tests, FDR.
 - Open/closed-book scoring with abstention, false answer (on unanswerables), and unsupported detection.
 - Cost tracking and cost-effectiveness; optional mixed-effects robustness models and sensitivity sweeps.
+- Shared-control cache that reuses deterministic control runs across trials/resumes (Fireworks + local backends).
 
 See `EXPERIMENT_WORKFLOW.md` for a walkthrough of the execution model and run layouts.
 
@@ -35,7 +36,8 @@ New in 2025
   - eval_config.yaml: main experiment config (model(s), temps, tokens, prompt sets, sweep/trials).
   - prompts/: control and treatment system prompts. task_instructions/: task-specific additions when applicable.
 - scripts/
-  - run_all.py: end-to-end orchestrator (prepare → build → submit → poll → parse → score → stats → costs → report → archive). STOP/resume, plan-only, from/to gating, per-trial manifests.
+  - run_all.py: end-to-end orchestrator (prepare → build → submit → poll → parse → score → stats → costs → report → archive). STOP/resume, plan-only, from/to gating, shared-control reuse, per-trial manifests.
+  - shared_controls.py: registry helpers for loading/sanitizing, exporting control caches, and iterating cached rows.
   - prepare_data.py, build_batches.py: data normalization and JSONL batch generation.
   - smoke_test.py, smoke_orchestration.py: offline flow and dry-run orchestration smokes.
   - generate_report.py, summarize_costs.py, compare_runs.py, resume_run.py, state_utils.py, manifest_v2.py, archive_run.py.
@@ -69,7 +71,8 @@ Excellence_experiment/
 ├── scripts/                # Orchestrator and utilities
 ├── experiments/            # Multi-trial runs under run_<RUN_ID>/ (ignored)
 ├── results/                # Simple-run outputs (ignored)
-└── reports/                # Simple-run reports (ignored)
+├── reports/                # Simple-run reports (ignored)
+└── shared_controls/        # Run-scoped cache of exported control artifacts
 ```
 
 Trial slug example: `gpt-oss-120b-operational_only-tp1-tk50-mx1024-1024`.
@@ -356,3 +359,10 @@ Commit and PR guidelines
   - `codex/TICKET_TEMPLATE.md`, `codex/LOG_TEMPLATE.md` (if present) standardize tickets and operational logs.
 - Orchestration planning
   - `docs/planning/stop_resume_design.md` — run_state.json schema, per-trial manifest v2, idempotent gating.
+
+### Shared-control reuse
+
+- Control keys include backend, model, prompt hash, input hash, temp, samples-per-item, max_new_tokens, and run_id to guarantee isolation per run.
+- Producers export canonical control JSONL + metadata into `experiments/run_<RUN_ID>/shared_controls/<key>/` and mark the registry entry completed.
+- When another trial encounters the same key, control submission is skipped, manifests receive `mode: reuse`, and downstream parse/score/stats hydrate rows from the shared cache.
+- `--resume` first refreshes `control_registry.json`, pruning stale entries and re-queueing only missing controls. Deleting a shared cache directory plus its registry entry forces regeneration.

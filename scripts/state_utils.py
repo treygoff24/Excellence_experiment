@@ -1,6 +1,8 @@
 from __future__ import annotations
 import os
 import json
+import stat
+import time
 try:
     import fcntl  # POSIX-only; calls are already best-effort guarded below
 except Exception:  # pragma: no cover
@@ -10,11 +12,12 @@ import tempfile
 import signal
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Iterable
 import yaml
 RUN_STATE_FILENAME = "run_state.json"
 STATE_LOCK_FILENAME = ".state.lock"
 STOP_FILENAME = "STOP_REQUESTED"
+CONTROL_REGISTRY_FILENAME = "control_registry.json"
 
 
 def _utc_now_iso() -> str:
@@ -44,15 +47,37 @@ def write_json_atomic(path: str, data: Dict[str, Any]) -> None:
             json.dump(data, tf, indent=2)
             tf.flush()
             os.fsync(tf.fileno())
-        # Atomic replace
-        os.replace(tmp, path)
-        tmp = None
+        # Atomic replace with Windows-hardened retries
+        attempts = 0
+        max_attempts = 5 if os.name == "nt" else 1
+        while True:
+            try:
+                os.replace(tmp, path)
+                tmp = None
+                break
+            except PermissionError:
+                attempts += 1
+                if os.name != "nt" or attempts >= max_attempts:
+                    raise
+                _windows_prepare_for_replace(path)
+                time.sleep(min(0.5, 0.1 * attempts))
     finally:
         if tmp and os.path.exists(tmp):
             try:
                 os.unlink(tmp)
             except Exception:
                 pass
+
+
+def _windows_prepare_for_replace(path: str) -> None:
+    """Best-effort adjustments so os.replace succeeds on Windows."""
+    if os.name != "nt" or not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except Exception:
+        pass
 
 @dataclass
 class RunStateLock:
@@ -108,6 +133,10 @@ def run_state_path(run_root: str) -> str:
     return os.path.join(run_root, RUN_STATE_FILENAME)
 
 
+def control_registry_path(run_root: str) -> str:
+    return os.path.join(run_root, CONTROL_REGISTRY_FILENAME)
+
+
 def load_run_state(run_root: str) -> Optional[Dict[str, Any]]:
     path = run_state_path(run_root)
     if not os.path.isfile(path):
@@ -144,6 +173,50 @@ def update_phase(state: Dict[str, Any], phase: str, *, status: str, error: Optio
     ph["updated_at"] = now
     if error is not None:
         ph["last_error"] = error
+
+
+def _ensure_controls_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    data.setdefault("schema_version", 1)
+    controls = data.get("controls")
+    if not isinstance(controls, dict):
+        data["controls"] = {}
+    return data
+
+
+def _cleanup_registry(data: Dict[str, Any], *, valid_keys: Iterable[str] | None = None) -> Dict[str, Any]:
+    if valid_keys is None:
+        return data
+    controls = data.get("controls") or {}
+    valid = set(valid_keys)
+    stale = [k for k in list(controls.keys()) if k not in valid]
+    for key in stale:
+        controls.pop(key, None)
+    if stale:
+        data["controls"] = controls
+    return data
+
+
+def load_control_registry(run_root: str, *, valid_keys: Iterable[str] | None = None) -> Dict[str, Any]:
+    path = control_registry_path(run_root)
+    if not os.path.isfile(path):
+        return {"schema_version": 1, "controls": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {"schema_version": 1, "controls": {}}
+    if not isinstance(data, dict):
+        return {"schema_version": 1, "controls": {}}
+    data = _ensure_controls_dict(data)
+    return _cleanup_registry(data, valid_keys=valid_keys)
+
+
+def write_control_registry(run_root: str, registry: Dict[str, Any], *, valid_keys: Iterable[str] | None = None) -> None:
+    data = dict(registry or {})
+    data = _ensure_controls_dict(data)
+    data = _cleanup_registry(data, valid_keys=valid_keys)
+    data["schema_version"] = int(data.get("schema_version") or 1)
+    write_json_atomic(control_registry_path(run_root), data)
 class StopRequested(Exception):
     pass
 
