@@ -55,8 +55,10 @@ def process_results(results_jsonl: str, out_csv: str):
 
     control_ids = {row.get("custom_id") or row.get("customId") for row in control_rows if row.get("custom_id") or row.get("customId")}
     results_mtime = os.path.getmtime(results_jsonl) if os.path.exists(results_jsonl) else 0.0
-    expected_json_ids = _count_unique_custom_ids(results_jsonl)
-    expected_total = expected_json_ids + len(control_ids)
+    json_ids = _unique_custom_ids(results_jsonl)
+    expected_json_ids = len(json_ids)
+    overlap = control_ids.intersection(json_ids)
+    expected_total = len(control_ids) + (expected_json_ids - len(overlap))
     csv_contains_controls = _csv_contains_ids(out_csv, control_ids) if control_ids else True
     if os.path.isfile(out_csv) and os.path.getmtime(out_csv) >= results_mtime:
         actual = _count_rows(out_csv)
@@ -137,13 +139,14 @@ def process_results(results_jsonl: str, out_csv: str):
             })
     # Validate outcome and update manifest
     actual = _count_rows(out_csv)
-    final_expected = _count_unique_custom_ids(results_jsonl) + len(control_ids)
+    json_ids = _unique_custom_ids(results_jsonl)
+    final_expected = len(control_ids) + (len(json_ids) - len(control_ids.intersection(json_ids)))
     if final_expected != actual:
         raise SystemExit(f"Parsed row count mismatch: expected {final_expected} rows (including shared controls) but wrote {actual}")
     _update_manifest_parsed(out_csv, actual)
 
 
-def _count_unique_custom_ids(path: str) -> int:
+def _unique_custom_ids(path: str) -> set[str]:
     seen: set[str] = set()
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -159,8 +162,8 @@ def _count_unique_custom_ids(path: str) -> int:
                 if cid:
                     seen.add(str(cid))
     except Exception:
-        return 0
-    return len(seen)
+        return set()
+    return seen
 
 
 def _count_rows(csv_path: str) -> int:
