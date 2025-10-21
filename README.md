@@ -92,6 +92,8 @@ Populate `.env`:
 - `FIREWORKS_API_KEY` — API key
 - `FIREWORKS_ACCOUNT_ID` — account slug (e.g., `my-team`)
 - `FIREWORKS_API_BASE` — optional; defaults to `https://api.fireworks.ai`
+- `OPENAI_API_KEY` — optional; required for alt OpenAI runs
+- `ANTHROPIC_API_KEY` — optional; required for alt Anthropic runs
 
 Prompts
 - `config/prompts/control_system.txt` — baseline
@@ -141,8 +143,11 @@ python -m scripts.run_all --config config/eval_config.yaml --dry_run \
 ```
 
 Alternative backends (OpenAI/Anthropic scaffolding)
+- Config: `config/alt_eval_config.yaml` pins provider metadata (name/model), batch parameters, and pricing tables for OpenAI + Anthropic. Validate via `python -c "from config.schema import load_config; load_config('config/alt_eval_config.yaml')"` after updating prompt sets or pricing.
+- Credentials: export `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` (and any account-specific headers) in `.env`. Fireworks keys are ignored when `backend: alt`.
 - `python -m scripts.alt_run_all --backend openai --config config/alt_eval_config.yaml --dry_run --skip_prepare --skip_build --limit_items 2`
   - Reuses prepare/build artifacts, writes per-trial manifest v2 with provider metadata (`batch_id`, `results_uri`, `output_file_id`), and refreshes the shared control registry once per control shard. Non-dry-run execution requires provider adapters (tickets 202/203).
+- Cost summaries: `python -m scripts.summarize_costs --config config/alt_eval_config.yaml --usage_json results/usage.json --out_path results/costs.json` reads OpenAI (`prompt_tokens`/`completion_tokens`) and Anthropic (`input_tokens`/`output_tokens`) usage reports, applies batch discounts, and records provider/pricing keys into the trial manifest. Add `--dry_run` to inspect the summary without writing.
 
 Smoke tests
 - Classic flow: `python -m scripts.smoke_test --mode flow --n 2`

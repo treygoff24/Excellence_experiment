@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, field_validator, ConfigDict
+from pydantic import BaseModel, Field, ValidationError, field_validator, ConfigDict, model_validator
 
 
 def _format_temp_key(t: float | str) -> str:
@@ -25,10 +25,170 @@ class PathsModel(BaseModel):
     experiments_dir: str = Field(default="experiments")
 
 
+class ProviderBatchModel(BaseModel):
+    endpoint: Optional[str] = None
+    completion_window: Optional[str] = None
+    max_output_tokens: Optional[int] = None
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+
+    @field_validator("max_output_tokens", "max_tokens")
+    @classmethod
+    def _validate_positive_int(cls, v: Optional[int]):  # type: ignore[override]
+        if v is None:
+            return None
+        iv = int(v)
+        if iv <= 0:
+            raise ValueError("batch.{max_tokens,max_output_tokens} must be positive when provided")
+        return iv
+
+    @field_validator("temperature")
+    @classmethod
+    def _validate_temperature(cls, v: Optional[float]):  # type: ignore[override]
+        if v is None:
+            return None
+        fv = float(v)
+        if not (0.0 <= fv <= 2.0):
+            raise ValueError("batch.temperature must be within [0,2]")
+        return fv
+
+    @field_validator("top_p")
+    @classmethod
+    def _validate_top_p(cls, v: Optional[float]):  # type: ignore[override]
+        if v is None:
+            return None
+        fv = float(v)
+        if not (0.0 <= fv <= 1.0):
+            raise ValueError("batch.top_p must be within [0,1]")
+        return fv
+
+
+class ProviderModel(BaseModel):
+    name: str
+    model: str
+    account_id: Optional[str] = None
+    region: Optional[str] = None
+    pricing_key: Optional[str] = None
+    batch: Optional[ProviderBatchModel] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("name")
+    @classmethod
+    def _normalize_name(cls, v: str):  # type: ignore[override]
+        vv = (v or "").strip().lower()
+        if not vv:
+            raise ValueError("provider.name must be a non-empty string")
+        return vv
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, v: str):  # type: ignore[override]
+        vv = (v or "").strip()
+        if not vv:
+            raise ValueError("provider.model must be a non-empty string")
+        return vv
+
+    @model_validator(mode="after")
+    def _default_pricing_key(self) -> "ProviderModel":
+        if not self.pricing_key:
+            object.__setattr__(self, "pricing_key", self.model)
+        return self
+
+
+class ProviderPricingEntry(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    input_per_mtok: Optional[float] = None
+    output_per_mtok: Optional[float] = None
+    input_per_mtok_batch: Optional[float] = None
+    output_per_mtok_batch: Optional[float] = None
+    batch_discount: Optional[float] = None
+
+    @field_validator(
+        "input_per_mtok",
+        "output_per_mtok",
+        "input_per_mtok_batch",
+        "output_per_mtok_batch",
+        "batch_discount",
+    )
+    @classmethod
+    def _validate_non_negative(cls, v: Optional[float], info):  # type: ignore[override]
+        if v is None:
+            return None
+        try:
+            fv = float(v)
+        except Exception as e:
+            raise ValueError(f"{info.field_name} must be numeric") from e
+        if fv < 0:
+            raise ValueError(f"{info.field_name} must be non-negative")
+        return fv
+
+    @model_validator(mode="after")
+    def _ensure_rate_pairs(self) -> "ProviderPricingEntry":
+        has_std = self.input_per_mtok is not None and self.output_per_mtok is not None
+        has_batch = self.input_per_mtok_batch is not None and self.output_per_mtok_batch is not None
+        if not (has_std or has_batch):
+            raise ValueError("provider pricing entries must include both input and output rates")
+        return self
+
+
 class PricingModel(BaseModel):
+    model_config = ConfigDict(extra="allow")
     input_per_million: float = Field(default=0.15)
     output_per_million: float = Field(default=0.60)
     batch_discount: float = Field(default=0.5)
+    providers: Dict[str, Dict[str, ProviderPricingEntry]] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _collect_providers(cls, data: Any):
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            raise TypeError("pricing must be a mapping")
+        known = {"input_per_million", "output_per_million", "batch_discount", "providers"}
+        provider_tables: Dict[str, Dict[str, Any]] = {}
+        for key in list(data.keys()):
+            if key not in known:
+                provider_tables[key] = data.pop(key)
+        if provider_tables:
+            existing = data.get("providers") or {}
+            merged: Dict[str, Dict[str, Any]] = {}
+            if isinstance(existing, dict):
+                merged.update(existing)
+            for prov, table in provider_tables.items():
+                merged[prov] = table
+            data["providers"] = merged
+        return data
+
+    @field_validator("input_per_million", "output_per_million", "batch_discount")
+    @classmethod
+    def _validate_pricing_defaults(cls, v: float):  # type: ignore[override]
+        try:
+            fv = float(v)
+        except Exception as e:
+            raise ValueError("pricing defaults must be numeric") from e
+        if fv < 0:
+            raise ValueError("pricing defaults must be non-negative")
+        return fv
+
+    @field_validator("providers", mode="before")
+    @classmethod
+    def _normalize_providers(cls, v: Any):  # type: ignore[override]
+        if v is None:
+            return {}
+        if not isinstance(v, dict):
+            raise TypeError("pricing.providers must be a mapping of provider -> model -> rates")
+        normalized: Dict[str, Dict[str, ProviderPricingEntry]] = {}
+        for provider_name, table in v.items():
+            if not isinstance(table, dict):
+                raise TypeError("provider pricing table must be a mapping of model -> rates")
+            normalized[provider_name] = {}
+            for model_name, rates in table.items():
+                if not isinstance(model_name, str) or not model_name:
+                    raise ValueError("pricing provider model keys must be non-empty strings")
+                normalized[provider_name][model_name] = ProviderPricingEntry.model_validate(rates)
+        return normalized
 
 
 class SizesModel(BaseModel):
@@ -94,6 +254,7 @@ class EvalConfigModel(BaseModel):
     paths: PathsModel = Field(default_factory=PathsModel)
     pricing: PricingModel = Field(default_factory=PricingModel)
     use_batch_api: bool = True
+    provider: Optional[ProviderModel] = None
     unsupported_threshold: float = Field(default=0.5)
     class UnsupportedModel(BaseModel):
         strategy: str = Field(default="baseline")  # baseline|overlap|nli
@@ -202,7 +363,7 @@ class EvalConfigModel(BaseModel):
     @field_validator("backend")
     @classmethod
     def _validate_backend(cls, v: str):  # type: ignore[override]
-        allowed = {"fireworks", "local"}
+        allowed = {"fireworks", "local", "alt"}
         vv = (v or "").strip().lower()
         if vv not in allowed:
             raise ValueError(f"backend must be one of {sorted(allowed)}")
