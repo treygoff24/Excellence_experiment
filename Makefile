@@ -31,6 +31,9 @@ eval:
 smoke:
 	$(PY) -m scripts.smoke_orchestration --n 3 --prompt_set operational_only --dry_run
 
+alt-smoke:
+	$(PY) -m scripts.alt_smoke --mode dry-run
+
 plan:
 	$(PY) -m scripts.run_all --config config/eval_config.yaml --plan_only
 

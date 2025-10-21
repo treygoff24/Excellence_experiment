@@ -1,0 +1,1 @@
+{"custom_id": "datasetA|123|treatment|0.0|0|open", "body": {"messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Explain the treatment workflow in one sentence."}]}}

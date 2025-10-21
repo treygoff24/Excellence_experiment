@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -9,6 +11,8 @@ from typing import Any, Iterable, Optional
 
 import json
 import yaml
+
+from fireworks.parse_results import process_results
 
 from backends.anthropic import AnthropicBatchAdapter
 from backends.openai import OpenAIBatchAdapter
@@ -184,8 +188,149 @@ class DryRunAdapter(BaseAdapter):
         return artifact
 
 
-def resolve_adapter(name: str, *, cfg: dict[str, Any]) -> BaseAdapter:
+class ReplayAdapter(BaseAdapter):
+    def __init__(self, backend: str, *, cfg: dict[str, Any], replay_dir: str) -> None:
+        self.backend = backend
+        self.cfg = cfg
+        self.replay_dir = os.path.abspath(replay_dir)
+        self.results_dir = os.path.join(self.replay_dir, "results")
+        self.metadata = self._load_metadata()
+        self.failure_mode = (self.metadata.get("failure_mode") or "none").lower()
+        self.expected_records = self.metadata.get("expected_records")
+        self.expected_predictions = self._resolve_metadata_path(self.metadata.get("expected_predictions"))
+        self.expected_results = self._resolve_metadata_path(self.metadata.get("expected_results"))
+
+    def _resolve_metadata_path(self, rel: Any) -> str | None:
+        if not rel:
+            return None
+        path = os.path.join(self.replay_dir, str(rel))
+        return path if os.path.exists(path) else None
+
+    def _load_metadata(self) -> dict[str, Any]:
+        meta_path = os.path.join(self.replay_dir, "metadata.json")
+        if not os.path.isfile(meta_path):
+            return {}
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+
+    def _condition_filename(self, *, condition: str, temp: float) -> str:
+        label = _format_temp_label(temp)
+        return os.path.join(self.results_dir, f"{condition}_t{label}.jsonl")
+
+    def _combine_results(self, results_dir: str) -> str:
+        dest = os.path.join(results_dir, "results.jsonl")
+        if self.expected_results and os.path.isfile(self.expected_results):
+            shutil.copyfile(self.expected_results, dest)
+            return dest
+        pattern = os.path.join(results_dir, "*_results.jsonl")
+        matches = sorted(glob.glob(pattern))
+        if not matches:
+            raise RuntimeError("Replay simulation: no per-condition result files found to combine.")
+        with open(dest, "w", encoding="utf-8") as fout:
+            for path in matches:
+                with open(path, "r", encoding="utf-8") as fin:
+                    for line in fin:
+                        s = line.rstrip()
+                        if s:
+                            fout.write(s + "\n")
+        return dest
+
+    @staticmethod
+    def _count_records(path: str) -> int:
+        count = 0
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        count += 1
+        except FileNotFoundError:
+            return 0
+        return count
+
+    def submit(
+        self,
+        *,
+        trial_slug: str,
+        artifacts: ProviderArtifacts,
+        dry_run: bool,
+    ) -> ProviderArtifacts:
+        label = _format_temp_label(artifacts.temp)
+        artifacts.batch_id = artifacts.batch_id or f"replay-{self.backend}-{trial_slug}-{artifacts.condition}-t{label}"
+        artifacts.extra.setdefault("replay", True)
+        artifacts.extra.setdefault("submitted_at", _utc_now_iso())
+        return artifacts
+
+    def poll(
+        self,
+        *,
+        results_dir: str,
+        artifact: ProviderArtifacts,
+        dry_run: bool,
+    ) -> ProviderArtifacts:
+        if self.failure_mode == "expired":
+            raise RuntimeError(
+                f"Replay simulation: batch for {artifact.condition} temp {artifact.temp} marked as expired."
+            )
+
+        source = self._condition_filename(condition=artifact.condition, temp=artifact.temp)
+        if not os.path.isfile(source):
+            raise FileNotFoundError(
+                f"Replay fixture missing result JSONL for {artifact.condition} at temp {artifact.temp}: {source}"
+            )
+        os.makedirs(results_dir, exist_ok=True)
+        dest = os.path.join(results_dir, f"{artifact.condition}_t{_format_temp_label(artifact.temp)}_results.jsonl")
+        shutil.copyfile(source, dest)
+        artifact.results_uri = dest
+        artifact.extra["normalized_path"] = dest
+        artifact.extra["poll_completed_at"] = _utc_now_iso()
+        return artifact
+
+    def parse(
+        self,
+        *,
+        results_dir: str,
+        artifact: ProviderArtifacts,
+        dry_run: bool,
+    ) -> ProviderArtifacts:
+        if self.failure_mode == "validation":
+            raise ValueError(
+                f"Replay simulation: validation error for {artifact.condition} temp {artifact.temp}."
+            )
+
+        os.makedirs(results_dir, exist_ok=True)
+        combined_path = self._combine_results(results_dir)
+        actual_records = self._count_records(combined_path)
+        if self.failure_mode == "partial":
+            expected = self.expected_records
+            if expected is None:
+                raise RuntimeError("Replay simulation: partial failure requested but expected_records missing in metadata.json")
+            raise RuntimeError(
+                f"Replay simulation: expected {expected} records but found {actual_records} in combined results."
+            )
+        if self.expected_records is not None and actual_records != self.expected_records:
+            raise RuntimeError(
+                f"Replay simulation: record count mismatch (expected {self.expected_records}, got {actual_records})."
+            )
+
+        predictions_path = os.path.join(results_dir, "predictions.csv")
+        process_results(combined_path, predictions_path)
+        artifact.extra["predictions_csv"] = predictions_path
+        artifact.extra["parsed_at"] = _utc_now_iso()
+        return artifact
+
+
+def resolve_adapter(name: str, *, cfg: dict[str, Any], replay_dir: str | None = None) -> BaseAdapter:
     normalized = (name or "").strip().lower()
+    if replay_dir:
+        if normalized not in {"openai", "anthropic"}:
+            raise SystemExit("Replay mode only supports 'openai' or 'anthropic' backends.")
+        return ReplayAdapter(normalized, cfg=cfg, replay_dir=replay_dir)
     if normalized == "openai":
         return OpenAIBatchAdapter(cfg)
     if normalized == "anthropic":
@@ -424,11 +569,15 @@ def main() -> None:
     ap.add_argument("--limit_items", type=int, default=None)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--dry_run", action="store_true")
+    ap.add_argument("--replay_dir", default=None)
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     backend_name = args.backend or (cfg.get("provider", {}) or {}).get("name") or "openai"
-    adapter = resolve_adapter(backend_name, cfg=cfg)
+    if args.replay_dir and args.dry_run:
+        print("NOTE: --replay_dir specified; ignoring --dry_run to allow parse and downstream checks.")
+        args.dry_run = False
+    adapter = resolve_adapter(backend_name, cfg=cfg, replay_dir=args.replay_dir)
 
     if args.models:
         cfg["models"] = _split_list_arg(args.models)

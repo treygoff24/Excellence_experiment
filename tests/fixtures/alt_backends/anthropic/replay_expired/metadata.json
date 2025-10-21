@@ -1,0 +1,6 @@
+{
+  "failure_mode": "expired",
+  "expected_records": 2,
+  "expected_predictions": "../replay_success/expected/predictions.csv",
+  "expected_results": "../replay_success/results/results.jsonl"
+}

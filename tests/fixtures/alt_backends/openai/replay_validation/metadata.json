@@ -1,0 +1,6 @@
+{
+  "failure_mode": "validation",
+  "expected_records": 2,
+  "expected_predictions": "expected/predictions.csv",
+  "expected_results": "results/results.jsonl"
+}
