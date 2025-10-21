@@ -10,6 +10,8 @@ from typing import Any, Iterable, Optional
 import json
 import yaml
 
+from backends.openai import OpenAIBatchAdapter
+
 from config.schema import load_config
 from scripts import manifest_v2 as mf
 from scripts.run_all import (  # type: ignore[attr-defined]
@@ -181,11 +183,13 @@ class DryRunAdapter(BaseAdapter):
         return artifact
 
 
-def resolve_adapter(name: str) -> BaseAdapter:
+def resolve_adapter(name: str, *, cfg: dict[str, Any]) -> BaseAdapter:
     normalized = (name or "").strip().lower()
-    if normalized not in {"openai", "anthropic"}:
-        raise SystemExit(f"Unsupported backend '{name}'. Choose from 'openai' or 'anthropic'.")
-    return DryRunAdapter(normalized)
+    if normalized == "openai":
+        return OpenAIBatchAdapter(cfg)
+    if normalized == "anthropic":
+        return DryRunAdapter(normalized)
+    raise SystemExit(f"Unsupported backend '{name}'. Choose from 'openai' or 'anthropic'.")
 
 
 def _collect_conditions(selected: str) -> list[str]:
@@ -423,7 +427,7 @@ def main() -> None:
 
     cfg = load_config(args.config)
     backend_name = args.backend or (cfg.get("provider", {}) or {}).get("name") or "openai"
-    adapter = resolve_adapter(backend_name)
+    adapter = resolve_adapter(backend_name, cfg=cfg)
 
     if args.models:
         cfg["models"] = _split_list_arg(args.models)
@@ -634,6 +638,10 @@ def main() -> None:
             stop_token.check()
             manifest = tr.manifest
             artifacts: list[ProviderArtifacts] = []
+            provider_batch_dir = (
+                os.path.join(run_root, "batch_inputs") if run_root else os.path.join(cfg["paths"]["batch_inputs_dir"], "openai")
+            )
+            os.makedirs(provider_batch_dir, exist_ok=True)
             for temp in tr.trial.get("temps") or []:
                 t_label = _format_temp_label(float(temp))
                 suffix = _prompt_suffix(tr.trial["prompt_set"], prompt_sets_cfg)
@@ -673,8 +681,26 @@ def main() -> None:
                 mf.write_manifest(tr.manifest_path, manifest)
 
                 for cond in conditions:
+                    cond_fname = f"t{t_label}{suffix}_{cond}.jsonl"
+                    cond_source = os.path.join(cfg["paths"]["batch_inputs_dir"], cond_fname)
                     mode = "reuse" if (cond == "control" and entry.get("mode") == "reuse") else "producer"
                     art = ProviderArtifacts(condition=cond, temp=float(temp), mode=mode)
+                    top_p = tr.trial.get("top_p")
+                    if top_p is None:
+                        top_p = cfg.get("top_p")
+                    top_k = tr.trial.get("top_k")
+                    if top_k is None:
+                        top_k = cfg.get("top_k")
+                    art.extra.update({
+                        "model_id": tr.trial["model_id"],
+                        "top_p": top_p,
+                        "top_k": top_k,
+                        "max_new_tokens": tr.trial.get("max_new_tokens") or cfg.get("max_new_tokens"),
+                        "source_jsonl": cond_source,
+                        "provider_batch_dir": provider_batch_dir,
+                        "prompt_set": tr.trial.get("prompt_set"),
+                        "run_root": run_root,
+                    })
                     artifacts.append(adapter.submit(trial_slug=tr.slug, artifacts=art, dry_run=args.dry_run))
             tr.artifacts = artifacts
             _update_stage(
@@ -713,14 +739,16 @@ def main() -> None:
         print("Gating: skipping poll")
 
     if "parse" in selected_phases:
-        if not args.dry_run:
+        if not args.dry_run and isinstance(adapter, DryRunAdapter):
             raise NotImplementedError(
                 "Parse phase for alternative backends requires provider adapters (tickets 202/203). "
                 "Run with --dry_run for now."
             )
         for tr in trial_runs:
             stop_token.check()
-            parsed = [adapter.parse(results_dir=tr.results_dir, artifact=art, dry_run=True) for art in tr.artifacts]
+            parsed = [
+                adapter.parse(results_dir=tr.results_dir, artifact=art, dry_run=args.dry_run) for art in tr.artifacts
+            ]
             tr.artifacts = parsed
             _update_stage(
                 manifest=tr.manifest,
