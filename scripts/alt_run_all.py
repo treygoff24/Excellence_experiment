@@ -1,0 +1,750 @@
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Iterable, Optional
+
+import json
+import yaml
+
+from config.schema import load_config
+from scripts import manifest_v2 as mf
+from scripts.run_all import (  # type: ignore[attr-defined]
+    _backend_tag,
+    _compute_control_key,
+    _expand_trials,
+    _format_temp_label,
+    _load_build_manifest,
+    _lookup_shard_meta,
+    _split_list_arg,
+    _trial_slug,
+    _prompt_suffix,
+    ensure_dirs,
+    run_cmd,
+    token_len,
+    write_manifest,
+)
+from scripts.shared_controls import (
+    refresh_registry,
+    shared_rel_default,
+    write_control_registry,
+)
+from scripts.state_utils import (
+    RunStateLock,
+    StopToken,
+    compute_config_hash,
+    init_run_state,
+    load_run_state,
+    run_state_path,
+    update_phase,
+    write_json_atomic,
+)
+
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def _sha256_file(path: str) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+@dataclass
+class ProviderArtifacts:
+    condition: str
+    temp: float
+    mode: str = "producer"
+    batch_id: Optional[str] = None
+    results_uri: Optional[str] = None
+    output_file_id: Optional[str] = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+class BaseAdapter:
+    backend: str
+
+    def submit(
+        self,
+        *,
+        trial_slug: str,
+        artifacts: ProviderArtifacts,
+        dry_run: bool,
+    ) -> ProviderArtifacts:
+        raise NotImplementedError
+
+    def poll(
+        self,
+        *,
+        results_dir: str,
+        artifact: ProviderArtifacts,
+        dry_run: bool,
+    ) -> ProviderArtifacts:
+        raise NotImplementedError
+
+    def parse(
+        self,
+        *,
+        results_dir: str,
+        artifact: ProviderArtifacts,
+        dry_run: bool,
+    ) -> ProviderArtifacts:
+        raise NotImplementedError
+
+
+class DryRunAdapter(BaseAdapter):
+    def __init__(self, backend: str):
+        self.backend = backend
+
+    def submit(
+        self,
+        *,
+        trial_slug: str,
+        artifacts: ProviderArtifacts,
+        dry_run: bool,
+    ) -> ProviderArtifacts:
+        label = _format_temp_label(artifacts.temp)
+        if not dry_run:
+            raise NotImplementedError(
+                f"{self.backend} adapter submit is not implemented yet. "
+                "Use --dry_run or complete provider adapter integration."
+            )
+        if artifacts.mode == "reuse":
+            artifacts.batch_id = f"reuse-{self.backend}-{trial_slug}-{artifacts.condition}-t{label}"
+        else:
+            artifacts.batch_id = f"dry-{self.backend}-{trial_slug}-{artifacts.condition}-t{label}"
+        artifacts.extra["submitted_at"] = _utc_now_iso()
+        return artifacts
+
+    def poll(
+        self,
+        *,
+        results_dir: str,
+        artifact: ProviderArtifacts,
+        dry_run: bool,
+    ) -> ProviderArtifacts:
+        label = _format_temp_label(artifact.temp)
+        if not dry_run:
+            raise NotImplementedError(
+                f"{self.backend} adapter poll is not implemented yet. "
+                "Use --dry_run or complete provider adapter integration."
+            )
+        placeholder = os.path.join(results_dir, f"dry_{artifact.condition}_t{label}.jsonl")
+        os.makedirs(os.path.dirname(placeholder), exist_ok=True)
+        if not os.path.isfile(placeholder):
+            with open(placeholder, "w", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "custom_id": f"{artifact.condition}|dry|{label}|0",
+                            "response": {
+                                "body": {
+                                    "choices": [
+                                        {
+                                            "message": {"content": "dry-run placeholder"},
+                                            "finish_reason": "stop",
+                                        }
+                                    ]
+                                },
+                                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+        artifact.results_uri = f"file://{placeholder}"
+        artifact.extra["poll_completed_at"] = _utc_now_iso()
+        return artifact
+
+    def parse(
+        self,
+        *,
+        results_dir: str,
+        artifact: ProviderArtifacts,
+        dry_run: bool,
+    ) -> ProviderArtifacts:
+        if not dry_run:
+            raise NotImplementedError(
+                f"{self.backend} adapter parse is not implemented yet. "
+                "Use --dry_run or complete provider adapter integration."
+            )
+        artifact.output_file_id = f"dry-output-{self.backend}-{artifact.condition}-{_format_temp_label(artifact.temp)}"
+        artifact.extra["parsed_at"] = _utc_now_iso()
+        return artifact
+
+
+def resolve_adapter(name: str) -> BaseAdapter:
+    normalized = (name or "").strip().lower()
+    if normalized not in {"openai", "anthropic"}:
+        raise SystemExit(f"Unsupported backend '{name}'. Choose from 'openai' or 'anthropic'.")
+    return DryRunAdapter(normalized)
+
+
+def _collect_conditions(selected: str) -> list[str]:
+    if selected in {"control", "treatment"}:
+        return [selected]
+    return ["control", "treatment"]
+
+
+def _serialize_artifacts(entries: Iterable[ProviderArtifacts]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for art in entries:
+        record = {
+            "condition": art.condition,
+            "temp": art.temp,
+            "mode": art.mode,
+            "batch_id": art.batch_id,
+            "results_uri": art.results_uri,
+            "output_file_id": art.output_file_id,
+        }
+        if art.extra:
+            record["extra"] = dict(art.extra)
+        serialized.append(record)
+    return serialized
+
+
+def _update_stage(
+    *,
+    manifest: dict[str, Any],
+    manifest_path: str,
+    stage: str,
+    status: str,
+    provider_entries: Iterable[ProviderArtifacts],
+    backend: str,
+) -> None:
+    stage_map = manifest.setdefault("stage_status", {})
+    stage_map[stage] = {
+        "status": status,
+        "updated_at": _utc_now_iso(),
+        "artifacts": {
+            "backend": backend,
+            "provider_runs": _serialize_artifacts(provider_entries),
+        },
+    }
+    mf.write_manifest(manifest_path, manifest)
+
+
+def _load_or_create_manifest(
+    *,
+    manifest_path: str,
+    run_id: str,
+    trial: dict[str, Any],
+    prompt_paths: dict[str, str],
+) -> dict[str, Any]:
+    if os.path.isfile(manifest_path):
+        try:
+            data, upgraded = mf.load_manifest(manifest_path)
+            if upgraded:
+                print(f"Upgraded manifest at {manifest_path} to schema v{mf.SCHEMA_VERSION}")
+            return data
+        except Exception as exc:  # pragma: no cover - fallback path
+            print(f"WARNING: failed to load existing manifest {manifest_path}: {exc}")
+    ctrl_prompt = open(prompt_paths["control"], "r", encoding="utf-8").read()
+    trt_prompt = open(prompt_paths["treatment"], "r", encoding="utf-8").read()
+    manifest = {
+        "schema_version": mf.SCHEMA_VERSION,
+        "timestamps": {"created_at": _utc_now_iso(), "updated_at": _utc_now_iso()},
+        "run_id": run_id,
+        "trial": {
+            "model_id": trial["model_id"],
+            "prompt_set": trial["prompt_set"],
+            "top_p": trial.get("top_p"),
+            "top_k": trial.get("top_k"),
+            "max_new_tokens": trial.get("max_new_tokens"),
+            "id": trial.get("id"),
+        },
+        "temps": [float(t) for t in (trial.get("temps") or [])],
+        "samples_per_item": trial.get("samples_per_item"),
+        "prompts": {
+            "control": {"sha256": _sha256_file(prompt_paths["control"]), "tokens": token_len(ctrl_prompt)},
+            "treatment": {"sha256": _sha256_file(prompt_paths["treatment"]), "tokens": token_len(trt_prompt)},
+        },
+        "datasets": {},
+        "jobs": {},
+        "job_status": {},
+        "control_registry": {},
+        "stage_status": {},
+    }
+    mf.write_manifest(manifest_path, manifest)
+    return manifest
+
+
+def _ensure_control_entry(
+    *,
+    run_root: Optional[str],
+    control_registry: Optional[dict[str, Any]],
+    manifest: dict[str, Any],
+    label: str,
+    ctrl_key: str,
+    slug: str,
+    prompt_sha: str,
+    input_sha: str,
+    backend_tag: str,
+    model_id: str,
+    temp: float,
+) -> tuple[dict[str, Any], bool]:
+    mutated = False
+    entry = manifest.setdefault("control_registry", {}).setdefault(label, {})
+    shared_rel = entry.get("shared_rel") or shared_rel_default(ctrl_key)
+    entry.update({
+        "key": ctrl_key,
+        "temp": float(temp),
+        "shared_rel": shared_rel,
+    })
+    reg_entry = None
+    if control_registry is not None:
+        reg_controls = control_registry.setdefault("controls", {})
+        candidate = reg_controls.get(ctrl_key)
+        if candidate and candidate.get("status") == "completed":
+            from scripts.run_all import _control_entry_files_exist  # local import to avoid cycle
+
+            if _control_entry_files_exist(run_root or "", candidate):
+                reg_entry = candidate
+    if reg_entry:
+        entry.update({
+            "mode": "reuse",
+            "status": reg_entry.get("status", "completed"),
+            "producer_trial": reg_entry.get("producer_trial"),
+            "files": reg_entry.get("files", {}),
+            "counts": reg_entry.get("counts", {}),
+        })
+    else:
+        entry.update({
+            "mode": "producer",
+            "status": "pending",
+            "producer_trial": slug,
+        })
+        if control_registry is not None:
+            reg_controls = control_registry.setdefault("controls", {})
+            existing = reg_controls.get(ctrl_key)
+            previous = json.dumps(existing, sort_keys=True) if existing is not None else None
+            info = dict(existing or {})
+            info["status"] = info.get("status") or "pending"
+            info["shared_rel"] = info.get("shared_rel") or shared_rel
+            info["created_at"] = info.get("created_at") or _utc_now_iso()
+            if not info.get("producer_trial"):
+                info["producer_trial"] = slug
+            if prompt_sha and not info.get("prompt_sha"):
+                info["prompt_sha"] = prompt_sha
+            if input_sha and not info.get("input_sha"):
+                info["input_sha"] = input_sha
+            info["backend"] = info.get("backend") or backend_tag
+            info["model_id"] = info.get("model_id") or model_id
+            info["temp"] = info.get("temp") if info.get("temp") is not None else float(temp)
+            reg_controls[ctrl_key] = info
+            if json.dumps(info, sort_keys=True) != previous:
+                mutated = True
+    return entry, mutated
+
+
+@dataclass
+class TrialRun:
+    slug: str
+    trial: dict[str, Any]
+    results_dir: str
+    reports_dir: str
+    manifest_path: str
+    manifest: dict[str, Any]
+    artifacts: list[ProviderArtifacts] = field(default_factory=list)
+
+
+def _write_multi_manifest(run_root: str, run_id: str, trials: list[TrialRun]) -> None:
+    summary = {
+        "schema_version": 2,
+        "created_utc": _utc_now_iso(),
+        "updated_utc": _utc_now_iso(),
+        "run_id": run_id,
+        "num_trials": len(trials),
+        "trials": [],
+    }
+    for tr in trials:
+        rel_results = os.path.relpath(tr.results_dir, run_root) if run_root else tr.results_dir
+        rel_reports = os.path.relpath(tr.reports_dir, run_root) if run_root else tr.reports_dir
+        summary["trials"].append({
+            "slug": tr.slug,
+            "model_id": tr.trial["model_id"],
+            "prompt_set": tr.trial.get("prompt_set"),
+            "temps": tr.trial.get("temps"),
+            "results_dir": rel_results,
+            "reports_dir": rel_reports,
+        })
+    manifest_path = os.path.join(run_root, "multi_trial_manifest.json")
+    write_manifest(manifest_path, summary)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config/eval_config.yaml")
+    ap.add_argument("--backend", choices=["openai", "anthropic"])
+    ap.add_argument("--account_id", default=None)
+    ap.add_argument("--condition", choices=["control", "treatment", "both"], default="both")
+    ap.add_argument("--skip_prepare", action="store_true")
+    ap.add_argument("--skip_build", action="store_true")
+    ap.add_argument("--skip_score", action="store_true")
+    ap.add_argument("--skip_stats", action="store_true")
+    ap.add_argument("--skip_costs", action="store_true")
+    ap.add_argument("--skip_report", action="store_true")
+    ap.add_argument("--run_id", help="Custom run ID (auto-generated if not provided)")
+    ap.add_argument("--models", nargs="+")
+    ap.add_argument("--prompt_sets", nargs="+")
+    ap.add_argument("--temps", nargs="+")
+    ap.add_argument("--no_sweep", action="store_true")
+    ap.add_argument("--plan_only", action="store_true")
+    ap.add_argument(
+        "--only_step",
+        choices=["prepare", "build", "submit", "poll", "parse", "score", "stats", "costs", "report"],
+    )
+    ap.add_argument(
+        "--from_step",
+        choices=["prepare", "build", "submit", "poll", "parse", "score", "stats", "costs", "report"],
+    )
+    ap.add_argument(
+        "--to_step",
+        choices=["prepare", "build", "submit", "poll", "parse", "score", "stats", "costs", "report"],
+    )
+    ap.add_argument("--archive", action="store_true")
+    ap.add_argument("--ignore_stop", action="store_true")
+    ap.add_argument("--stop_stale_minutes", type=int, default=60)
+    ap.add_argument("--max_concurrent_jobs", type=int, default=4)
+    ap.add_argument("--parts_per_dataset", type=int, default=None)
+    ap.add_argument("--lines_per_part", type=int, default=None)
+    ap.add_argument("--limit_items", type=int, default=None)
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--dry_run", action="store_true")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    backend_name = args.backend or (cfg.get("provider", {}) or {}).get("name") or "openai"
+    adapter = resolve_adapter(backend_name)
+
+    if args.models:
+        cfg["models"] = _split_list_arg(args.models)
+    if args.prompt_sets:
+        cfg["prompt_sets_run"] = _split_list_arg(args.prompt_sets)
+    if args.temps:
+        cfg["temps_override"] = [float(t) for t in _split_list_arg(args.temps)]
+    if args.no_sweep:
+        cfg["sweep"] = None
+
+    ensure_dirs(cfg)
+    run_id = args.run_id or datetime.utcnow().strftime("r%Y%m%d%H%M%S")
+    trials = _expand_trials(cfg, args)
+    experiments_dir = (cfg.get("paths", {}) or {}).get("experiments_dir") or ""
+    use_exp_root = bool(experiments_dir)
+    if use_exp_root:
+        os.makedirs(experiments_dir, exist_ok=True)
+    run_root = os.path.join(experiments_dir, f"run_{run_id}") if use_exp_root else None
+    if run_root:
+        os.makedirs(run_root, exist_ok=True)
+    control_registry = refresh_registry(run_root) if run_root else None
+    control_registry_dirty = False
+
+    effective_config_path = args.config
+    if run_root:
+        effective_config_path = os.path.join(run_root, "effective_config.yaml")
+        with open(effective_config_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False)
+
+    stop_token = StopToken(
+        run_root or os.getcwd(),
+        ignore_file=bool(args.ignore_stop),
+        stale_minutes=args.stop_stale_minutes,
+    )
+    state = None
+    if run_root:
+        state = load_run_state(run_root)
+        if args.resume and state is None:
+            raise SystemExit(f"--resume requested but run_state.json missing at {run_state_path(run_root)}")
+        if state is None:
+            state = init_run_state(run_root, run_id, cfg)
+            with RunStateLock(run_root):
+                write_json_atomic(run_state_path(run_root), state)
+        else:
+            try:
+                if compute_config_hash(cfg) != state.get("config_hash"):
+                    print("WARNING: Effective config differs from stored config hash. Resume may be inconsistent.")
+            except Exception:
+                pass
+
+    PHASES = ["prepare", "build", "submit", "poll", "parse", "score", "stats", "costs", "report"]
+
+    def _select_phases() -> list[str]:
+        if args.only_step:
+            return [args.only_step]
+        if args.from_step and args.to_step:
+            si = PHASES.index(args.from_step)
+            ei = PHASES.index(args.to_step)
+            if si > ei:
+                raise SystemExit("--from_step must be <= --to_step")
+            return PHASES[si:ei + 1]
+        if args.from_step:
+            return PHASES[PHASES.index(args.from_step):]
+        if args.to_step:
+            return PHASES[: PHASES.index(args.to_step) + 1]
+        return PHASES[:]
+
+    selected_phases = _select_phases()
+    if args.skip_prepare:
+        selected_phases = [p for p in selected_phases if p != "prepare"]
+    if args.skip_build:
+        selected_phases = [p for p in selected_phases if p != "build"]
+    if args.skip_score:
+        selected_phases = [p for p in selected_phases if p != "score"]
+    if args.skip_stats:
+        selected_phases = [p for p in selected_phases if p != "stats"]
+    if args.skip_costs:
+        selected_phases = [p for p in selected_phases if p != "costs"]
+    if args.skip_report:
+        selected_phases = [p for p in selected_phases if p != "report"]
+    if args.dry_run:
+        selected_phases = [p for p in selected_phases if p not in {"parse", "score", "stats", "costs", "report"}]
+
+    if args.plan_only:
+        print(f"Run ID: {run_id}")
+        print(f"Backend: {adapter.backend}")
+        print(f"Selected phases: {', '.join(selected_phases) or 'none'}")
+        print(f"Trials: {len(trials)} configured")
+        return
+
+    prompt_sets_cfg = cfg.get("prompt_sets") or {}
+    default_ps = cfg.get("default_prompt_set") or (
+        sorted(prompt_sets_cfg.keys())[0] if prompt_sets_cfg else "default"
+    )
+    conditions = _collect_conditions(args.condition)
+
+    def mark_state(phase: str, status: str) -> None:
+        if state is None or run_root is None:
+            return
+        with RunStateLock(run_root):
+            update_phase(state, phase, status=status)
+            write_json_atomic(run_state_path(run_root), state)
+
+    if "prepare" in selected_phases:
+        mark_state("prepare", "in_progress")
+        stop_token.check()
+        cmd = [sys.executable, "-m", "scripts.prepare_data", "--config", effective_config_path]
+        if args.resume:
+            cmd.append("--resume")
+        run_cmd(cmd)
+        mark_state("prepare", "completed")
+    else:
+        print("Gating: skipping prepare")
+
+    if "build" in selected_phases:
+        mark_state("build", "in_progress")
+        stop_token.check()
+        temps_per_ps: dict[str, set[float]] = {}
+        for trial in trials:
+            ps_name = trial.get("prompt_set") or default_ps
+            temps_per_ps.setdefault(ps_name, set()).update(float(t) for t in (trial.get("temps") or []))
+        for ps_name, temps in temps_per_ps.items():
+            temp_arg = ",".join(str(t) for t in sorted(temps))
+            cmd = [
+                sys.executable,
+                "-m",
+                "scripts.build_batches",
+                "--config",
+                effective_config_path,
+                "--prompt_set",
+                ps_name,
+            ]
+            if temp_arg:
+                cmd.extend(["--temps", temp_arg])
+            if args.resume:
+                cmd.append("--resume")
+            if args.limit_items:
+                cmd.extend(["--limit_items", str(args.limit_items)])
+            run_cmd(cmd)
+        mark_state("build", "completed")
+    else:
+        print("Gating: skipping build")
+
+    trial_runs: list[TrialRun] = []
+    build_manifest = _load_build_manifest(cfg["paths"]["batch_inputs_dir"])
+    backend_tag = _backend_tag(is_local_backend=False)
+
+    for trial in trials:
+        model_id = trial["model_id"]
+        ps_name = trial.get("prompt_set") or default_ps
+        temps = trial.get("temps") or (cfg.get("temps") or [0.0])
+        top_p = trial.get("top_p", cfg.get("top_p"))
+        top_k = trial.get("top_k", cfg.get("top_k"))
+        mx = trial.get("max_new_tokens")
+        if not mx:
+            mx = cfg.get("max_new_tokens") or {"closed_book": 1024, "open_book": 1024}
+        slug = _trial_slug(model_id, ps_name, top_p, top_k, mx, aliases=cfg.get("model_aliases") or {})
+        if run_root:
+            trial_root = os.path.join(run_root, slug)
+            results_dir = os.path.join(trial_root, "results")
+            reports_dir = os.path.join(trial_root, "reports")
+        else:
+            results_dir = cfg["paths"]["results_dir"]
+            reports_dir = cfg["paths"]["reports_dir"]
+        os.makedirs(results_dir, exist_ok=True)
+        os.makedirs(reports_dir, exist_ok=True)
+
+        prompt_meta = prompt_sets_cfg.get(ps_name) or {}
+        ctrl_path = os.path.expanduser(prompt_meta.get("control", "config/prompts/control_system.txt"))
+        trt_path = os.path.expanduser(prompt_meta.get("treatment", "config/prompts/treatment_system.txt"))
+        manifest_path = os.path.join(results_dir, "trial_manifest.json")
+        manifest = _load_or_create_manifest(
+            manifest_path=manifest_path,
+            run_id=run_id,
+            trial={
+                "model_id": model_id,
+                "prompt_set": ps_name,
+                "top_p": top_p,
+                "top_k": top_k,
+                "max_new_tokens": mx,
+                "temps": temps,
+                "samples_per_item": cfg.get("samples_per_item"),
+                "id": slug,
+            },
+            prompt_paths={"control": ctrl_path, "treatment": trt_path},
+        )
+        trial_runs.append(
+            TrialRun(
+                slug=slug,
+                trial={
+                    "model_id": model_id,
+                    "prompt_set": ps_name,
+                    "temps": temps,
+                    "top_p": top_p,
+                    "top_k": top_k,
+                    "max_new_tokens": mx,
+                },
+                results_dir=results_dir,
+                reports_dir=reports_dir,
+                manifest_path=manifest_path,
+                manifest=manifest,
+            )
+        )
+
+    if "submit" in selected_phases:
+        mark_state("submit", "in_progress")
+        for tr in trial_runs:
+            stop_token.check()
+            manifest = tr.manifest
+            artifacts: list[ProviderArtifacts] = []
+            for temp in tr.trial.get("temps") or []:
+                t_label = _format_temp_label(float(temp))
+                suffix = _prompt_suffix(tr.trial["prompt_set"], prompt_sets_cfg)
+                control_fname = f"t{t_label}{suffix}_control.jsonl"
+                input_name = os.path.join(cfg["paths"]["batch_inputs_dir"], control_fname)
+                shard_meta = _lookup_shard_meta(build_manifest, os.path.basename(input_name))
+                shard_sha = (shard_meta or {}).get("sha256") or (_sha256_file(input_name) if os.path.isfile(input_name) else "")
+                ctrl_key = _compute_control_key(
+                    run_id=run_id,
+                    backend=backend_tag,
+                    model_id=tr.trial["model_id"],
+                    temp=float(temp),
+                    top_p=tr.trial.get("top_p"),
+                    top_k=tr.trial.get("top_k"),
+                    max_new_tokens=tr.trial.get("max_new_tokens"),
+                    samples_per_item=cfg.get("samples_per_item") or {},
+                    control_prompt_sha=manifest.get("prompts", {}).get("control", {}).get("sha256"),
+                    input_sha=shard_sha,
+                )
+                label = f"t{t_label}"
+                entry, mutated = _ensure_control_entry(
+                    run_root=run_root,
+                    control_registry=control_registry,
+                    manifest=manifest,
+                    label=label,
+                    ctrl_key=ctrl_key,
+                    slug=tr.slug,
+                    prompt_sha=manifest.get("prompts", {}).get("control", {}).get("sha256"),
+                    input_sha=shard_sha,
+                    backend_tag=backend_tag,
+                    model_id=tr.trial["model_id"],
+                    temp=float(temp),
+                )
+                if mutated:
+                    control_registry_dirty = True
+                manifest["control_registry"][label] = entry
+                mf.write_manifest(tr.manifest_path, manifest)
+
+                for cond in conditions:
+                    mode = "reuse" if (cond == "control" and entry.get("mode") == "reuse") else "producer"
+                    art = ProviderArtifacts(condition=cond, temp=float(temp), mode=mode)
+                    artifacts.append(adapter.submit(trial_slug=tr.slug, artifacts=art, dry_run=args.dry_run))
+            tr.artifacts = artifacts
+            _update_stage(
+                manifest=manifest,
+                manifest_path=tr.manifest_path,
+                stage="submitted",
+                status="completed",
+                provider_entries=artifacts,
+                backend=adapter.backend,
+            )
+        mark_state("submit", "completed")
+    else:
+        print("Gating: skipping submit")
+
+    if control_registry_dirty and run_root and control_registry is not None:
+        write_control_registry(run_root, control_registry)
+
+    if "poll" in selected_phases:
+        mark_state("poll", "in_progress")
+        for tr in trial_runs:
+            stop_token.check()
+            updated: list[ProviderArtifacts] = []
+            for art in tr.artifacts:
+                updated.append(adapter.poll(results_dir=tr.results_dir, artifact=art, dry_run=args.dry_run))
+            tr.artifacts = updated
+            _update_stage(
+                manifest=tr.manifest,
+                manifest_path=tr.manifest_path,
+                stage="downloaded",
+                status="completed",
+                provider_entries=tr.artifacts,
+                backend=adapter.backend,
+            )
+        mark_state("poll", "completed")
+    else:
+        print("Gating: skipping poll")
+
+    if "parse" in selected_phases:
+        if not args.dry_run:
+            raise NotImplementedError(
+                "Parse phase for alternative backends requires provider adapters (tickets 202/203). "
+                "Run with --dry_run for now."
+            )
+        for tr in trial_runs:
+            stop_token.check()
+            parsed = [adapter.parse(results_dir=tr.results_dir, artifact=art, dry_run=True) for art in tr.artifacts]
+            tr.artifacts = parsed
+            _update_stage(
+                manifest=tr.manifest,
+                manifest_path=tr.manifest_path,
+                stage="parsed",
+                status="completed",
+                provider_entries=parsed,
+                backend=adapter.backend,
+            )
+    else:
+        print("Gating: skipping parse")
+
+    # Downstream phases require real parse outputs; skip until adapters land.
+    downstream = {"score", "stats", "costs", "report"}
+    for phase in downstream:
+        if phase in selected_phases:
+            print(f"NOTE: {phase} phase requires parsed outputs. Skipping until provider adapters implement full path.")
+
+    if run_root:
+        _write_multi_manifest(run_root, run_id, trial_runs)
+
+    if control_registry_dirty and run_root and control_registry is not None:
+        write_control_registry(run_root, control_registry)
+
+
+if __name__ == "__main__":
+    main()

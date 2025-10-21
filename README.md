@@ -140,6 +140,10 @@ python -m scripts.run_all --config config/eval_config.yaml --dry_run \
   --prompt_sets operational_only --temps 0.0 --limit_items 200 --parts_per_dataset 3 --max_concurrent_jobs 2
 ```
 
+Alternative backends (OpenAI/Anthropic scaffolding)
+- `python -m scripts.alt_run_all --backend openai --config config/alt_eval_config.yaml --dry_run --skip_prepare --skip_build --limit_items 2`
+  - Reuses prepare/build artifacts, writes per-trial manifest v2 with provider metadata (`batch_id`, `results_uri`, `output_file_id`), and refreshes the shared control registry once per control shard. Non-dry-run execution requires provider adapters (tickets 202/203).
+
 Smoke tests
 - Classic flow: `python -m scripts.smoke_test --mode flow --n 2`
 - Orchestration dry-run with STOP/resume: `python -m scripts.smoke_orchestration --n 3 --prompt_set operational_only --dry_run [--keep]`
