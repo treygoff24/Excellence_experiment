@@ -10,6 +10,7 @@ from typing import Any, Iterable, Optional
 import json
 import yaml
 
+from backends.anthropic import AnthropicBatchAdapter
 from backends.openai import OpenAIBatchAdapter
 
 from config.schema import load_config
@@ -188,7 +189,7 @@ def resolve_adapter(name: str, *, cfg: dict[str, Any]) -> BaseAdapter:
     if normalized == "openai":
         return OpenAIBatchAdapter(cfg)
     if normalized == "anthropic":
-        return DryRunAdapter(normalized)
+        return AnthropicBatchAdapter(cfg)
     raise SystemExit(f"Unsupported backend '{name}'. Choose from 'openai' or 'anthropic'.")
 
 
@@ -638,9 +639,11 @@ def main() -> None:
             stop_token.check()
             manifest = tr.manifest
             artifacts: list[ProviderArtifacts] = []
-            provider_batch_dir = (
-                os.path.join(run_root, "batch_inputs") if run_root else os.path.join(cfg["paths"]["batch_inputs_dir"], "openai")
-            )
+            if run_root:
+                batch_inputs_root = os.path.join(run_root, "batch_inputs")
+            else:
+                batch_inputs_root = cfg["paths"]["batch_inputs_dir"]
+            provider_batch_dir = os.path.join(batch_inputs_root, adapter.backend)
             os.makedirs(provider_batch_dir, exist_ok=True)
             for temp in tr.trial.get("temps") or []:
                 t_label = _format_temp_label(float(temp))
