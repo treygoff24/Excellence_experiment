@@ -33,13 +33,6 @@ def start_message_batch(
 
     payload = [_to_request_mapping(item) for item in requests]
     create_kwargs = dict(batch_params or {})
-    if metadata:
-        combined_meta = dict(create_kwargs.get("metadata") or {})
-        for key, value in metadata.items():
-            if key is None:
-                continue
-            combined_meta[str(key)] = value
-        create_kwargs["metadata"] = combined_meta
     create_kwargs["requests"] = payload
 
     messages_iface = getattr(client, "messages", None)

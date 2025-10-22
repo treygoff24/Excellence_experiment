@@ -38,6 +38,43 @@ def _part_suffix_fragment(extra: Mapping[str, Any] | None) -> str:
     return "" if idx <= 0 else f"_p{idx + 1:02d}"
 
 
+def _remap_custom_ids(jsonl_path: str, map_path: str) -> None:
+    if not jsonl_path or not map_path:
+        return
+    try:
+        with open(map_path, "r", encoding="utf-8") as fin:
+            mapping = json.load(fin)
+    except Exception:
+        return
+    if not isinstance(mapping, dict):
+        return
+    normalized_map = {str(k): str(v) for k, v in mapping.items() if k is not None and v is not None}
+    if not normalized_map:
+        return
+    tmp_path = f"{jsonl_path}.tmp"
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as src, open(tmp_path, "w", encoding="utf-8") as dst:
+            for line in src:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except json.JSONDecodeError:
+                    dst.write(line)
+                    continue
+                provider_id = obj.get("custom_id") or obj.get("customId")
+                if provider_id and provider_id in normalized_map:
+                    obj.setdefault("provider_custom_id", provider_id)
+                    obj["custom_id"] = normalized_map[provider_id]
+                dst.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, jsonl_path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
 def _stringify_dict(data: Optional[dict[str, Any]]) -> dict[str, Any]:
     if not data:
         return {}
@@ -169,10 +206,21 @@ class AnthropicBatchAdapter:
             request_overrides=self.request_overrides or None,
         )
         write_requests_preview(requests, request_preview_path)
+        id_map_path = os.path.join(
+            batch_dir,
+            f"{trial_slug}_{artifacts.condition}_t{temp_label}{part_suffix}_id_map.json",
+        )
+        try:
+            with open(id_map_path, "w", encoding="utf-8") as fout:
+                json.dump({req.custom_id: req.orig_custom_id for req in requests}, fout, ensure_ascii=False, indent=2)
+        except Exception:
+            id_map_path = None
 
         artifacts.extra["request_count"] = len(requests)
         artifacts.extra["request_preview"] = request_preview_path
         artifacts.extra["submitted_at"] = _utc_now_iso()
+        if id_map_path:
+            artifacts.extra["custom_id_map_path"] = id_map_path
 
         if dry_run:
             artifacts.batch_id = f"dry-{self.backend}-{trial_slug}-{artifacts.condition}-t{temp_label}{part_suffix}"
@@ -261,6 +309,9 @@ class AnthropicBatchAdapter:
 
         streamed = stream_results_to_jsonl(client, artifact.batch_id, raw_path)
         normalized = normalize_jsonl(raw_path, normalized_path)
+        id_map_path = getattr(artifact, "extra", {}).get("custom_id_map_path")
+        if id_map_path:
+            _remap_custom_ids(normalized_path, id_map_path)
 
         artifact.results_uri = normalized_path
         artifact.extra["batch_status"] = status

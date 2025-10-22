@@ -39,15 +39,12 @@ reports/
 **/results/
 **/reports/
 # Experiments runs and per-run batch inputs
-experiments/run_*/
-experiments/**/batch_inputs/
+experiments/
 # Keep the markdown report file if you want to track it; by default ignore entire reports dir
 # If you want to keep report.md, comment the reports/ line above and ignore only large assets
 
 # Batch inputs and prepared/raw datasets (can be large and/or derived)
-data/raw/
-data/prepared/
-data/batch_inputs/
+data/
 
 # Fireworks downloaded bundles or binaries
 *.bin

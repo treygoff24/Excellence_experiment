@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Sequence, Tuple
 
 MAX_REQUESTS_PER_BATCH = 10_000
+_SAFE_ID_PATTERN = re.compile(r"[^A-Za-z0-9_-]")
 
 
 def _load_rows(path: str) -> Iterable[dict[str, Any]]:
@@ -128,6 +131,35 @@ def _extract_system_and_messages(messages: Sequence[dict[str, Any]]) -> Tuple[Op
 class RequestPayload:
     custom_id: str
     params: dict[str, Any]
+    orig_custom_id: str
+    metadata: dict[str, Any]
+
+
+def _sanitize_custom_id(raw: str, used: set[str]) -> str:
+    if not raw:
+        raw = "request"
+    safe = _SAFE_ID_PATTERN.sub("_", raw)
+    if not safe:
+        safe = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    if len(safe) > 64:
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        safe = f"{safe[:32]}_{digest[:16]}"
+    safe = safe[:64]
+    if safe not in used:
+        used.add(safe)
+        return safe
+    counter = 1
+    base = safe.rstrip("_")
+    while True:
+        suffix = f"_{counter}"
+        if base:
+            candidate = (base[: max(0, 64 - len(suffix))] + suffix)
+        else:
+            candidate = hashlib.sha256(f"{raw}:{counter}".encode("utf-8")).hexdigest()[:64]
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+        counter += 1
 
 
 def build_message_requests(
@@ -146,6 +178,7 @@ def build_message_requests(
     token_lookup = _max_tokens_lookup(max_new_tokens)
     meta = _normalize_metadata(metadata)
     overrides = dict(request_overrides or {})
+    used_custom_ids: set[str] = set()
 
     requests: list[RequestPayload] = []
     for row in _load_rows(src_path):
@@ -153,6 +186,7 @@ def build_message_requests(
         base_body = row.get("body") or {}
         if not custom_id or "messages" not in base_body:
             continue
+        orig_custom_id = str(custom_id)
         raw_messages = base_body.get("messages")
         if not isinstance(raw_messages, list):
             continue
@@ -160,6 +194,7 @@ def build_message_requests(
         if not conversation:
             continue
 
+        safe_custom_id = _sanitize_custom_id(orig_custom_id, used_custom_ids)
         params: dict[str, Any] = {
             "model": model,
             "temperature": float(temperature),
@@ -185,12 +220,19 @@ def build_message_requests(
             token_limit = fallback if fallback is not None else 1024
         params["max_tokens"] = int(token_limit)
 
-        if meta:
-            params["metadata"] = meta
+        request_meta = dict(meta)
+        request_meta["orig_custom_id"] = orig_custom_id
         if overrides:
             params.update(overrides)
 
-        requests.append(RequestPayload(custom_id=str(custom_id), params=params))
+        requests.append(
+            RequestPayload(
+                custom_id=safe_custom_id,
+                params=params,
+                orig_custom_id=orig_custom_id,
+                metadata=request_meta,
+            )
+        )
 
     if len(requests) > MAX_REQUESTS_PER_BATCH:
         raise ValueError(
@@ -213,6 +255,13 @@ def write_requests_preview(requests: Iterable[RequestPayload], dest_path: str) -
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fout:
         for req in data:
-            fout.write(json.dumps({"custom_id": req.custom_id, "params": req.params}, ensure_ascii=False) + "\n")
+            payload = {
+                "custom_id": req.custom_id,
+                "params": req.params,
+                "orig_custom_id": req.orig_custom_id,
+            }
+            if req.metadata:
+                payload["metadata"] = req.metadata
+            fout.write(json.dumps(payload, ensure_ascii=False) + "\n")
             count += 1
     return count

@@ -1,0 +1,82 @@
+model_id: claude-3-5-haiku-20241022
+backend: alt
+temps:
+  - 0.0
+samples_per_item:
+  "0.0": 1
+max_new_tokens:
+  closed_book: 512
+  open_book: 512
+top_p: 1.0
+top_k: 50
+stop: []
+sizes:
+  open_book_max_items: 10
+  triviaqa_max_items: 10
+  nq_open_max_items: 10
+paths:
+  raw_dir: data/raw
+  prepared_dir: data/smoke_prepared
+  batch_inputs_dir: data/batch_inputs/smoke_anthropic
+  results_dir: results/smoke_anthropic
+  reports_dir: reports/smoke_anthropic
+  run_manifest: results/smoke_anthropic/run_manifest.json
+  experiments_dir: experiments
+provider:
+  name: anthropic
+  model: claude-3-5-haiku-20241022
+  pricing_key: claude-3-5-haiku-20241022
+  batch:
+    endpoint: /v1/messages/batches
+    completion_window: 24h
+    max_output_tokens: 512
+    temperature: 0.0
+pricing:
+  input_per_million: 0.15
+  output_per_million: 0.60
+  batch_discount: 0.5
+  openai:
+    gpt-4o-mini:
+      input_per_mtok: 0.15
+      output_per_mtok: 0.60
+      batch_discount: 0.5
+    gpt-4o:
+      input_per_mtok: 5.00
+      output_per_mtok: 15.00
+      batch_discount: 0.5
+  anthropic:
+    claude-3-5-sonnet-20241022:
+      input_per_mtok_batch: 1.50
+      output_per_mtok_batch: 7.50
+      batch_discount: 0.6
+    claude-3-5-haiku-20241022:
+      input_per_mtok: 0.80
+      output_per_mtok: 4.00
+      batch_discount: 1.0
+use_batch_api: true
+stats:
+  bootstrap_samples: 100
+  permutation_samples: 100
+  random_seed: 1337
+  enable_permutation: true
+  enable_fdr: true
+  risk_thresholds:
+    - 0.0
+    - 0.25
+    - 0.5
+    - 0.75
+    - 1.0
+  tost_alpha: 0.05
+  tost_margins:
+    em: 0.01
+    f1: 0.01
+unsupported:
+  strategy: overlap
+  threshold: 0.5
+  min_token_overlap: 0.6
+prompt_sets:
+  default:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/treatment_system.txt
+default_prompt_set: default
+sweep: null

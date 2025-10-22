@@ -110,6 +110,13 @@ def normalize_jsonl(src_path: str, dest_path: str) -> int:
             custom_id = row.get("custom_id") or row.get("customId")
             if not custom_id:
                 continue
+            request_info = row.get("request") or {}
+            if isinstance(request_info, dict):
+                meta = request_info.get("metadata")
+                if isinstance(meta, dict):
+                    orig_custom_id = meta.get("orig_custom_id") or meta.get("orig-custom-id")
+                    if orig_custom_id:
+                        custom_id = orig_custom_id
             result = row.get("result") or {}
             result_type = str(result.get("type") or "").lower()
             record: Dict[str, Any] = {"custom_id": str(custom_id)}
