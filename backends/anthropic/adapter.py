@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import glob
 import json
 import os
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from backends.anthropic.build_requests import build_message_requests, write_requests_preview
 from backends.anthropic.normalize_to_openai import normalize_jsonl
@@ -19,6 +20,22 @@ def _utc_now_iso() -> str:
 def _format_temp_label(temp: float) -> str:
     value = f"{float(temp):.1f}"
     return "0" if value == "0.0" else value.replace(".", "")
+
+
+def _part_suffix_fragment(extra: Mapping[str, Any] | None) -> str:
+    if not extra:
+        return ""
+    fragment = extra.get("part_suffix")
+    if fragment:
+        return str(fragment)
+    part_index = extra.get("part_index")
+    if part_index is None:
+        return ""
+    try:
+        idx = int(part_index)
+    except (TypeError, ValueError):
+        return ""
+    return "" if idx <= 0 else f"_p{idx + 1:02d}"
 
 
 def _stringify_dict(data: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -113,8 +130,11 @@ class AnthropicBatchAdapter:
         dry_run: bool,
     ) -> Any:
         extra = artifacts.extra
+        part_suffix = _part_suffix_fragment(extra)
         if artifacts.mode == "reuse":
-            artifacts.batch_id = artifacts.batch_id or f"reuse-{self.backend}-{trial_slug}-{artifacts.condition}-t{_format_temp_label(artifacts.temp)}"
+            artifacts.batch_id = artifacts.batch_id or (
+                f"reuse-{self.backend}-{trial_slug}-{artifacts.condition}-t{_format_temp_label(artifacts.temp)}{part_suffix}"
+            )
             artifacts.extra.setdefault("reuse", True)
             artifacts.extra.setdefault("submitted_at", _utc_now_iso())
             return artifacts
@@ -127,7 +147,7 @@ class AnthropicBatchAdapter:
         temp_label = _format_temp_label(artifacts.temp)
         request_preview_path = os.path.join(
             batch_dir,
-            f"{trial_slug}_{artifacts.condition}_t{temp_label}_requests.jsonl",
+            f"{trial_slug}_{artifacts.condition}_t{temp_label}{part_suffix}_requests.jsonl",
         )
 
         model_id = extra.get("model_id") or self.cfg.get("model_id")
@@ -155,7 +175,7 @@ class AnthropicBatchAdapter:
         artifacts.extra["submitted_at"] = _utc_now_iso()
 
         if dry_run:
-            artifacts.batch_id = f"dry-{self.backend}-{trial_slug}-{artifacts.condition}-t{temp_label}"
+            artifacts.batch_id = f"dry-{self.backend}-{trial_slug}-{artifacts.condition}-t{temp_label}{part_suffix}"
             return artifacts
 
         client = self._ensure_client()
@@ -185,13 +205,14 @@ class AnthropicBatchAdapter:
         dry_run: bool,
     ) -> Any:
         temp_label = _format_temp_label(artifact.temp)
+        part_suffix = _part_suffix_fragment(getattr(artifact, "extra", {}))
         if artifact.mode == "reuse":
             artifact.extra.setdefault("reuse", True)
             artifact.extra.setdefault("poll_completed_at", _utc_now_iso())
             return artifact
 
         if dry_run:
-            placeholder = os.path.join(results_dir, f"{artifact.condition}_t{temp_label}_anthropic_dry.jsonl")
+            placeholder = os.path.join(results_dir, f"{artifact.condition}_t{temp_label}{part_suffix}_anthropic_dry.jsonl")
             os.makedirs(os.path.dirname(placeholder), exist_ok=True)
             if not os.path.isfile(placeholder):
                 with open(placeholder, "w", encoding="utf-8") as fout:
@@ -235,8 +256,8 @@ class AnthropicBatchAdapter:
             batch.get("processing_status") if isinstance(batch, dict) else None
         )
 
-        raw_path = os.path.join(results_dir, f"{artifact.condition}_t{temp_label}_anthropic_raw.jsonl")
-        normalized_path = os.path.join(results_dir, f"{artifact.condition}_t{temp_label}_results.jsonl")
+        raw_path = os.path.join(results_dir, f"{artifact.condition}_t{temp_label}{part_suffix}_anthropic_raw.jsonl")
+        normalized_path = os.path.join(results_dir, f"{artifact.condition}_t{temp_label}{part_suffix}_results.jsonl")
 
         streamed = stream_results_to_jsonl(client, artifact.batch_id, raw_path)
         normalized = normalize_jsonl(raw_path, normalized_path)
@@ -250,6 +271,19 @@ class AnthropicBatchAdapter:
         artifact.extra["request_counts"] = _maybe_model_dump(getattr(batch, "request_counts", None))
         artifact.extra["poll_completed_at"] = _utc_now_iso()
         return artifact
+
+    def _combine_results(self, results_dir: str) -> str | None:
+        normalized_paths = sorted(glob.glob(os.path.join(results_dir, "*_results.jsonl")))
+        if not normalized_paths:
+            return None
+        combined = os.path.join(results_dir, "results_combined.jsonl")
+        with open(combined, "w", encoding="utf-8") as fout:
+            for path in normalized_paths:
+                with open(path, "r", encoding="utf-8") as fin:
+                    for line in fin:
+                        if line.strip():
+                            fout.write(line.rstrip() + "\n")
+        return combined
 
     def parse(
         self,
@@ -266,10 +300,12 @@ class AnthropicBatchAdapter:
             artifact.extra["parsed_at"] = _utc_now_iso()
             return artifact
 
-        if not artifact.results_uri or not os.path.isfile(artifact.results_uri):
+        combined_path = self._combine_results(results_dir)
+        if not combined_path:
             raise RuntimeError("No Anthropic normalized results available to parse.")
         predictions_csv = os.path.join(results_dir, "predictions.csv")
-        process_results(artifact.results_uri, predictions_csv)
+        process_results(combined_path, predictions_csv)
         artifact.extra["predictions_csv"] = predictions_csv
+        artifact.extra["combined_results_path"] = combined_path
         artifact.extra["parsed_at"] = _utc_now_iso()
         return artifact

@@ -2,12 +2,11 @@ from __future__ import annotations
 import os
 import json
 import argparse
-import yaml
 from tqdm import tqdm
 from config.schema import load_config
 import hashlib
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Iterable
 from scripts.state_utils import write_json_atomic
 
 
@@ -59,13 +58,103 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def _count_lines(path: str) -> int:
-    n = 0
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                n += 1
-    return n
+MAX_LINES_PER_SHARD = 9_999
+
+
+class _ShardWriter:
+    """Rotate JSONL shard files once a max line threshold is hit."""
+
+    def __init__(self, base_path: str, *, max_lines: int = MAX_LINES_PER_SHARD) -> None:
+        self.base_path = base_path
+        self.max_lines = max_lines
+        self._parts: list[dict[str, Any]] = []
+        self._current: dict[str, Any] | None = None
+
+    def _part_path(self, index: int) -> str:
+        if index == 0:
+            return self.base_path
+        stem, ext = os.path.splitext(self.base_path)
+        return f"{stem}_part{index + 1:02d}{ext}"
+
+    def _open_new_part(self) -> None:
+        part_index = len(self._parts)
+        path = self._part_path(part_index)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fout = open(path, "w", encoding="utf-8")
+        part = {
+            "path": path,
+            "file": fout,
+            "lines": 0,
+            "bytes": 0,
+            "sha256": hashlib.sha256(),
+            "part_index": part_index,
+        }
+        self._parts.append(part)
+        self._current = part
+
+    def write_json(self, payload: dict[str, Any]) -> None:
+        if self._current is None or self._current["lines"] >= self.max_lines:
+            self._close_current()
+            self._open_new_part()
+        line = json.dumps(payload, ensure_ascii=False)
+        data = (line + "\n").encode("utf-8")
+        assert self._current is not None  # for mypy
+        fout = self._current["file"]
+        fout.write(line + "\n")
+        self._current["lines"] += 1
+        self._current["bytes"] += len(data)
+        self._current["sha256"].update(data)
+
+    def _close_current(self) -> None:
+        if self._current is not None:
+            self._current["file"].close()
+            self._current = None
+
+    def finalize(self) -> list[dict[str, Any]]:
+        self._close_current()
+        finalized: list[dict[str, Any]] = []
+        for part in self._parts:
+            if part["lines"] == 0:
+                try:
+                    os.remove(part["path"])
+                except FileNotFoundError:
+                    pass
+                continue
+            finalized.append(
+                {
+                    "path": part["path"],
+                    "lines": part["lines"],
+                    "size": part["bytes"],
+                    "sha256": part["sha256"].hexdigest(),
+                    "part_index": part["part_index"],
+                }
+            )
+        return finalized
+
+
+def _remove_stale_shards(
+    manifest: dict[str, Any],
+    *,
+    prompt_set: str,
+    temp: float,
+    condition: str,
+    keep_files: Iterable[str],
+) -> None:
+    shards = manifest.setdefault("shards", {})
+    keep = {os.path.basename(path) for path in keep_files}
+    for name, meta in list(shards.items()):
+        if meta.get("prompt_set") != prompt_set:
+            continue
+        try:
+            meta_temp = float(meta.get("temp"))
+        except (TypeError, ValueError):
+            continue
+        if abs(meta_temp - float(temp)) > 1e-6:
+            continue
+        if meta.get("condition") != condition:
+            continue
+        if name not in keep:
+            shards.pop(name, None)
 
 
 def _manifest_path(batch_dir: str) -> str:
@@ -160,91 +249,114 @@ def main():
             if m_ok_ctrl and m_ok_trt:
                 print(f"Resume: skipping build for t={float(t):.1f}, ps={ps_name} (valid shards)")
                 continue
-        with open(out_control, "w", encoding="utf-8") as fc, open(out_treat, "w", encoding="utf-8") as ft:
-            # Ensure per-file uniqueness of custom_id to satisfy Fireworks dataset validation
-            seen_control: set[str] = set()
-            seen_treat: set[str] = set()
-            skipped_control = 0
-            skipped_treat = 0
-            K = int(samples_per_item[str(float(t))])
-            for rows, open_flag in [(cb_rows, False), (ob_rows, True)]:
-                # enumerate to create a stable fallback id when missing
-                for idx, row in enumerate(tqdm(rows, desc=f"t={t} {'open' if open_flag else 'closed'}")):
-                    # derive dataset and id with safe fallbacks
-                    dataset = (
-                        row.get("dataset")
-                        or row.get("source")
-                        or row.get("collection")
-                        or ("open_book" if open_flag else "closed_book")
-                    )
-                    rid = (
-                        row.get("id")
-                        or row.get("example_id")
-                        or row.get("qid")
-                        or row.get("uuid")
-                        or str(idx)
-                    )
-                    custom_prefix = f"{dataset}|{rid}"
+        control_writer = _ShardWriter(out_control, max_lines=MAX_LINES_PER_SHARD)
+        treatment_writer = _ShardWriter(out_treat, max_lines=MAX_LINES_PER_SHARD)
+        # Ensure per-file uniqueness of custom_id to satisfy Fireworks dataset validation
+        seen_control: set[str] = set()
+        seen_treat: set[str] = set()
+        skipped_control = 0
+        skipped_treat = 0
+        K = int(samples_per_item[str(float(t))])
+        for rows, open_flag in [(cb_rows, False), (ob_rows, True)]:
+            # enumerate to create a stable fallback id when missing
+            for idx, row in enumerate(tqdm(rows, desc=f"t={t} {'open' if open_flag else 'closed'}")):
+                # derive dataset and id with safe fallbacks
+                dataset = (
+                    row.get("dataset")
+                    or row.get("source")
+                    or row.get("collection")
+                    or ("open_book" if open_flag else "closed_book")
+                )
+                rid = (
+                    row.get("id")
+                    or row.get("example_id")
+                    or row.get("qid")
+                    or row.get("uuid")
+                    or str(idx)
+                )
+                custom_prefix = f"{dataset}|{rid}"
 
-                    # Prepare user content with fallbacks; skip if no question
-                    question = row.get("question") or row.get("query") or row.get("prompt")
-                    if not question:
-                        # cannot build a prompt without a question; skip this row
-                        continue
-                    if open_flag:
-                        context = row.get("context", "")
-                        user = assemble_user_open(open_instr, context, question)
+                # Prepare user content with fallbacks; skip if no question
+                question = row.get("question") or row.get("query") or row.get("prompt")
+                if not question:
+                    # cannot build a prompt without a question; skip this row
+                    continue
+                if open_flag:
+                    context = row.get("context", "")
+                    user = assemble_user_open(open_instr, context, question)
+                else:
+                    user = assemble_user_closed(closed_instr, question)
+
+                for k in range(K):
+                    typ = "open" if open_flag else "closed"
+                    # CONTROL
+                    cid = f"{custom_prefix}|control|{float(t):.1f}|{k}|{typ}"
+                    if cid in seen_control:
+                        skipped_control += 1
                     else:
-                        user = assemble_user_closed(closed_instr, question)
-
-                    for k in range(K):
-                        typ = "open" if open_flag else "closed"
-                        # CONTROL
-                        cid = f"{custom_prefix}|control|{float(t):.1f}|{k}|{typ}"
-                        if cid in seen_control:
-                            skipped_control += 1
-                        else:
-                            seen_control.add(cid)
-                            payload = build_line(cid, control_system, user, stop=(stop_cfg if include_row_stop else None))
-                            fc.write(json.dumps(payload, ensure_ascii=False) + "\n")
-                        # TREATMENT
-                        cid = f"{custom_prefix}|treatment|{float(t):.1f}|{k}|{typ}"
-                        if cid in seen_treat:
-                            skipped_treat += 1
-                        else:
-                            seen_treat.add(cid)
-                            payload = build_line(cid, treatment_system, user, stop=(stop_cfg if include_row_stop else None))
-                            ft.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        print("Wrote", out_control, "and", out_treat)
+                        seen_control.add(cid)
+                        payload = build_line(cid, control_system, user, stop=(stop_cfg if include_row_stop else None))
+                        control_writer.write_json(payload)
+                    # TREATMENT
+                    cid = f"{custom_prefix}|treatment|{float(t):.1f}|{k}|{typ}"
+                    if cid in seen_treat:
+                        skipped_treat += 1
+                    else:
+                        seen_treat.add(cid)
+                        payload = build_line(cid, treatment_system, user, stop=(stop_cfg if include_row_stop else None))
+                        treatment_writer.write_json(payload)
+        control_entries = control_writer.finalize()
+        treatment_entries = treatment_writer.finalize()
+        all_paths = [entry["path"] for entry in control_entries + treatment_entries]
+        if all_paths:
+            print("Wrote shards:", ", ".join(all_paths))
         if skipped_control or skipped_treat:
             print(
                 f"De-dup summary @ T={float(t):.1f}: skipped {skipped_control} duplicate custom_id(s) in control, {skipped_treat} in treatment."
             )
+        # Remove stale manifest entries for this prompt/temp/condition combo
+        _remove_stale_shards(manifest, prompt_set=ps_name, temp=t, condition="control", keep_files=[e["path"] for e in control_entries])
+        _remove_stale_shards(manifest, prompt_set=ps_name, temp=t, condition="treatment", keep_files=[e["path"] for e in treatment_entries])
+
         # Update manifest entries for these shards
         ctrl_meta = {
-            "path": os.path.basename(out_control),
             "prompt_set": ps_name,
             "condition": "control",
             "temp": float(t),
-            "lines": _count_lines(out_control),
-            "size": int(os.path.getsize(out_control)),
-            "sha256": _sha256_file(out_control),
         }
         trt_meta = {
-            "path": os.path.basename(out_treat),
             "prompt_set": ps_name,
             "condition": "treatment",
             "temp": float(t),
-            "lines": _count_lines(out_treat),
-            "size": int(os.path.getsize(out_treat)),
-            "sha256": _sha256_file(out_treat),
         }
+        shards = manifest.setdefault("shards", {})
+        for entry in control_entries:
+            meta = dict(ctrl_meta)
+            meta.update(
+                {
+                    "path": os.path.basename(entry["path"]),
+                    "lines": entry["lines"],
+                    "size": entry["size"],
+                    "sha256": entry["sha256"],
+                    "part_index": entry["part_index"],
+                }
+            )
+            shards[os.path.basename(entry["path"])] = meta
+        for entry in treatment_entries:
+            meta = dict(trt_meta)
+            meta.update(
+                {
+                    "path": os.path.basename(entry["path"]),
+                    "lines": entry["lines"],
+                    "size": entry["size"],
+                    "sha256": entry["sha256"],
+                    "part_index": entry["part_index"],
+                }
+            )
+            shards[os.path.basename(entry["path"])] = meta
         # Maintain temps list as sorted unique values
         manifest.setdefault("temps", [])
         manifest["temps"] = sorted(list(set([float(x) for x in (manifest.get("temps") or [])] + [float(t)])))
-        shards = manifest.setdefault("shards", {})
-        shards[os.path.basename(out_control)] = ctrl_meta
-        shards[os.path.basename(out_treat)] = trt_meta
         manifest["updated_at"] = datetime.utcnow().isoformat() + "Z"
         write_json_atomic(manifest_path, manifest)
 

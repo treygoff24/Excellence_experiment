@@ -4,7 +4,7 @@ import glob
 import json
 import os
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from backends.openai.build_inputs import build_batch_requests
 from backends.openai.normalize import normalize_jsonl
@@ -20,6 +20,22 @@ def _utc_now_iso() -> str:
 def _format_temp_label(temp: float) -> str:
     value = f"{float(temp):.1f}"
     return "0" if value == "0.0" else value.replace(".", "")
+
+
+def _part_suffix_fragment(extra: Mapping[str, Any] | None) -> str:
+    if not extra:
+        return ""
+    fragment = extra.get("part_suffix")
+    if fragment:
+        return str(fragment)
+    part_index = extra.get("part_index")
+    if part_index is None:
+        return ""
+    try:
+        idx = int(part_index)
+    except (TypeError, ValueError):
+        return ""
+    return "" if idx <= 0 else f"_p{idx + 1:02d}"
 
 
 def _coerce_max_tokens(data: Any) -> dict[str, int]:
@@ -111,8 +127,11 @@ class OpenAIBatchAdapter:
         dry_run: bool,
     ) -> Any:
         extra = artifacts.extra
+        part_suffix = _part_suffix_fragment(extra)
         if artifacts.mode == "reuse":
-            artifacts.batch_id = artifacts.batch_id or f"reuse-openai-{trial_slug}-{artifacts.condition}-t{_format_temp_label(artifacts.temp)}"
+            artifacts.batch_id = artifacts.batch_id or (
+                f"reuse-openai-{trial_slug}-{artifacts.condition}-t{_format_temp_label(artifacts.temp)}{part_suffix}"
+            )
             artifacts.extra.setdefault("reuse", True)
             artifacts.extra.setdefault("submitted_at", _utc_now_iso())
             return artifacts
@@ -123,7 +142,7 @@ class OpenAIBatchAdapter:
 
         batch_dir = self._default_batch_dir(extra)
         temp_label = _format_temp_label(artifacts.temp)
-        request_path = os.path.join(batch_dir, f"{trial_slug}_{artifacts.condition}_t{temp_label}.jsonl")
+        request_path = os.path.join(batch_dir, f"{trial_slug}_{artifacts.condition}_t{temp_label}{part_suffix}.jsonl")
 
         model_id = extra.get("model_id") or self.cfg.get("model_id")
         if not model_id:
@@ -151,7 +170,7 @@ class OpenAIBatchAdapter:
         artifacts.extra["submitted_at"] = _utc_now_iso()
 
         if dry_run:
-            artifacts.batch_id = f"dry-openai-{trial_slug}-{artifacts.condition}-t{temp_label}"
+            artifacts.batch_id = f"dry-openai-{trial_slug}-{artifacts.condition}-t{temp_label}{part_suffix}"
             return artifacts
 
         client = self._ensure_client()
@@ -182,13 +201,14 @@ class OpenAIBatchAdapter:
         dry_run: bool,
     ) -> Any:
         temp_label = _format_temp_label(artifact.temp)
+        part_suffix = _part_suffix_fragment(getattr(artifact, "extra", {}))
         if artifact.mode == "reuse":
             artifact.extra.setdefault("reuse", True)
             artifact.extra.setdefault("poll_completed_at", _utc_now_iso())
             return artifact
 
         if dry_run:
-            placeholder = os.path.join(results_dir, f"{artifact.condition}_t{temp_label}_dry.jsonl")
+            placeholder = os.path.join(results_dir, f"{artifact.condition}_t{temp_label}{part_suffix}_dry.jsonl")
             os.makedirs(os.path.dirname(placeholder), exist_ok=True)
             if not os.path.isfile(placeholder):
                 with open(placeholder, "w", encoding="utf-8") as fout:
@@ -230,7 +250,7 @@ class OpenAIBatchAdapter:
 
         endpoint = artifact.extra.get("endpoint") or self.endpoint
         extracted = download_and_extract(client, output_file_id=output_file_id, out_dir=results_dir)
-        normalized_path = os.path.join(results_dir, f"{artifact.condition}_t{temp_label}_results.jsonl")
+        normalized_path = os.path.join(results_dir, f"{artifact.condition}_t{temp_label}{part_suffix}_results.jsonl")
         normalize_jsonl(extracted, normalized_path, endpoint=endpoint)
 
         artifact.output_file_id = output_file_id
@@ -260,12 +280,16 @@ class OpenAIBatchAdapter:
         artifact: Any,
         dry_run: bool,
     ) -> Any:
+        temp_label = _format_temp_label(artifact.temp)
+        part_suffix = _part_suffix_fragment(getattr(artifact, "extra", {}))
         if artifact.mode == "reuse":
             artifact.extra.setdefault("parsed_at", _utc_now_iso())
             return artifact
 
         if dry_run:
-            artifact.output_file_id = artifact.output_file_id or f"dry-output-openai-{artifact.condition}-t{_format_temp_label(artifact.temp)}"
+            artifact.output_file_id = artifact.output_file_id or (
+                f"dry-output-openai-{artifact.condition}-t{temp_label}{part_suffix}"
+            )
             artifact.extra["parsed_at"] = _utc_now_iso()
             return artifact
 

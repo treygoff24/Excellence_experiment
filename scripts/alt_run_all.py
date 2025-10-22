@@ -7,7 +7,7 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Protocol
 
 import json
 import yaml
@@ -65,6 +65,46 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def _condition_shards(
+    build_manifest: dict[str, Any] | None,
+    *,
+    prompt_set: str,
+    temp: float,
+    condition: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    if not build_manifest:
+        return []
+    shards_obj = build_manifest.get("shards")
+    if not isinstance(shards_obj, dict):
+        return []
+    shards: dict[str, dict[str, Any]] = {}
+    for name, meta in shards_obj.items():
+        if isinstance(meta, dict):
+            shards[str(name)] = meta
+    matches: list[tuple[int, str, dict[str, Any]]] = []
+    for name, meta in shards.items():
+        if meta.get("prompt_set") != prompt_set:
+            continue
+        if meta.get("condition") != condition:
+            continue
+        temp_val = meta.get("temp")
+        if temp_val is None:
+            continue
+        try:
+            meta_temp = float(temp_val)
+        except (TypeError, ValueError):
+            continue
+        if abs(meta_temp - float(temp)) > 1e-6:
+            continue
+        try:
+            part_index = int(meta.get("part_index") or 0)
+        except (TypeError, ValueError):
+            part_index = 0
+        matches.append((part_index, name, meta))
+    matches.sort(key=lambda item: (item[0], item[1]))
+    return [(name, meta) for _, name, meta in matches]
+
+
 @dataclass
 class ProviderArtifacts:
     condition: str
@@ -76,35 +116,35 @@ class ProviderArtifacts:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-class BaseAdapter:
+class BaseAdapter(Protocol):
     backend: str
 
     def submit(
         self,
         *,
         trial_slug: str,
-        artifacts: ProviderArtifacts,
+        artifacts: "ProviderArtifacts",
         dry_run: bool,
-    ) -> ProviderArtifacts:
-        raise NotImplementedError
+    ) -> "ProviderArtifacts":
+        ...
 
     def poll(
         self,
         *,
         results_dir: str,
-        artifact: ProviderArtifacts,
+        artifact: "ProviderArtifacts",
         dry_run: bool,
-    ) -> ProviderArtifacts:
-        raise NotImplementedError
+    ) -> "ProviderArtifacts":
+        ...
 
     def parse(
         self,
         *,
         results_dir: str,
-        artifact: ProviderArtifacts,
+        artifact: "ProviderArtifacts",
         dry_run: bool,
-    ) -> ProviderArtifacts:
-        raise NotImplementedError
+    ) -> "ProviderArtifacts":
+        ...
 
 
 class DryRunAdapter(BaseAdapter):
@@ -797,63 +837,89 @@ def main() -> None:
             for temp in tr.trial.get("temps") or []:
                 t_label = _format_temp_label(float(temp))
                 suffix = _prompt_suffix(tr.trial["prompt_set"], prompt_sets_cfg)
-                control_fname = f"t{t_label}{suffix}_control.jsonl"
-                input_name = os.path.join(cfg["paths"]["batch_inputs_dir"], control_fname)
-                shard_meta = _lookup_shard_meta(build_manifest, os.path.basename(input_name))
-                shard_sha = (shard_meta or {}).get("sha256") or (_sha256_file(input_name) if os.path.isfile(input_name) else "")
-                ctrl_key = _compute_control_key(
-                    run_id=run_id,
-                    backend=backend_tag,
-                    model_id=tr.trial["model_id"],
-                    temp=float(temp),
-                    top_p=tr.trial.get("top_p"),
-                    top_k=tr.trial.get("top_k"),
-                    max_new_tokens=tr.trial.get("max_new_tokens"),
-                    samples_per_item=cfg.get("samples_per_item") or {},
-                    control_prompt_sha=manifest.get("prompts", {}).get("control", {}).get("sha256"),
-                    input_sha=shard_sha,
-                )
-                label = f"t{t_label}"
-                entry, mutated = _ensure_control_entry(
-                    run_root=run_root,
-                    control_registry=control_registry,
-                    manifest=manifest,
-                    label=label,
-                    ctrl_key=ctrl_key,
-                    slug=tr.slug,
-                    prompt_sha=manifest.get("prompts", {}).get("control", {}).get("sha256"),
-                    input_sha=shard_sha,
-                    backend_tag=backend_tag,
-                    model_id=tr.trial["model_id"],
-                    temp=float(temp),
-                )
-                if mutated:
-                    control_registry_dirty = True
-                manifest["control_registry"][label] = entry
-                mf.write_manifest(tr.manifest_path, manifest)
-
                 for cond in conditions:
-                    cond_fname = f"t{t_label}{suffix}_{cond}.jsonl"
-                    cond_source = os.path.join(cfg["paths"]["batch_inputs_dir"], cond_fname)
-                    mode = "reuse" if (cond == "control" and entry.get("mode") == "reuse") else "producer"
-                    art = ProviderArtifacts(condition=cond, temp=float(temp), mode=mode)
-                    top_p = tr.trial.get("top_p")
-                    if top_p is None:
-                        top_p = cfg.get("top_p")
-                    top_k = tr.trial.get("top_k")
-                    if top_k is None:
-                        top_k = cfg.get("top_k")
-                    art.extra.update({
-                        "model_id": tr.trial["model_id"],
-                        "top_p": top_p,
-                        "top_k": top_k,
-                        "max_new_tokens": tr.trial.get("max_new_tokens") or cfg.get("max_new_tokens"),
-                        "source_jsonl": cond_source,
-                        "provider_batch_dir": provider_batch_dir,
-                        "prompt_set": tr.trial.get("prompt_set"),
-                        "run_root": run_root,
-                    })
-                    artifacts.append(adapter.submit(trial_slug=tr.slug, artifacts=art, dry_run=args.dry_run))
+                    shard_entries = _condition_shards(
+                        build_manifest,
+                        prompt_set=tr.trial["prompt_set"],
+                        temp=float(temp),
+                        condition=cond,
+                    )
+                    if not shard_entries:
+                        cond_fname = f"t{t_label}{suffix}_{cond}.jsonl"
+                        shard_entries = [
+                            (
+                                os.path.basename(cond_fname),
+                                _lookup_shard_meta(build_manifest, os.path.basename(cond_fname)) or {},
+                            )
+                        ]
+                    for shard_idx, (cond_fname, shard_meta) in enumerate(shard_entries):
+                        cond_source = os.path.join(cfg["paths"]["batch_inputs_dir"], cond_fname)
+                        try:
+                            part_index = int((shard_meta or {}).get("part_index") or 0)
+                        except (TypeError, ValueError):
+                            part_index = shard_idx if len(shard_entries) > 1 else 0
+                        part_suffix = "" if part_index <= 0 else f"_p{part_index + 1:02d}"
+
+                        entry = None
+                        mode = "producer"
+                        if cond == "control":
+                            shard_sha = (shard_meta or {}).get("sha256") or (
+                                _sha256_file(cond_source) if os.path.isfile(cond_source) else ""
+                            )
+                            ctrl_key = _compute_control_key(
+                                run_id=run_id,
+                                backend=backend_tag,
+                                model_id=tr.trial["model_id"],
+                                temp=float(temp),
+                                top_p=tr.trial.get("top_p"),
+                                top_k=tr.trial.get("top_k"),
+                                max_new_tokens=tr.trial.get("max_new_tokens"),
+                                samples_per_item=cfg.get("samples_per_item") or {},
+                                control_prompt_sha=manifest.get("prompts", {}).get("control", {}).get("sha256"),
+                                input_sha=shard_sha,
+                            )
+                            label = f"t{t_label}{part_suffix}"
+                            entry, mutated = _ensure_control_entry(
+                                run_root=run_root,
+                                control_registry=control_registry,
+                                manifest=manifest,
+                                label=label,
+                                ctrl_key=ctrl_key,
+                                slug=tr.slug,
+                                prompt_sha=manifest.get("prompts", {}).get("control", {}).get("sha256"),
+                                input_sha=shard_sha,
+                                backend_tag=backend_tag,
+                                model_id=tr.trial["model_id"],
+                                temp=float(temp),
+                            )
+                            if mutated:
+                                control_registry_dirty = True
+                            manifest["control_registry"][label] = entry
+                            mf.write_manifest(tr.manifest_path, manifest)
+                            if entry.get("mode") == "reuse":
+                                mode = "reuse"
+
+                        art = ProviderArtifacts(condition=cond, temp=float(temp), mode=mode)
+                        top_p = tr.trial.get("top_p")
+                        if top_p is None:
+                            top_p = cfg.get("top_p")
+                        top_k = tr.trial.get("top_k")
+                        if top_k is None:
+                            top_k = cfg.get("top_k")
+                        art.extra.update({
+                            "model_id": tr.trial["model_id"],
+                            "top_p": top_p,
+                            "top_k": top_k,
+                            "max_new_tokens": tr.trial.get("max_new_tokens") or cfg.get("max_new_tokens"),
+                            "source_jsonl": cond_source,
+                            "provider_batch_dir": provider_batch_dir,
+                            "prompt_set": tr.trial.get("prompt_set"),
+                            "run_root": run_root,
+                            "shard_name": cond_fname,
+                            "part_index": part_index,
+                            "part_suffix": part_suffix,
+                        })
+                        artifacts.append(adapter.submit(trial_slug=tr.slug, artifacts=art, dry_run=args.dry_run))
             tr.artifacts = artifacts
             _update_stage(
                 manifest=manifest,
