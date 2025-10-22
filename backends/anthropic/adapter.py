@@ -68,7 +68,10 @@ class AnthropicBatchAdapter:
             raise RuntimeError(
                 "Anthropic SDK is required for Anthropic backend integration. Install the 'anthropic' package."
             ) from exc
-        self._client = anthropic.Anthropic(**self.client_options)
+        client_ctor = getattr(anthropic, "Anthropic", None)
+        if client_ctor is None or not callable(client_ctor):
+            raise RuntimeError("Anthropic SDK does not expose the expected Anthropic client constructor.")
+        self._client = client_ctor(**self.client_options)
         return self._client
 
     def _default_batch_dir(self, artifact_extra: dict[str, Any]) -> str:

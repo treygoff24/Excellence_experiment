@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any
+from typing import Any, Callable, Iterable, cast
 
 
 def _get_processing_status(batch: Any) -> str | None:
@@ -57,7 +57,7 @@ def _serialize_result_item(item: Any) -> str:
         return json.dumps({})
     dump_json = getattr(item, "model_dump_json", None)
     if callable(dump_json):
-        return dump_json()
+        return str(dump_json())
     dump = getattr(item, "model_dump", None)
     if callable(dump):
         return json.dumps(dump(), ensure_ascii=False)
@@ -95,7 +95,8 @@ def stream_results_to_jsonl(
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
     count = 0
     with open(dest_path, "w", encoding="utf-8") as fout:
-        for item in results_iter(batch_id):
+        iter_results = cast(Callable[[str], Iterable[Any]], results_iter)
+        for item in iter_results(batch_id):
             serialized = _serialize_result_item(item)
             if not serialized:
                 continue

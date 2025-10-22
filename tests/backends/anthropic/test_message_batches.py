@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ import pytest
 from backends.anthropic.build_requests import MAX_REQUESTS_PER_BATCH, build_message_requests, write_requests_preview
 from backends.anthropic.normalize_to_openai import normalize_jsonl
 from backends.anthropic.poll_and_stream import poll_until_complete, stream_results_to_jsonl
+from fireworks.parse_results import process_results
 
 
 def _jsonl_write(path: Path, rows: list[dict]) -> None:
@@ -140,6 +142,20 @@ def test_normalize_jsonl_handles_success_and_failure(tmp_path: Path) -> None:
     second = json.loads(lines[1])
     assert second["error"]["message"] == "Bad prompt"
     assert second["response"]["status"] == "errored"
+
+    out_csv = tmp_path / "predictions.csv"
+    process_results(str(dest), str(out_csv))
+    with out_csv.open("r", encoding="utf-8", newline="") as fcsv:
+        rows = list(csv.DictReader(fcsv))
+    assert len(rows) == count
+    success_row = rows[0]
+    assert success_row["custom_id"] == "dataset|item|treatment|0.0|0|open"
+    assert success_row["response_text"] == "Hello world!"
+    assert success_row["finish_reason"] == "end_turn"
+    assert success_row["request_id"] == "msg_1"
+    # CSV writer stringifies integers; validate tokens survived normalization
+    assert success_row["prompt_tokens"] == "42"
+    assert success_row["completion_tokens"] == "128"
 
 
 class _StubResults:
