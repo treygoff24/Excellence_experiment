@@ -17,9 +17,10 @@
 - Make targets:
   - `make venv` — create venv and install deps.
   - `make data` — download/prepare datasets to `data/prepared/`.
-  - `make build` — create batch inputs in `data/batch_inputs/`.
-  - `make eval` — full pipeline via `scripts/run_all.py`.
+- `make build` — create batch inputs in `data/batch_inputs/`.
+- `make eval` — full pipeline via `scripts/run_all.py`.
 - `make smoke` — small end‑to‑end run for sanity checks.
+- `make alt-smoke` — exercises the OpenAI/Anthropic replay fixtures; run `make venv` first so `.venv/bin/python` exists, or invoke `python3 -m scripts.alt_smoke` manually.
 - Orchestrator smoke (dry‑run, auto‑cleanup):
   - `python -m scripts.smoke_orchestration --n 3 --prompt_set operational_only` (add `--keep` to retain outputs)
 - `make parse | score | stats | report` — post‑processing utilities.

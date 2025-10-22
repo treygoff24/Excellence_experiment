@@ -148,6 +148,7 @@ Alternative backends (OpenAI/Anthropic scaffolding)
 - `python -m scripts.alt_run_all --backend openai --config config/alt_eval_config.yaml --dry_run --skip_prepare --skip_build --limit_items 2`
   - Reuses prepare/build artifacts, writes per-trial manifest v2 with provider metadata (`batch_id`, `results_uri`, `output_file_id`), and refreshes the shared control registry once per control shard. Non-dry-run execution requires provider adapters (tickets 202/203).
 - Cost summaries: `python -m scripts.summarize_costs --config config/alt_eval_config.yaml --usage_json results/usage.json --out_path results/costs.json` reads OpenAI (`prompt_tokens`/`completion_tokens`) and Anthropic (`input_tokens`/`output_tokens`) usage reports, applies batch discounts, and records provider/pricing keys into the trial manifest. Add `--dry_run` to inspect the summary without writing.
+- Alt smoke harness: `make alt-smoke` runs the dry-run + replay fixtures. Run `make venv` first so `.venv/bin/python` exists; otherwise call `python3 -m scripts.alt_smoke --mode both` directly.
 
 Smoke tests
 - Classic flow: `python -m scripts.smoke_test --mode flow --n 2`

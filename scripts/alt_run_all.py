@@ -979,11 +979,234 @@ def main() -> None:
     else:
         print("Gating: skipping parse")
 
-    # Downstream phases require real parse outputs; skip until adapters land.
-    downstream = {"score", "stats", "costs", "report"}
-    for phase in downstream:
-        if phase in selected_phases:
-            print(f"NOTE: {phase} phase requires parsed outputs. Skipping until provider adapters implement full path.")
+    def _results_file(tr: TrialRun, name: str) -> str:
+        return os.path.join(tr.results_dir, name)
+
+    def _reports_file(tr: TrialRun, name: str) -> str:
+        return os.path.join(tr.reports_dir, name)
+
+    def _needs_refresh(output_path: str, inputs: Iterable[str]) -> bool:
+        if not output_path or not os.path.isfile(output_path):
+            return True
+        try:
+            out_mtime = os.path.getmtime(output_path)
+        except OSError:
+            return True
+        for dep in inputs:
+            if not dep:
+                continue
+            if not os.path.isfile(dep):
+                continue
+            try:
+                if os.path.getmtime(dep) > out_mtime:
+                    return True
+            except OSError:
+                return True
+        return False
+
+    # Score phase
+    if "score" in selected_phases:
+        prepared_dir = (cfg.get("paths") or {}).get("prepared_dir")
+        if not prepared_dir or not os.path.isdir(prepared_dir):
+            print(f"NOTE: skipping score phase because prepared_dir is unavailable ({prepared_dir!r}).")
+        else:
+            score_targets: list[TrialRun] = []
+            for tr in trial_runs:
+                preds_path = _results_file(tr, "predictions.csv")
+                if not os.path.isfile(preds_path):
+                    raise FileNotFoundError(f"Expected predictions.csv before scoring: {preds_path}")
+                per_item_path = _results_file(tr, "per_item_scores.csv")
+                if _needs_refresh(per_item_path, [preds_path, effective_config_path]):
+                    score_targets.append(tr)
+            if score_targets:
+                mark_state("score", "in_progress")
+                for tr in score_targets:
+                    preds_path = _results_file(tr, "predictions.csv")
+                    per_item_path = _results_file(tr, "per_item_scores.csv")
+                    try:
+                        run_cmd(
+                            [
+                                sys.executable,
+                                "-m",
+                                "scoring.score_predictions",
+                                "--pred_csv",
+                                preds_path,
+                                "--prepared_dir",
+                                prepared_dir,
+                                "--out_dir",
+                                tr.results_dir,
+                                "--config",
+                                effective_config_path,
+                            ]
+                        )
+                    except Exception:
+                        print(
+                            f"WARNING: scoring failed for {tr.slug}; downstream stats/costs/report will be skipped for this trial."
+                        )
+                        continue
+                    if os.path.isfile(per_item_path):
+                        tr.manifest.setdefault("stage_status", {})["score"] = {
+                            "status": "completed",
+                            "updated_at": _utc_now_iso(),
+                            "artifacts": {"per_item_scores_csv": os.path.relpath(per_item_path, tr.results_dir)},
+                        }
+                        mf.write_manifest(tr.manifest_path, tr.manifest)
+                if all(os.path.isfile(_results_file(tr, "per_item_scores.csv")) for tr in trial_runs):
+                    mark_state("score", "completed")
+            else:
+                if all(os.path.isfile(_results_file(tr, "per_item_scores.csv")) for tr in trial_runs):
+                    mark_state("score", "completed")
+                print("Gating: skipping score (up-to-date)")
+    else:
+        print("Gating: skipping score")
+
+    # Stats phase
+    if "stats" in selected_phases:
+        missing_per_item = [tr.slug for tr in trial_runs if not os.path.isfile(_results_file(tr, "per_item_scores.csv"))]
+        if missing_per_item:
+            print("NOTE: skipping stats phase because per_item_scores.csv is missing for:", ", ".join(missing_per_item))
+        else:
+            stats_targets: list[TrialRun] = []
+            for tr in trial_runs:
+                sig_path = _results_file(tr, "significance.json")
+                per_item_path = _results_file(tr, "per_item_scores.csv")
+                if _needs_refresh(sig_path, [per_item_path, effective_config_path]):
+                    stats_targets.append(tr)
+            if stats_targets:
+                mark_state("stats", "in_progress")
+                for tr in stats_targets:
+                    per_item_path = _results_file(tr, "per_item_scores.csv")
+                    sig_path = _results_file(tr, "significance.json")
+                    try:
+                        run_cmd(
+                            [
+                                sys.executable,
+                                "-m",
+                                "scoring.stats",
+                                "--per_item_csv",
+                                per_item_path,
+                                "--config",
+                                effective_config_path,
+                                "--out_path",
+                                sig_path,
+                            ]
+                        )
+                    except Exception:
+                        with open(sig_path, "w", encoding="utf-8") as fh:
+                            json.dump({}, fh)
+                    tr.manifest.setdefault("stage_status", {})["stats"] = {
+                        "status": "completed",
+                        "updated_at": _utc_now_iso(),
+                        "artifacts": {"significance_json": os.path.relpath(sig_path, tr.results_dir)},
+                    }
+                    mf.write_manifest(tr.manifest_path, tr.manifest)
+                if all(os.path.isfile(_results_file(tr, "significance.json")) for tr in trial_runs):
+                    mark_state("stats", "completed")
+            else:
+                if all(os.path.isfile(_results_file(tr, "significance.json")) for tr in trial_runs):
+                    mark_state("stats", "completed")
+                print("Gating: skipping stats (up-to-date)")
+    else:
+        print("Gating: skipping stats")
+
+    # Costs phase
+    if "costs" in selected_phases:
+        missing_preds = [tr.slug for tr in trial_runs if not os.path.isfile(_results_file(tr, "predictions.csv"))]
+        if missing_preds:
+            print("NOTE: skipping costs phase because predictions.csv is missing for:", ", ".join(missing_preds))
+        else:
+            costs_targets: list[TrialRun] = []
+            for tr in trial_runs:
+                costs_path = _results_file(tr, "costs.json")
+                preds_path = _results_file(tr, "predictions.csv")
+                if _needs_refresh(costs_path, [preds_path, effective_config_path]):
+                    costs_targets.append(tr)
+            if costs_targets:
+                mark_state("costs", "in_progress")
+                for tr in costs_targets:
+                    costs_path = _results_file(tr, "costs.json")
+                    try:
+                        run_cmd(
+                            [
+                                sys.executable,
+                                "-m",
+                                "scripts.summarize_costs",
+                                "--pred_csv",
+                                _results_file(tr, "predictions.csv"),
+                                "--config",
+                                effective_config_path,
+                                "--out_path",
+                                costs_path,
+                            ]
+                        )
+                    except Exception:
+                        print(f"WARNING: cost summarization failed for {tr.slug}; skipping costs output for this trial.")
+                        continue
+                    tr.manifest.setdefault("stage_status", {})["costs"] = {
+                        "status": "completed",
+                        "updated_at": _utc_now_iso(),
+                        "artifacts": {"costs_json": os.path.relpath(costs_path, tr.results_dir)},
+                    }
+                    mf.write_manifest(tr.manifest_path, tr.manifest)
+                if all(os.path.isfile(_results_file(tr, "costs.json")) for tr in trial_runs):
+                    mark_state("costs", "completed")
+            else:
+                if all(os.path.isfile(_results_file(tr, "costs.json")) for tr in trial_runs):
+                    mark_state("costs", "completed")
+                print("Gating: skipping costs (up-to-date)")
+    else:
+        print("Gating: skipping costs")
+
+    # Report phase
+    if "report" in selected_phases:
+        missing_report_inputs: list[str] = []
+        for tr in trial_runs:
+            required = [
+                _results_file(tr, "per_item_scores.csv"),
+                _results_file(tr, "significance.json"),
+                _results_file(tr, "costs.json"),
+            ]
+            if not all(os.path.isfile(path) for path in required):
+                missing_report_inputs.append(tr.slug)
+        if missing_report_inputs:
+            print("NOTE: skipping report phase because prerequisites are missing for:", ", ".join(missing_report_inputs))
+        else:
+            report_targets: list[TrialRun] = []
+            for tr in trial_runs:
+                report_path = _reports_file(tr, "report.md")
+                deps = [
+                    _results_file(tr, "per_item_scores.csv"),
+                    _results_file(tr, "significance.json"),
+                    _results_file(tr, "costs.json"),
+                    effective_config_path,
+                ]
+                if _needs_refresh(report_path, deps):
+                    report_targets.append(tr)
+            if report_targets:
+                mark_state("report", "in_progress")
+                for tr in report_targets:
+                    run_cmd(
+                        [
+                            sys.executable,
+                            "-m",
+                            "scripts.generate_report",
+                            "--config",
+                            effective_config_path,
+                            "--results_dir",
+                            tr.results_dir,
+                            "--reports_dir",
+                            tr.reports_dir,
+                        ]
+                    )
+                    tr.manifest, _ = mf.load_manifest(tr.manifest_path)
+                if all(os.path.isfile(_reports_file(tr, "report.md")) for tr in trial_runs):
+                    mark_state("report", "completed")
+            else:
+                if all(os.path.isfile(_reports_file(tr, "report.md")) for tr in trial_runs):
+                    mark_state("report", "completed")
+                print("Gating: skipping report (up-to-date)")
+    else:
+        print("Gating: skipping report")
 
     if run_root:
         _write_multi_manifest(run_root, run_id, trial_runs)
