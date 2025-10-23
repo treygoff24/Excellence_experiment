@@ -4,9 +4,11 @@ import csv
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from backends.anthropic.adapter import AnthropicBatchAdapter
 from backends.anthropic.build_requests import MAX_REQUESTS_PER_BATCH, build_message_requests, write_requests_preview
 from backends.anthropic.normalize_to_openai import normalize_jsonl
 from backends.anthropic.poll_and_stream import poll_until_complete, stream_results_to_jsonl
@@ -47,14 +49,15 @@ def test_build_message_requests_basic(tmp_path: Path) -> None:
     )
     assert len(requests) == 1
     req = requests[0]
-    assert req.custom_id == "dataset|item|control|0.0|0|open"
+    assert req.custom_id == "dataset_item_control_0_0_0_open"
+    assert req.orig_custom_id == "dataset|item|control|0.0|0|open"
     assert req.params["model"] == "claude-sonnet-3.5"
     assert req.params["system"] == "You are a helpful assistant."
     assert req.params["messages"][0]["role"] == "user"
     assert req.params["messages"][0]["content"] == "Outline selective risk."
     assert req.params["stop_sequences"] == ["</end>"]
     assert req.params["max_tokens"] == 1536
-    assert req.params["metadata"]["trial"] == "slug-123"
+    assert req.metadata["trial"] == "slug-123"
 
     preview = tmp_path / "preview.jsonl"
     written = write_requests_preview(requests, str(preview))
@@ -198,3 +201,151 @@ def test_poll_and_stream_writes_results(tmp_path: Path) -> None:
     assert count == 1
     written = out_path.read_text(encoding="utf-8").strip()
     assert "custom_id" in written
+
+
+class _StubLimiter:
+    def __init__(self):
+        self.before_calls: list[tuple[Any, int]] = []
+        self.register_calls: list[tuple[str, int]] = []
+        self.retry_calls: list[tuple[int, Any]] = []
+        self.completed: list[str] = []
+
+    def before_submit(self, client: Any, request_count: int) -> None:
+        self.before_calls.append((client, request_count))
+
+    def register_batch(self, batch_id: str | None, request_count: int) -> None:
+        if batch_id:
+            self.register_calls.append((batch_id, request_count))
+
+    def compute_retry_delay(self, error: Any, attempt: int) -> float:
+        self.retry_calls.append((attempt, error))
+        return 0.5
+
+    def mark_batch_complete(self, batch: Any) -> None:
+        batch_id = getattr(batch, "id", None) or getattr(batch, "batch_id", None)
+        if batch_id:
+            self.completed.append(batch_id)
+
+
+def test_adapter_retries_and_registers_batches(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    src = tmp_path / "batch.jsonl"
+    _jsonl_write(
+        src,
+        [
+            {
+                "custom_id": "item|0",
+                "body": {
+                    "messages": [
+                        {"role": "system", "content": "You are concise."},
+                        {"role": "user", "content": "Hi"},
+                    ]
+                },
+            }
+        ],
+    )
+
+    class FakeRateLimitError(Exception):
+        status_code = 429
+
+        def __init__(self):
+            self.response = SimpleNamespace(headers={"Retry-After": "1"})
+            self.body = {"error": {"type": "rate_limit_error"}}
+
+    class _Batches:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise FakeRateLimitError()
+            return SimpleNamespace(
+                id="msgbatch_123",
+                processing_status="in_progress",
+                request_counts={"processing": len(kwargs.get("requests", []))},
+            )
+
+    client = SimpleNamespace(messages=SimpleNamespace(batches=_Batches()))
+
+    cfg = {
+        "model_id": "claude-test",
+        "paths": {"batch_inputs_dir": str(tmp_path)},
+        "max_new_tokens": {"open_book": 128, "closed_book": 128},
+        "top_p": 1.0,
+        "top_k": 50,
+        "provider": {"name": "anthropic", "model": "claude-test"},
+    }
+    adapter = AnthropicBatchAdapter(cfg, client=client)
+    adapter._anthropic = SimpleNamespace(RateLimitError=FakeRateLimitError)
+    limiter = _StubLimiter()
+    adapter._limiter = limiter
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr("backends.anthropic.adapter.time.sleep", lambda seconds: sleep_calls.append(seconds))
+
+    artifact = SimpleNamespace(
+        condition="control",
+        temp=0.0,
+        mode="producer",
+        batch_id=None,
+        extra={
+            "model_id": "claude-test",
+            "source_jsonl": str(src),
+            "prompt_set": "default",
+            "part_suffix": "",
+        },
+    )
+
+    result = adapter.submit(trial_slug="trial-1", artifacts=artifact, dry_run=False)
+
+    assert result.batch_id == "msgbatch_123"
+    assert result.extra.get("rate_limit_retries") == 1
+    assert sleep_calls == [0.5]
+    assert len(limiter.before_calls) == 2  # one per attempt
+    assert limiter.register_calls == [("msgbatch_123", 1)]
+
+
+def test_adapter_poll_marks_completion(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+
+    class _Results:
+        def retrieve(self, batch_id: str):
+            return SimpleNamespace(
+                id=batch_id,
+                processing_status="ended",
+                request_counts={"processing": 0},
+            )
+
+        def results(self, batch_id: str):
+            row = {
+                "custom_id": "item|0",
+                "result": {"type": "succeeded", "message": {"content": "ok"}},
+            }
+            yield SimpleNamespace(model_dump_json=lambda data=None, row=row: json.dumps(row))
+
+    client = SimpleNamespace(messages=SimpleNamespace(batches=_Results()))
+
+    cfg = {
+        "model_id": "claude-test",
+        "paths": {"batch_inputs_dir": str(tmp_path)},
+        "max_new_tokens": {"open_book": 128, "closed_book": 128},
+        "top_p": 1.0,
+        "top_k": 50,
+        "provider": {"name": "anthropic", "model": "claude-test", "poll_seconds": 0.0},
+    }
+    adapter = AnthropicBatchAdapter(cfg, client=client)
+    limiter = _StubLimiter()
+    adapter._limiter = limiter
+
+    artifact = SimpleNamespace(
+        condition="control",
+        temp=0.0,
+        mode="producer",
+        batch_id="msgbatch_456",
+        extra={},
+    )
+
+    updated = adapter.poll(results_dir=str(results_dir), artifact=artifact, dry_run=False)
+    assert updated.extra["normalized_rows"] == 1
+    assert limiter.completed == ["msgbatch_456"]

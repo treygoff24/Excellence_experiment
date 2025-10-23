@@ -31,6 +31,13 @@ provider:
     completion_window: 24h
     max_output_tokens: 512
     temperature: 0.0
+  rate_limits:
+    processing_queue_limit: 100000
+    processing_queue_safety_margin: 0.1
+    processing_queue_poll_seconds: 5.0
+    batch_requests_per_minute: 2000
+    max_rate_limit_retries: 5
+    retry_after_fallback_seconds: 30.0
 pricing:
   input_per_million: 0.15
   output_per_million: 0.60

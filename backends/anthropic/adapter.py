@@ -3,12 +3,14 @@ from __future__ import annotations
 import glob
 import json
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
 from backends.anthropic.build_requests import build_message_requests, write_requests_preview
 from backends.anthropic.normalize_to_openai import normalize_jsonl
 from backends.anthropic.poll_and_stream import poll_until_complete, stream_results_to_jsonl
+from backends.anthropic.rate_limiter import AnthropicBatchLimiter
 from backends.anthropic.start_message_batch import start_message_batch
 from fireworks.parse_results import process_results
 
@@ -111,7 +113,10 @@ class AnthropicBatchAdapter:
         self.batch_metadata = dict(provider_cfg.get("batch_metadata") or provider_cfg.get("job_metadata") or {})
         self.client_options = dict(provider_cfg.get("client_options") or {})
         self.provider_cfg = provider_cfg
+        self.rate_limits_cfg = dict(provider_cfg.get("rate_limits") or {})
         self._client = client
+        self._limiter: AnthropicBatchLimiter | None = None
+        self._anthropic: Any | None = None
 
     def _ensure_client(self) -> Any:
         if self._client is not None:
@@ -126,7 +131,33 @@ class AnthropicBatchAdapter:
         if client_ctor is None or not callable(client_ctor):
             raise RuntimeError("Anthropic SDK does not expose the expected Anthropic client constructor.")
         self._client = client_ctor(**self.client_options)
+        self._anthropic = anthropic
         return self._client
+
+    def _ensure_limiter(self, client: Any) -> AnthropicBatchLimiter | None:
+        if self._limiter is not None:
+            return self._limiter
+        cfg = self.rate_limits_cfg or {}
+        queue_limit = cfg["processing_queue_limit"] if "processing_queue_limit" in cfg else 100_000
+        rpm_limit = cfg["batch_requests_per_minute"] if "batch_requests_per_minute" in cfg else 2_000
+        safety_margin = cfg.get("processing_queue_safety_margin", 0.1)
+        queue_poll_seconds = cfg.get("processing_queue_poll_seconds", 10.0)
+        max_retries = cfg.get("max_rate_limit_retries", 5)
+        retry_fallback = cfg.get("retry_after_fallback_seconds", 30.0)
+        # Allow disabling by explicitly setting values to null in config
+        queue_limit_int = int(queue_limit) if queue_limit is not None else None
+        rpm_limit_int = int(rpm_limit) if rpm_limit is not None else None
+        if queue_limit_int is None and rpm_limit_int is None:
+            return None
+        self._limiter = AnthropicBatchLimiter(
+            processing_limit=queue_limit_int,
+            safety_margin=float(safety_margin),
+            queue_poll_seconds=float(queue_poll_seconds),
+            rpm_limit=rpm_limit_int,
+            max_retries=int(max_retries),
+            retry_after_fallback=float(retry_fallback),
+        )
+        return self._limiter
 
     def _default_batch_dir(self, artifact_extra: dict[str, Any]) -> str:
         if artifact_extra.get("provider_batch_dir"):
@@ -216,7 +247,8 @@ class AnthropicBatchAdapter:
         except Exception:
             id_map_path = None
 
-        artifacts.extra["request_count"] = len(requests)
+        request_count = len(requests)
+        artifacts.extra["request_count"] = request_count
         artifacts.extra["request_preview"] = request_preview_path
         artifacts.extra["submitted_at"] = _utc_now_iso()
         if id_map_path:
@@ -227,22 +259,42 @@ class AnthropicBatchAdapter:
             return artifacts
 
         client = self._ensure_client()
+        limiter = self._ensure_limiter(client)
         batch_metadata = self._prepare_batch_metadata(trial_slug, artifacts)
-        batch = start_message_batch(
-            client,
-            requests,
-            metadata=batch_metadata,
-            batch_params=self.batch_params or None,
-        )
+        attempt = 0
+        while True:
+            if limiter:
+                limiter.before_submit(client, request_count)
+            try:
+                batch = start_message_batch(
+                    client,
+                    requests,
+                    metadata=batch_metadata,
+                    batch_params=self.batch_params or None,
+                )
+                break
+            except Exception as exc:
+                if not limiter or not self._is_rate_limit_error(exc):
+                    raise
+                delay = limiter.compute_retry_delay(exc, attempt)
+                attempt += 1
+                print(
+                    f"Anthropic batch rate limited (attempt {attempt}); retrying in {delay:.1f}s.",
+                )
+                time.sleep(delay)
         batch_id = getattr(batch, "id", None) or getattr(batch, "batch_id", None) or (batch.get("id") if isinstance(batch, dict) else None)
         if not batch_id:
             raise RuntimeError("Anthropic batch submission did not return a batch id.")
+        if limiter:
+            limiter.register_batch(batch_id, request_count)
         artifacts.batch_id = batch_id
         artifacts.extra["batch_metadata"] = batch_metadata
         artifacts.extra["batch_status"] = getattr(batch, "processing_status", None) or (
             batch.get("processing_status") if isinstance(batch, dict) else None
         )
         artifacts.extra["request_counts"] = _maybe_model_dump(getattr(batch, "request_counts", None))
+        if attempt:
+            artifacts.extra["rate_limit_retries"] = attempt
         return artifacts
 
     def poll(
@@ -299,7 +351,10 @@ class AnthropicBatchAdapter:
             raise ValueError("Cannot poll Anthropic batch without batch_id.")
 
         client = self._ensure_client()
+        limiter = self._ensure_limiter(client)
         batch = poll_until_complete(client, artifact.batch_id, poll_seconds=self.poll_seconds)
+        if limiter:
+            limiter.mark_batch_complete(batch)
         status = getattr(batch, "processing_status", None) or (
             batch.get("processing_status") if isinstance(batch, dict) else None
         )
@@ -360,3 +415,37 @@ class AnthropicBatchAdapter:
         artifact.extra["combined_results_path"] = combined_path
         artifact.extra["parsed_at"] = _utc_now_iso()
         return artifact
+
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        if self._anthropic is None:
+            try:
+                import anthropic  # type: ignore[import-not-found]
+            except Exception:  # pragma: no cover - optional dependency
+                anthropic = None  # type: ignore[assignment]
+            else:
+                self._anthropic = anthropic
+        rate_limit_cls = None
+        if self._anthropic is not None:
+            rate_limit_cls = getattr(self._anthropic, "RateLimitError", None)
+        if rate_limit_cls is not None and isinstance(exc, rate_limit_cls):
+            return True
+        status_code = getattr(exc, "status_code", None)
+        if status_code == 429:
+            return True
+        if exc.__class__.__name__.lower() == "ratelimiterror":
+            return True
+        body = getattr(exc, "body", None)
+        data: dict[str, Any] = {}
+        if isinstance(body, dict):
+            data = body
+        elif hasattr(body, "model_dump"):
+            try:
+                dumped = body.model_dump()
+                if isinstance(dumped, dict):
+                    data = dumped
+            except Exception:
+                data = {}
+        error_obj = data.get("error") if isinstance(data, dict) else None
+        if isinstance(error_obj, dict) and error_obj.get("type") == "rate_limit_error":
+            return True
+        return False

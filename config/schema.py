@@ -64,6 +64,41 @@ class ProviderBatchModel(BaseModel):
         return fv
 
 
+class ProviderRateLimitModel(BaseModel):
+    batch_requests_per_minute: Optional[int] = None
+    processing_queue_limit: Optional[int] = None
+    processing_queue_safety_margin: float = Field(default=0.1)
+    processing_queue_poll_seconds: float = Field(default=10.0)
+    max_rate_limit_retries: int = Field(default=5)
+    retry_after_fallback_seconds: float = Field(default=30.0)
+
+    @field_validator("batch_requests_per_minute", "processing_queue_limit", "max_rate_limit_retries")
+    @classmethod
+    def _validate_positive_int(cls, v: Optional[int], info):  # type: ignore[override]
+        if v is None:
+            return None
+        iv = int(v)
+        if iv <= 0:
+            raise ValueError(f"{info.field_name} must be a positive integer")
+        return iv
+
+    @field_validator("processing_queue_safety_margin")
+    @classmethod
+    def _validate_margin(cls, v: float):  # type: ignore[override]
+        fv = float(v)
+        if not (0.0 <= fv < 1.0):
+            raise ValueError("processing_queue_safety_margin must be within [0,1)")
+        return fv
+
+    @field_validator("processing_queue_poll_seconds", "retry_after_fallback_seconds")
+    @classmethod
+    def _validate_positive_float(cls, v: float, info):  # type: ignore[override]
+        fv = float(v)
+        if fv <= 0.0:
+            raise ValueError(f"{info.field_name} must be positive")
+        return fv
+
+
 class ProviderModel(BaseModel):
     name: str
     model: str
@@ -72,6 +107,12 @@ class ProviderModel(BaseModel):
     pricing_key: Optional[str] = None
     batch: Optional[ProviderBatchModel] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    batch_params: Dict[str, Any] = Field(default_factory=dict)
+    request_overrides: Dict[str, Any] = Field(default_factory=dict)
+    request_metadata: Dict[str, Any] = Field(default_factory=dict)
+    batch_metadata: Dict[str, Any] = Field(default_factory=dict)
+    client_options: Dict[str, Any] = Field(default_factory=dict)
+    rate_limits: Optional[ProviderRateLimitModel] = None
 
     @field_validator("name")
     @classmethod
