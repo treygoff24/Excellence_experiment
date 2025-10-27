@@ -93,6 +93,93 @@ def test_build_message_requests_enforces_limit(tmp_path: Path) -> None:
         )
 
 
+def test_build_message_requests_rejects_non_unit_temp_with_thinking(tmp_path: Path) -> None:
+    src = tmp_path / "shard_thinking.jsonl"
+    _jsonl_write(
+        src,
+        [
+            {
+                "custom_id": "dataset|item|control|0.5|0|open",
+                "body": {
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": "Hello?"},
+                    ]
+                },
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="temperature=0.5"):
+        build_message_requests(
+            src_path=str(src),
+            model="claude-sonnet-3.5",
+            temperature=0.5,
+            top_p=None,
+            top_k=None,
+            max_new_tokens={"default": 512},
+            request_overrides={"thinking": {"type": "enabled", "budget_tokens": 128}},
+        )
+
+
+def test_build_message_requests_allows_thinking_with_unit_temp(tmp_path: Path) -> None:
+    src = tmp_path / "shard_thinking_allowed.jsonl"
+    _jsonl_write(
+        src,
+        [
+            {
+                "custom_id": "dataset|item|control|1.0|0|open",
+                "body": {
+                    "messages": [
+                        {"role": "user", "content": "Hi"},
+                    ]
+                },
+            }
+        ],
+    )
+    requests = build_message_requests(
+        src_path=str(src),
+        model="claude-sonnet-3.5",
+        temperature=1.0,
+        top_p=None,
+        top_k=None,
+        max_new_tokens={"default": 256},
+        request_overrides={"thinking": {"type": "enabled", "budget_tokens": 64}},
+    )
+    assert len(requests) == 1
+    assert requests[0].params["temperature"] == 1.0
+    assert requests[0].params["thinking"]["type"] == "enabled"
+
+
+def test_build_message_requests_rejects_override_temperature_with_thinking(tmp_path: Path) -> None:
+    src = tmp_path / "shard_thinking_override.jsonl"
+    _jsonl_write(
+        src,
+        [
+            {
+                "custom_id": "dataset|item|control|1.0|0|open",
+                "body": {
+                    "messages": [
+                        {"role": "user", "content": "Hi"},
+                    ]
+                },
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="temperature=0.3"):
+        build_message_requests(
+            src_path=str(src),
+            model="claude-sonnet-3.5",
+            temperature=1.0,
+            top_p=None,
+            top_k=None,
+            max_new_tokens={"default": 256},
+            request_overrides={
+                "thinking": {"type": "enabled"},
+                "temperature": 0.3,
+            },
+        )
+
+
 def test_normalize_jsonl_handles_success_and_failure(tmp_path: Path) -> None:
     src = tmp_path / "raw.jsonl"
     _jsonl_write(

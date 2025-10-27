@@ -8,7 +8,7 @@ max_new_tokens:
   closed_book: 512
   open_book: 512
 top_p: 1.0
-top_k: 50
+top_k: null
 stop: []
 sizes:
   open_book_max_items: 10

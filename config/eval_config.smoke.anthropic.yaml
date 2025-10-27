@@ -1,9 +1,9 @@
 model_id: claude-3-5-haiku-20241022
 backend: alt
 temps:
-  - 0.0
+  - 1.0
 samples_per_item:
-  "0.0": 1
+  "1.0": 1
 max_new_tokens:
   closed_book: 512
   open_book: 512
@@ -28,9 +28,8 @@ provider:
   pricing_key: claude-3-5-haiku-20241022
   batch:
     endpoint: /v1/messages/batches
-    completion_window: 24h
     max_output_tokens: 512
-    temperature: 0.0
+    temperature: 1.0
   rate_limits:
     processing_queue_limit: 100000
     processing_queue_safety_margin: 0.1

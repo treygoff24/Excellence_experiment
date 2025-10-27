@@ -8,6 +8,84 @@ from typing import Any, Dict, Iterable, Optional
 SUPPORTED_ENDPOINTS = {"/v1/responses", "/v1/chat/completions"}
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        candidate = model_dump()
+        if isinstance(candidate, dict):
+            return dict(candidate)
+    as_dict = getattr(value, "dict", None)
+    if callable(as_dict):
+        candidate = as_dict()
+        if isinstance(candidate, dict):
+            return dict(candidate)
+    return {}
+
+
+def _parse_thinking_state(data: Any) -> tuple[bool, dict[str, Any]]:
+    if data is None:
+        return False, {}
+    if isinstance(data, bool):
+        return bool(data), {}
+    if isinstance(data, str):
+        return data.strip().lower() == "enabled", {}
+    thinking_dict = _as_dict(data)
+    if not thinking_dict:
+        return False, {}
+    flag = thinking_dict.get("enabled")
+    if isinstance(flag, bool):
+        enabled = flag
+    else:
+        state = str(
+            thinking_dict.get("type")
+            or thinking_dict.get("mode")
+            or thinking_dict.get("state")
+            or ""
+        ).strip().lower()
+        enabled = state == "enabled"
+    return enabled, thinking_dict
+
+
+def ensure_thinking_budget(container: Any, *, context: str) -> None:
+    mapping = _as_dict(container)
+    if not mapping:
+        return
+    if "thinking" not in mapping:
+        return
+    enabled, thinking_cfg = _parse_thinking_state(mapping["thinking"])
+    if not enabled:
+        return
+    if not thinking_cfg:
+        raise ValueError(
+            f"Thinking is enabled for {context} but no configuration object was provided. "
+            "Include a budget_tokens value or disable thinking."
+        )
+    budget_value = None
+    for key in ("budget_tokens", "budgetTokens", "budget", "max_tokens", "maxTokens"):
+        if key in thinking_cfg and thinking_cfg[key] is not None:
+            budget_value = thinking_cfg[key]
+            break
+    if budget_value is None:
+        raise ValueError(
+            f"Thinking is enabled for {context} but no token budget was supplied. "
+            "Set thinking.budget_tokens to a positive integer."
+        )
+    try:
+        budget_int = int(budget_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Thinking budget for {context} must be an integer; received {budget_value!r}."
+        ) from exc
+    if budget_int <= 0:
+        raise ValueError(
+            f"Thinking budget for {context} must be positive; received {budget_int}."
+        )
+
+
 def _load_rows(path: str) -> Iterable[dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as fin:
         for line in fin:
@@ -105,7 +183,6 @@ def build_batch_requests(
     model: str,
     temperature: float,
     top_p: Optional[float],
-    top_k: Optional[int],
     max_new_tokens: Optional[dict[str, Any] | Any],
     endpoint: str = "/v1/responses",
     metadata: Optional[dict[str, Any]] = None,
@@ -144,8 +221,6 @@ def build_batch_requests(
             }
             if top_p is not None:
                 request_body["top_p"] = float(top_p)
-            if top_k is not None:
-                request_body["top_k"] = int(top_k)
             if stop:
                 request_body["stop"] = stop
 
@@ -166,6 +241,11 @@ def build_batch_requests(
 
             if overrides:
                 request_body.update(overrides)
+
+            ensure_thinking_budget(
+                request_body,
+                context=f"custom_id {custom_id}",
+            )
 
             record = {
                 "custom_id": custom_id,

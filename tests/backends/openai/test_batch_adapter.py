@@ -44,7 +44,6 @@ def test_build_batch_requests_responses(tmp_path: Path) -> None:
         model="gpt-4.1-mini",
         temperature=0.0,
         top_p=0.9,
-        top_k=50,
         max_new_tokens={"open_book": 2048, "closed_book": 1024},
         endpoint="/v1/responses",
         metadata={"trial": "slug-123", "condition": "control"},
@@ -60,6 +59,74 @@ def test_build_batch_requests_responses(tmp_path: Path) -> None:
     assert body["metadata"]["condition"] == "control"
     assert body["max_output_tokens"] == 2048
     assert body["stop"] == ["</end>"]
+
+
+def test_build_batch_requests_rejects_thinking_without_budget(tmp_path: Path) -> None:
+    src = tmp_path / "shard.jsonl"
+    src.write_text(
+        json.dumps(
+            {
+                "custom_id": "dataset|item|control|0.0|0|open",
+                "body": {
+                    "messages": [
+                        {"role": "system", "content": "System prompt."},
+                        {"role": "user", "content": "User question?"},
+                    ]
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dest = tmp_path / "requests.jsonl"
+    with pytest.raises(ValueError):
+        build_batch_requests(
+            src_path=str(src),
+            dest_path=str(dest),
+            model="gpt-4.1-mini",
+            temperature=0.0,
+            top_p=None,
+            max_new_tokens=None,
+            endpoint="/v1/responses",
+            metadata=None,
+            request_overrides={"thinking": {"type": "enabled", "budget_tokens": 0}},
+        )
+
+
+def test_build_batch_requests_accepts_thinking_with_budget(tmp_path: Path) -> None:
+    src = tmp_path / "shard.jsonl"
+    src.write_text(
+        json.dumps(
+            {
+                "custom_id": "dataset|item|control|0.0|0|open",
+                "body": {
+                    "messages": [
+                        {"role": "system", "content": "System prompt."},
+                        {"role": "user", "content": "User question?"},
+                    ]
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dest = tmp_path / "requests.jsonl"
+    count = build_batch_requests(
+        src_path=str(src),
+        dest_path=str(dest),
+        model="gpt-4.1-mini",
+        temperature=0.0,
+        top_p=None,
+        max_new_tokens=None,
+        endpoint="/v1/responses",
+        metadata=None,
+        request_overrides={"thinking": {"type": "enabled", "budget_tokens": 128}},
+    )
+    assert count == 1
+    record = _read_jsonl(dest)[0]
+    thinking = record["body"].get("thinking")
+    assert thinking is not None
+    assert thinking["budget_tokens"] == 128
 
 
 class _StubBatches:

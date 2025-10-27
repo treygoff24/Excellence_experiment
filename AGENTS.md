@@ -1,6 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
+
 - Root: Python 3.10+ project for A/B evaluating system prompts on Fireworks AI.
 - Key dirs:
   - `config/` — `eval_config.yaml`, prompt files; schema validation on load.
@@ -12,6 +13,7 @@
   - `results/`, `reports/` — top‑level summaries for simple runs.
 
 ## Build, Test, and Development Commands
+
 - Venv: `python -m venv .venv && source .venv/bin/activate`
 - Environment: `python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`
 - Make targets:
@@ -35,18 +37,40 @@
     - `python -m scripts.run_all --config config/eval_config.yaml --condition=treatment --parts_per_dataset=24 --max_concurrent_jobs=4 --resume --archive`
 - Validate config: `python -c "from config.schema import EvalConfig; EvalConfig.from_file('config/eval_config.yaml')"`.
 
+## CLI tools
+
+You are on macOS with Homebrew. Prefer these tools if available: rg (ripgrep) over grep, fd over find, fzf for interactive selection, bat over cat, delta for diffs, jq/yq for JSON/YAML, sd over sed, entr for file-watch, mise/direnv/uv for per-repo envs.
+
+Usage nudges:
+Search code: rg -n --hidden -g '!.git' "pattern".
+
+List files to pipe: fd -t f -E .git | fzf.
+
+View file: bat -n --paging=never path.
+
+Diffs: git diff | delta.
+
+JSON/YAML: jq '.key' file.json / yq '.key' file.yaml.
+
+Watch & run: fd -e py | entr -r pytest -q.
+
+Env: use direnv allow once per repo; prefer mise run tasks; for Python, uv venv .venv && source .venv/bin/activate.
+
 ## Coding Style & Naming Conventions
+
 - Style: PEP 8, 4‑space indents, type hints required for public functions.
 - Naming: `snake_case` for modules/functions, `CapWords` for classes, `UPPER_SNAKE_CASE` for constants. Filenames match module purpose (e.g., `build_batches.py`).
 - CLI pattern: define `main()` with `argparse` and use `if __name__ == '__main__': main()` when applicable.
 - Imports: prefer absolute imports within top‑level packages (`scripts`, `scoring`, `fireworks`).
 
 ## Testing Guidelines
+
 - Primary checks: `make smoke` and config validation (see above).
 - Determinism: keep sampling seeds fixed; start with small `--n` for quick iteration.
 - If adding unit tests, use `pytest` under `tests/` with `test_*.py`; aim for coverage on `scoring/` and parsing utilities.
 
 ## Statistical Analysis (what to expect)
+
 - `scoring/stats.py` computes:
   - Exact McNemar (b,c,p_exact) with odds ratio and CI.
   - Paired bootstrap CIs for deltas across metrics and effect sizes (HL, Cohen’s d, Cliff’s delta).
@@ -57,16 +81,19 @@
 - Optional robustness models: `scripts/mixed_effects.py` (GEE/OLS).
 
 ## Artifacts and Reports
+
 - `results/significance.json` (schema_version=2) consolidates all stats.
 - Optional extras: `unsupported_sensitivity.json`, `mixed_models.json`, `power_analysis.json`, `cost_effectiveness.json`.
 - `scripts/generate_report.py` renders all sections. Use the smoke config (temps) to align significance sections with outputs.
 
 ## Large Files Policy
+
 - Do not commit `results/` or `reports/` directories. These are ignored recursively by `.gitignore`.
 - Per‑run directories under `experiments/run_*/` and `experiments/**/batch_inputs/` are also ignored.
 - If you must share artifacts, upload them externally and link paths in PRs.
 
 ## Local Backend (Windows + Ollama/llama.cpp)
+
 - **Bootstrap:** `powershell -ExecutionPolicy Bypass -File tools\bootstrap.ps1` (Windows only).
 - **Configs:** `config/eval_config.local.yaml` (Ollama), `config/eval_config.local.llamacpp.yaml` (llama.cpp).
 - **Multi-prompt sweep workaround:** Use `run_all_prompts.ps1` for local backend; the built-in `--archive` multi-trial sweep has isolation issues (see `docs/local_multi_prompt_workaround.md`).
@@ -81,12 +108,15 @@
 - **Docs:** `docs/windows.md`, `docs/troubleshooting_windows_local.md`, `docs/performance.md`, `docs/local_multi_prompt_workaround.md`.
 
 ## Agent Tips
+
 - Prefer `make smoke` and `scripts.smoke_orchestration` to validate changes quickly; keep seeds/config deterministic.
 - Multi-trial sweeps write shared control batches once per `(model, dataset partition, prompt, sampling config)`. Downstream steps hydrate controls via the registry in `control_registry.json` rather than re-running control inference per trial.
 - When editing stats/report schemas, document fields in README and keep backward compatibility when feasible.
 - Avoid network actions unless necessary; ask for approval when required.
 - For local backend multi-model/multi-prompt runs on Windows, use `run_all_prompts.ps1` to avoid trial isolation issues.
+
 ### Shared Control Cache
+
 - Registry refresh on startup/resume cleans/prunes stale entries before submissions.
 - Producers export control JSONL + metadata into `experiments/run_<RID>/shared_controls/<key>/` and mark registry entries `completed`.
 - When manifest entries hit an existing key, the submit step marks `mode: reuse` and skips new control jobs; downstream consumers hydrate rows directly from the shared cache (no duplicate scoring rows).
@@ -95,6 +125,7 @@
 - Use `scripts.shared_controls.refresh_registry` in ad-hoc tooling if you need to inspect or repair registries outside the orchestrator.
 
 ## Fireworks CLI (firectl)
+
 - Overview: Fireworks’ official CLI for managing datasets, batch inference jobs, deployments, models, and LoRA adapters. Useful for quick, manual ops or debugging alongside our scripted pipeline. Docs: https://fireworks.ai/docs/tools-sdks/firectl/firectl
 - Install:
   - macOS/Homebrew: `brew install fw-ai/firectl/firectl` (or `brew tap fw-ai/firectl && brew install firectl`).
@@ -114,10 +145,10 @@
   - Download results: our scripts `fireworks/poll_and_download.py` and `fireworks/parse_results.py` remain the primary path to pull and normalize outputs. Use CLI to retrieve job IDs and status if preferred.
 - Suggested workflows:
   - Quick manual run:
-    1) `make build` (or `python -m scripts.build_batches ...`).
-    2) `firectl create-dataset ...` to upload the JSONL.
-    3) `firectl create batch-inference-job ... --dataset-id <id> ...`.
-    4) Poll with `firectl get batch-job <id>`. When complete, download results with `firectl download dataset <outputDatasetId> --output-dir results/raw_download`, then parse via `python -m fireworks.parse_results --job_id <id> --out_dir results/`.
+    1. `make build` (or `python -m scripts.build_batches ...`).
+    2. `firectl create-dataset ...` to upload the JSONL.
+    3. `firectl create batch-inference-job ... --dataset-id <id> ...`.
+    4. Poll with `firectl get batch-job <id>`. When complete, download results with `firectl download dataset <outputDatasetId> --output-dir results/raw_download`, then parse via `python -m fireworks.parse_results --job_id <id> --out_dir results/`.
   - Orchestrated run (CLI‑assisted): run `python -m scripts.run_all ... --skip_prepare --skip_build` if you’ve already uploaded the dataset via CLI; provide the dataset/job IDs with the script flags if applicable.
 - Tips and caveats:
   - Keep prepared inputs in the same JSONL schema our scorers expect; the CLI does not transform inputs.
@@ -125,12 +156,14 @@
   - Cleanup: `firectl delete-resources` supports removing obsolete datasets/deployments/jobs; prefer deleting test artifacts after smoke runs.
 
 ### Downloading results via CLI
+
 - Fast path: `firectl download dataset <outputDatasetId> --output-dir results/raw_download`
   - Optional: `--download-lineage` to download the entire lineage chain of related datasets.
 - Python helper (does polling + extraction): `python -m fireworks.poll_and_download --account <account_slug> --job_name <job_id_or_name> --out_dir results/raw_download`.
   - This polls, resolves `outputDatasetId`, downloads from `externalUrl`, extracts JSONL(s), and writes a combined `results.jsonl`.
 
 ## Commit & Pull Request Guidelines
+
 - Commits: concise, imperative summaries (e.g., "Improve batch splitting", "Update documentation for temperature=1.0 experiment").
 - PRs must include:
   - What changed and why; link related issues.

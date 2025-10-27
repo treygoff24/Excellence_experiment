@@ -12,6 +12,8 @@ from typing import Any, Iterable, Optional, Protocol
 import json
 import yaml
 
+from dotenv import load_dotenv
+
 from fireworks.parse_results import process_results
 
 from backends.anthropic import AnthropicBatchAdapter
@@ -20,7 +22,6 @@ from backends.openai import OpenAIBatchAdapter
 from config.schema import load_config
 from scripts import manifest_v2 as mf
 from scripts.run_all import (  # type: ignore[attr-defined]
-    _backend_tag,
     _compute_control_key,
     _expand_trials,
     _format_temp_label,
@@ -571,6 +572,7 @@ def _write_multi_manifest(run_root: str, run_id: str, trials: list[TrialRun]) ->
 
 
 def main() -> None:
+    load_dotenv()
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config/eval_config.yaml")
     ap.add_argument("--backend", choices=["openai", "anthropic"])
@@ -763,7 +765,7 @@ def main() -> None:
 
     trial_runs: list[TrialRun] = []
     build_manifest = _load_build_manifest(cfg["paths"]["batch_inputs_dir"])
-    backend_tag = _backend_tag(is_local_backend=False)
+    backend_tag = adapter.backend
 
     for trial in trials:
         model_id = trial["model_id"]

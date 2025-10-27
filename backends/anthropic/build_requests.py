@@ -8,6 +8,42 @@ from typing import Any, Iterable, Optional, Sequence, Tuple
 
 MAX_REQUESTS_PER_BATCH = 10_000
 _SAFE_ID_PATTERN = re.compile(r"[^A-Za-z0-9_-]")
+_TEMPERATURE_TOLERANCE = 1e-6
+
+
+def _is_thinking_enabled(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        for key in ("type", "mode", "state"):
+            setting = value.get(key)
+            if isinstance(setting, str) and setting.lower() == "enabled":
+                return True
+        enabled_flag = value.get("enabled")
+        if isinstance(enabled_flag, bool):
+            return enabled_flag
+        return False
+    if hasattr(value, "type"):
+        setting = getattr(value, "type")
+        if isinstance(setting, str) and setting.lower() == "enabled":
+            return True
+    if isinstance(value, str):
+        return value.lower() == "enabled"
+    return False
+
+
+def _ensure_thinking_temperature(temperature: Any, *, context: str) -> None:
+    try:
+        temp_val = float(temperature)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Anthropic thinking requires temperature=1. Unable to interpret temperature {temperature!r} for {context}."
+        ) from None
+    if abs(temp_val - 1.0) > _TEMPERATURE_TOLERANCE:
+        raise ValueError(
+            f"Anthropic thinking requires temperature=1. Received temperature={temp_val} for {context}. "
+            "Update the eval configuration or disable thinking before retrying."
+        )
 
 
 def _load_rows(path: str) -> Iterable[dict[str, Any]]:
@@ -180,6 +216,9 @@ def build_message_requests(
     overrides = dict(request_overrides or {})
     used_custom_ids: set[str] = set()
 
+    if _is_thinking_enabled(overrides.get("thinking")):
+        _ensure_thinking_temperature(temperature, context=f"shard {src_path} (request overrides)")
+
     requests: list[RequestPayload] = []
     for row in _load_rows(src_path):
         custom_id = row.get("custom_id")
@@ -224,6 +263,10 @@ def build_message_requests(
         request_meta["orig_custom_id"] = orig_custom_id
         if overrides:
             params.update(overrides)
+
+        if _is_thinking_enabled(params.get("thinking")):
+            context = f"custom_id={orig_custom_id} (shard {src_path})"
+            _ensure_thinking_temperature(params.get("temperature"), context=context)
 
         requests.append(
             RequestPayload(

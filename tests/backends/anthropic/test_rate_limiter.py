@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -100,6 +101,69 @@ def test_limiter_enforces_rpm_window() -> None:
     # After waiting, the limiter should allow registration of the new batch.
     limiter.register_batch("new", 400)
     assert limiter._pending_batches["new"] == 400
+
+
+def test_limiter_handles_batches_larger_than_limit() -> None:
+    client = SimpleNamespace()
+    clock = {"now": 0.0, "sleeps": []}
+
+    def fake_time() -> float:
+        return clock["now"]
+
+    def fake_sleep(seconds: float) -> None:
+        clock["sleeps"].append(seconds)
+        clock["now"] += seconds
+
+    limiter = AnthropicBatchLimiter(
+        processing_limit=None,
+        safety_margin=0.1,
+        queue_poll_seconds=5.0,
+        rpm_limit=2_000,
+        max_retries=3,
+        retry_after_fallback=10.0,
+        time_fn=fake_time,
+        sleep_fn=fake_sleep,
+    )
+
+    limiter.before_submit(client, request_count=5_000)
+    limiter.register_batch("big", 5_000)
+
+    clock["now"] = 10.0
+    limiter.before_submit(client, request_count=5_000)
+
+    assert clock["sleeps"] == [50.0]
+
+
+def test_limiter_recovers_when_window_disappears_mid_wait() -> None:
+    client = SimpleNamespace()
+    clock = {"now": 0.0, "sleeps": []}
+
+    def fake_time() -> float:
+        return clock["now"]
+
+    def fake_sleep(seconds: float) -> None:
+        clock["sleeps"].append(seconds)
+        clock["now"] += seconds
+
+    limiter = AnthropicBatchLimiter(
+        processing_limit=None,
+        safety_margin=0.1,
+        queue_poll_seconds=5.0,
+        rpm_limit=2_000,
+        max_retries=3,
+        retry_after_fallback=10.0,
+        time_fn=fake_time,
+        sleep_fn=fake_sleep,
+    )
+
+    class FlakyDeque(deque):
+        def __getitem__(self, index):  # type: ignore[override]
+            self.clear()
+            raise IndexError
+
+    limiter._request_window = FlakyDeque([(0.0, 1_500)])
+    limiter.before_submit(client, request_count=1_600)
+    assert clock["sleeps"] == []
 
 
 def test_limiter_retry_delay_honors_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:

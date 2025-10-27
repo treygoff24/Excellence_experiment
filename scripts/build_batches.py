@@ -192,6 +192,7 @@ def main():
     ap.add_argument("--prompt_set", default=None, help="Name of prompt set in config.prompt_sets")
     ap.add_argument("--temps", default=None, help="Comma-separated temperatures to build (override config)")
     ap.add_argument("--resume", action="store_true", help="Skip shards when present and valid per manifest")
+    ap.add_argument("--limit_items", type=int, default=None, help="Take only the first N items from each dataset split")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -228,6 +229,10 @@ def main():
 
     ob_rows = read_lines(os.path.join(prepared_dir, "open_book.jsonl"))
     cb_rows = read_lines(os.path.join(prepared_dir, "closed_book.jsonl"))
+    if args.limit_items is not None and args.limit_items > 0:
+        limit = int(args.limit_items)
+        ob_rows = ob_rows[:limit]
+        cb_rows = cb_rows[:limit]
 
     stop_cfg = cfg.get("stop") or []
     include_row_stop = not bool(cfg.get("use_batch_api", True))

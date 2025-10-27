@@ -137,7 +137,16 @@ class AnthropicBatchLimiter:
 
     def _prune_window(self, now: float) -> None:
         cutoff = now - 60.0
-        while self._request_window and self._request_window[0][0] <= cutoff:
+        while self._request_window:
+            try:
+                oldest_time, _ = self._request_window[0]
+            except IndexError:
+                logger.debug(
+                    "Anthropic RPM limiter observed empty window during prune; stopping cleanup.",
+                )
+                break
+            if oldest_time > cutoff:
+                break
             self._request_window.popleft()
 
     def _current_request_total(self, now: float) -> int:
@@ -252,12 +261,36 @@ class AnthropicBatchLimiter:
     def _enforce_rpm_window(self, request_count: int) -> None:
         if self.rpm_limit is None or request_count <= 0:
             return
+        effective_count = request_count
+        if request_count > self.rpm_limit:
+            logger.warning(
+                "Anthropic batch request_count (%s) exceeds configured batch_requests_per_minute limit (%s); "
+                "continuing but treating the submission as %s requests for throttling. "
+                "Consider reducing shard size or increasing provider.rate_limits.batch_requests_per_minute.",
+                request_count,
+                self.rpm_limit,
+                self.rpm_limit,
+            )
+            effective_count = self.rpm_limit
         while True:
             now = self._time()
             current = self._current_request_total(now)
-            if current + request_count <= self.rpm_limit:
+            if current + effective_count <= self.rpm_limit:
                 return
-            oldest_time, _ = self._request_window[0]
+            if not self._request_window:
+                logger.debug(
+                    "Anthropic RPM limiter observed empty window while current=%s; re-evaluating without sleeping.",
+                    current,
+                )
+                continue
+            try:
+                oldest_time, _ = self._request_window[0]
+            except IndexError:
+                logger.debug(
+                    "Anthropic RPM limiter lost oldest timestamp while current=%s; retrying window check.",
+                    current,
+                )
+                continue
             wait_seconds = max(0.0, 60.0 - (now - oldest_time))
             wait_seconds = max(wait_seconds, 1.0)
             logger.info(

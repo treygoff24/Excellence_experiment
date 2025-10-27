@@ -8,7 +8,7 @@ max_new_tokens:
   closed_book: 1024
   open_book: 1024
 top_p: 1.0
-top_k: 50
+top_k: null
 stop: []
 sizes:
   closed_book_max_items: null
@@ -30,7 +30,6 @@ provider:
   pricing_key: gpt-4o-mini
   batch:
     endpoint: /v1/responses
-    completion_window: 24h
     max_output_tokens: 1024
     temperature: 0.0
 pricing:

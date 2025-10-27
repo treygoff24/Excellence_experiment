@@ -443,6 +443,26 @@ def load_config(path: str) -> dict:
         raise SystemExit(f"Invalid configuration in {path}:\n{e}")
     cfg = model.model_dump()
 
+    provider_cfg = cfg.get("provider") or {}
+    provider_name = (provider_cfg.get("name") or "").lower()
+    if provider_name == "anthropic":
+        batch_cfg = provider_cfg.get("batch") or {}
+        if batch_cfg.get("completion_window") not in (None, ""):
+            raise SystemExit(
+                f"Invalid configuration in {path}:\n"
+                "Anthropic Message Batches no longer accept 'completion_window'; remove provider.batch.completion_window."
+            )
+        batch_params = provider_cfg.get("batch_params") or {}
+        if (
+            isinstance(batch_params, dict)
+            and "completion_window" in batch_params
+            and batch_params.get("completion_window") not in (None, "")
+        ):
+            raise SystemExit(
+                f"Invalid configuration in {path}:\n"
+                "Anthropic Message Batches no longer accept 'completion_window'; remove provider.batch_params.completion_window."
+            )
+
     # Ensure directories exist lazily; do not create here to keep load side-effect free
     # but normalize any env vars or user home symbols
     for key in ("raw_dir", "prepared_dir", "batch_inputs_dir", "results_dir", "reports_dir"):

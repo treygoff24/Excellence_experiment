@@ -3,7 +3,7 @@ backend: alt
 temps:
   - 1.0
 samples_per_item:
-  "1.0": 10
+  "1.0": 1
 max_new_tokens:
   closed_book: 3072
   open_book: 3072
@@ -11,11 +11,11 @@ top_p: null
 top_k: null
 stop: []
 sizes:
-  closed_book_max_items: null
-  open_book_max_items: null
+  closed_book_max_items: 1000
+  open_book_max_items: 1000
   triviaqa_max_items: null
   nq_open_max_items: null
-  squad_v2_max_items: null
+  squad_v2_max_items: 0
 paths:
   raw_dir: data/raw
   prepared_dir: data/prepared
@@ -41,7 +41,6 @@ provider:
   pricing_key: claude-sonnet-4-5-20250929
   batch:
     endpoint: /v1/messages/batches
-    completion_window: 24h
     max_output_tokens: 3072
     temperature: 1.0
   rate_limits:
@@ -51,8 +50,6 @@ provider:
     batch_requests_per_minute: 2000
     max_rate_limit_retries: 5
     retry_after_fallback_seconds: 30.0
-  batch_params:
-    completion_window: "24h"
   request_overrides:
     max_tokens: 3072
     thinking:
@@ -116,14 +113,6 @@ prompt_sets:
 default_prompt_set: default
 sweep:
   prompt_sets:
-    - default
-    - operational_only
-    - structure_without_content
     - philosophy_without_instructions
-    - length_matched_random
-    - length_matched_best_practices
-    - excellence_25_percent
+    - operational_only
     - excellence_50_percent
-    - excellence_75_percent
-  temps:
-    - 1.0
