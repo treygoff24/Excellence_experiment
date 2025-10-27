@@ -5,6 +5,8 @@
 - Root: Python 3.10+ project for A/B evaluating system prompts on Fireworks AI.
 - Key dirs:
   - `config/` — `eval_config.yaml`, prompt files; schema validation on load.
+    - `eval_config.openai_thinking_test.yaml` — minimal OpenAI run with reasoning enabled.
+    - `prompts copy/` — frozen copies of long-form system prompts for packaging.
   - `scripts/` — CLI entrypoints (e.g., `run_all.py`, `prepare_data.py`).
   - `fireworks/` — dataset upload, job control, result parsing.
   - `scoring/` — normalization, metrics, statistics.
@@ -20,6 +22,7 @@
   - `make venv` — create venv and install deps.
   - `make data` — download/prepare datasets to `data/prepared/`.
 - `make build` — create batch inputs in `data/batch_inputs/`.
+- `python -m scripts.build_batches --limit_items <N>` — optional cap per split for fast smoke builds with new prompt variants.
 - `make eval` — full pipeline via `scripts/run_all.py`.
 - `make smoke` — small end‑to‑end run for sanity checks.
 - `make alt-smoke` — exercises the OpenAI/Anthropic replay fixtures; run `make venv` first so `.venv/bin/python` exists, or invoke `python3 -m scripts.alt_smoke` manually.
@@ -68,6 +71,10 @@ Env: use direnv allow once per repo; prefer mise run tasks; for Python, uv venv 
 - Primary checks: `make smoke` and config validation (see above).
 - Determinism: keep sampling seeds fixed; start with small `--n` for quick iteration.
 - If adding unit tests, use `pytest` under `tests/` with `test_*.py`; aim for coverage on `scoring/` and parsing utilities.
+- Backend regression suites worth running when tinkering with batch adapters or rate limiting:
+  - `pytest tests/backends/openai/test_batch_adapter.py`
+  - `pytest tests/backends/anthropic/test_message_batches.py`
+  - `pytest tests/backends/anthropic/test_rate_limiter.py`
 
 ## Statistical Analysis (what to expect)
 
@@ -114,6 +121,13 @@ Env: use direnv allow once per repo; prefer mise run tasks; for Python, uv venv 
 - When editing stats/report schemas, document fields in README and keep backward compatibility when feasible.
 - Avoid network actions unless necessary; ask for approval when required.
 - For local backend multi-model/multi-prompt runs on Windows, use `run_all_prompts.ps1` to avoid trial isolation issues.
+
+## Reasoning / Thinking Modes
+
+- Anthropic and OpenAI adapters now accept `thinking` overrides; when `thinking` is enabled you **must** set a positive `thinking.budget_tokens` (validation happens in `backends/openai.build_inputs.ensure_thinking_budget`).
+- Use `config/eval_config.openai_thinking_test.yaml` for quick OpenAI reasoning smokes; pair it with `python -m scripts.build_batches --limit_items 25` to stay within budgets.
+- Anthropic reasoning sweeps live in `config/eval_config.anthropic_full.yaml`; the rate limiter guards queue pressure, so keep `samples_per_item` small unless you raise the processing limits.
+- The long-form prompts used for reasoning experiments are mirrored in `config/prompts copy/` for archival comparisons; update both copies when editing prompt text.
 
 ### Shared Control Cache
 

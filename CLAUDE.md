@@ -11,6 +11,7 @@ This document orients Claude (and similar LLM agents) to the project’s structu
 ## Repo Map
 
 - `config/` — `eval_config.yaml` (validated), prompts, task instructions.
+  - `eval_config.openai_thinking_test.yaml` covers OpenAI reasoning smokes; `config/prompts copy/` holds frozen prompt snapshots for reproducibility.
 - `scripts/` — pipeline and analysis CLIs (`run_all.py`, `generate_report.py`, etc.).
 - `fireworks/` — data upload/poll/parse utilities.
 - `scoring/` — metrics + `stats.py` (core inference) and `unsupported.py` (support detection).
@@ -21,9 +22,10 @@ This document orients Claude (and similar LLM agents) to the project’s structu
 
 - Environment (activate venv first): `python -m venv .venv && source .venv/bin/activate`
 - Full pipeline: `python -m scripts.run_all --config config/eval_config.yaml --archive` (or `make eval`).
-- Offline smoke: `make smoke` — generates a tiny end‑to‑end run locally.
-- Orchestrator smoke (dry‑run, auto‑cleanup): `python -m scripts.smoke_orchestration --n 3 --prompt_set operational_only [--keep]`.
-- Post‑processing (run any subset):
+- Offline smoke: `make smoke` — generates a tiny end-to-end run locally.
+- Orchestrator smoke (dry-run, auto-cleanup): `python -m scripts.smoke_orchestration --n 3 --prompt_set operational_only [--keep]`.
+- Fast sanity shards: `python -m scripts.build_batches --config config/eval_config.yaml --limit_items 25` keeps each split tiny when testing new prompt variants.
+- Post-processing (run any subset):
   - `python -m scoring.stats --per_item_csv results/per_item_scores.csv --config config/eval_config.yaml --out_path results/significance.json`
   - `python -m scripts.unsupported_sensitivity --pred_csv results/predictions.csv --prepared_dir data/prepared --config config/eval_config.yaml --out_path results/unsupported_sensitivity.json`
   - `python -m scripts.mixed_effects --pred_csv results/predictions.csv --prepared_dir data/prepared --config config/eval_config.yaml --out_path results/mixed_models.json`
@@ -42,6 +44,14 @@ This document orients Claude (and similar LLM agents) to the project’s structu
 - Shared-control cache automatically skips duplicate control jobs when temps/prompts match; registry is sanitized on resume.
 
 Environment: `.env` is loaded via python-dotenv. Prefer `--account_id=slug` or omit entirely. Avoid `--account_id "$FIREWORKS_ACCOUNT_ID"` if the shell variable may be unset. The template value `fireworks` is **not** a usable team slug; replace it with your org’s slug before hitting the real API, or pass `--dry_run` for offline smokes.
+
+## Thinking / Reasoning Settings
+
+- Both Anthropic and OpenAI adapters honor `thinking` overrides; when you enable them, set `thinking.budget_tokens` to a positive integer or schema validation will fail (`backends/openai.build_inputs.ensure_thinking_budget` enforces this).
+- Quick OpenAI reasoning smoke: `python -m scripts.run_all --config config/eval_config.openai_thinking_test.yaml --archive --dry_run`, then lift the dry run once you have budget approval. Pair with `--limit_items` during build stages.
+- Anthropic reasoning runs use `config/eval_config.anthropic_full.yaml`; the upgraded rate limiter protects queue capacity, so revisit `tests/backends/anthropic/test_message_batches.py` and `tests/backends/anthropic/test_rate_limiter.py` when changing concurrency knobs.
+- OpenAI request overrides and reasoning payloads are covered by `tests/backends/openai/test_batch_adapter.py`; keep it green after adapter edits.
+- Frozen prompt copies in `config/prompts copy/` map one-to-one to active prompts—update both locations when editing prose.
 
 ## CLI tools
 

@@ -4,9 +4,9 @@
 
 This document provides a comprehensive guide for researchers writing an academic paper based on our controlled A/B experiments evaluating the impact of system prompts on large language model performance. The study measured whether a philosophical "excellence-oriented" treatment prompt significantly improves factual accuracy compared to a minimal baseline control prompt across different temperature settings.
 
-**Key Findings**: 
+**Key Findings**:
 - **Temperature = 0.0 (Deterministic)**: The treatment prompt caused a statistically significant improvement in performance (p < 10⁻¹⁰⁰), with a 6.1 percentage point increase in exact match accuracy on closed-book tasks.
-- **Temperature = 1.0 (Stochastic)**: Currently under evaluation with enhanced methodology including 10 replicates per item and extended token limits for variance estimation.
+- **Temperature = 1.0 (Stochastic / Reasoning)**: Currently running as a 1,000-item pilot on Anthropic Claude Sonnet 4.5 with thinking tokens (budget 2,048) to benchmark high-variance behaviour before scaling back up.
 
 ## 1. Research Question and Hypothesis
 
@@ -29,13 +29,13 @@ System prompts have emerged as a critical factor in steering language model beha
 - **Pre-registered**: All parameters fixed before data collection
 
 ### 2.2 Model and Infrastructure
-- **Model**: `accounts/fireworks/models/gpt-oss-120b` (OpenAI GPT-OSS-120B via Fireworks AI)
-- **API**: Fireworks AI Batch Inference API (OpenAI-compatible)
-- **Temperature**: T=0.0 (baseline study), T=1.0 (current stochastic evaluation)
-- **Max Tokens**: 512 (T=0.0 baseline), 1024 (T=1.0 experiment) for both closed-book and open-book tasks
-- **Sampling**: 1 sample per item (T=0.0), 10 replicates per item (T=1.0)
-- **Context Length**: 131,072 tokens maximum
-- **Cost**: $0.075/1M input tokens, $0.30/1M completion tokens (50% batch discount applied)
+- **Baseline model (T=0.0)**: `accounts/fireworks/models/gpt-oss-120b` served through the Fireworks AI Batch Inference API (OpenAI-compatible surface).
+- **Reasoning follow-up (T=1.0)**: `claude-sonnet-4-5-20250929` via Anthropic’s Messages Batch API with `thinking.budget_tokens=2048` enforced per request.
+- **OpenAI thinking smoke**: `gpt-5-2025-08-07` accessed through `/v1/responses`; mirrors the Anthropic run with reasoning enabled for cross-provider comparisons.
+- **Max tokens**: 1,024 for the deterministic baseline; 3,072 for reasoning experiments to avoid truncating long deliberations.
+- **Sampling**: 1 sample per item across active configs while we profile thinking-token overhead; multi-replicate runs are deferred to a later scaling phase.
+- **Context length**: 131,072 tokens (Fireworks) and 200k+ tokens (Anthropic Claude) per provider caps.
+- **Cost assumptions**: Fireworks baseline uses $0.075 / $0.30 per million tokens with a 50% batch discount. Anthropic reasoning relies on the provider pricing table (input 3.00, output 15.00 per MTok, discounted). OpenAI thinking smoke inherits the $0.15 / $0.60 per million rates with the same 50% batch discount.
 
 ### 2.3 Experimental Conditions
 
@@ -73,6 +73,18 @@ I don't know.
 Then, if you do answer, keep it concise and quote only grounded facts from the passage.
 ```
 
+### 2.5 Prompt Variant Families
+
+To disentangle which parts of the philosophical framing matter, the repo now ships multiple treatment variants (all under `config/prompts/`, with frozen mirrors in `config/prompts copy/`):
+
+- **operational_only** — strips the philosophical axioms and keeps pragmatic instructions only.
+- **structure_without_content** — preserves the formal outline but replaces the prose with placeholders, testing format effects.
+- **philosophy_without_instructions** — keeps the philosophical narrative but removes explicit task directives.
+- **length_matched_random** / **length_matched_best_practices** — control for sheer token count with either random filler or curated best-practice checklists.
+- **excellence_25/50/75_percent** — truncated versions of the full treatment to measure "dose-response" as the philosophy is gradually introduced.
+
+Each variant can be referenced in `config/eval_config.yaml` via `prompt_sets`, enabling targeted A/B or sweep experiments without duplicating config files.
+
 ## 3. Datasets and Data Structure
 
 ### 3.1 Dataset Selection
@@ -101,12 +113,16 @@ Three standard question-answering benchmarks were used to ensure broad coverage:
 - **Closed-book**: ~12,712 items per condition
 - **Open-book (SQuAD)**: ~12,712 items per condition
 
-#### Temperature = 1.0 (Current Experiment) 
-- **Total Items**: 25,424 unique questions per condition
-- **Replicates**: 10 samples per item per condition
-- **Total Evaluations**: ~508,480 individual responses
-- **Total Comparisons**: 254,240 paired comparisons (after aggregating replicates)
-- **Enhanced Statistical Power**: Standard deviation and confidence interval calculation
+#### Temperature = 1.0 (Reasoning Pilot)
+- **Scope**: Up to 1,000 closed-book TriviaQA items per condition (`squad_v2_max_items` = 0 for now to defer open-book cost).
+- **Samples per item**: 1 (thinking-enabled runs are token-intensive; we will re-introduce replicates once the budget model is validated).
+- **Prompt sweep**: Focuses on `philosophy_without_instructions`, `operational_only`, and `excellence_50_percent` to isolate philosophical vs. operational contributions under stochastic sampling.
+- **Artifacts**: Outputs land in `results/anthropic_claude_sonnet_4_5/` with matching manifests under that directory.
+
+#### OpenAI Thinking Smoke (Preview)
+- **Scope**: 25-item slices per condition via `config/eval_config.openai_thinking_test.yaml`.
+- **Samples per item**: 1 (mirrors the Anthropic pilot while we profile OpenAI thinking tokens).
+- **Purpose**: Cross-provider sanity check—verifies that reasoning metadata parses correctly and that reports handle mixed backends.
 
 ### 3.3 Data File Structure
 
@@ -121,26 +137,26 @@ abstain_rate,condition,em,f1,false_answer_rate,item_key,temp,type,unsupported_ra
 0.0,treatment,1.0,,,triviaqa|qw_1694,0.0,closed,
 ```
 
-*Temperature = 1.0 (enhanced with standard deviations)*:
+*Temperature = 1.0 (reasoning pilot — std columns populated only when samples_per_item > 1)*:
 ```csv
 abstain_rate,condition,em,em_std,f1,f1_std,false_answer_rate,false_answer_rate_std,item_key,temp,type,unsupported_rate,unsupported_rate_std,abstain_rate_std
-0.2,control,0.7,0.48,,,0.1,0.3,triviaqa|qw_1694,1.0,closed,,0.42
+0.2,control,0.7,,,,0.1,,triviaqa|qw_1694,1.0,closed,,
 ```
 
 **Fields**:
 - `abstain_rate`: Proportion of "I don't know" responses (0.0-1.0)
 - `condition`: "control" or "treatment" 
-- `em`: Exact Match score (aggregated across replicates, 0.0-1.0)
-- `em_std`: Standard deviation of EM across replicates (T=1.0 only)
+- `em`: Exact Match score (aggregated across replicates; equals the single sample when only one response is collected)
+- `em_std`: Standard deviation of EM across replicates (present when samples_per_item > 1)
 - `f1`: Token-level F1 score (SQuAD only, empty for closed-book)
-- `f1_std`: Standard deviation of F1 across replicates (T=1.0 only)
+- `f1_std`: Standard deviation of F1 across replicates (present when samples_per_item > 1)
 - `false_answer_rate`: Proportion of false answers on unanswerables
-- `false_answer_rate_std`: Standard deviation of false answer rate (T=1.0 only)
+- `false_answer_rate_std`: Standard deviation of false answer rate (present when samples_per_item > 1)
 - `item_key`: Unique identifier format: `dataset|item_id`
 - `temp`: Temperature (0.0 or 1.0)
 - `type`: "closed" or "open"
 - `unsupported_rate`: Proportion of claims not supported by passage (open-book only)
-- `*_std` fields: Standard deviations added in T=1.0 experiment for variance analysis
+- `*_std` fields: Optional variance diagnostics; blank when only a single sample is collected per item.
 
 **`results/predictions.csv`** (50,847 rows)
 ```csv
@@ -267,12 +283,12 @@ Control Correct    a        b      } b = 1,186
 | **Open-book** | 0.4% | 0.7% | +0.3 | p < 0.001 |
 | **Combined** | 23.9% | 27.1% | **+3.2** | p < 10⁻¹⁰⁸ |
 
-#### Temperature = 1.0 (Current Experiment)
-*Results pending - experiment designed to measure:*
-- Effect size with stochastic sampling
-- Variance estimation across 10 replicates per item
-- 95% confidence intervals for all metrics
-- Standard deviation of performance differences
+#### Temperature = 1.0 (Reasoning Pilot)
+*Results pending — the pilot run is designed to measure:*
+- Effect size under stochastic sampling when Claude’s `thinking` mode is enabled (budget 2,048 tokens).
+- Comparative performance of philosophical vs. operational prompt variants on 1,000 closed-book items.
+- Token consumption and latency impacts of reasoning mode prior to scaling up.
+- Confidence intervals once enough paired items are collected (target ≥900 paired comparisons).
 
 ### 6.2 Detailed Metrics
 
@@ -373,9 +389,9 @@ The treatment prompt's effectiveness may derive from:
 - **Generated report**: `reports/report.md`
 
 ### 9.2 Replication Materials
-- **System prompts**: `config/prompts/control_system.txt`, `treatment_system.txt`
+- **System prompts**: `config/prompts/control_system.txt`, `treatment_system.txt`, plus variant families under `config/prompts/` (mirrored in `config/prompts copy/` for archival integrity)
 - **Task instructions**: `config/task_instructions/closed_book.txt`, `open_book.txt`
-- **Configuration**: `config/eval_config.yaml`
+- **Configuration**: `config/eval_config.yaml`, `config/eval_config.anthropic_full.yaml`, `config/eval_config.openai_thinking_test.yaml`
 - **Analysis code**: Complete pipeline in `scripts/` and `scoring/` directories
 
 ### 9.3 Computational Requirements
@@ -386,11 +402,11 @@ The treatment prompt's effectiveness may derive from:
 - **Runtime**: ~2-4 hours including batch job queuing
 - **Dependencies**: Python 3.10+, see `requirements.txt`
 
-#### Temperature = 1.0 (Current Experiment)
-- **Estimated cost**: ~$58-70 USD (10x replicates + 2x token limit)
-- **Estimated runtime**: ~4-8 hours (larger dataset processing)
-- **Enhanced features**: Improved upload reliability, timeout handling, confidence intervals
-- **Statistical output**: Standard deviations and 95% CIs for all metrics
+#### Temperature = 1.0 (Reasoning Pilot)
+- **Budget guidance**: Allocate ~$40-55 USD for 1,000 closed-book items with a 2,048-token thinking budget (actual spend varies with reasoning length).
+- **Estimated runtime**: ~3-5 hours depending on Anthropic queue depth and rate-limit backoff.
+- **Enhanced features**: Upgraded message-batch rate limiter, automatic thinking-budget validation, and prompt sweep support.
+- **Statistical output**: Paired deltas and McNemar remain primary; variance columns stay blank until multi-replicate runs resume.
 
 ### 9.4 Alternative Setup: Local LLM Backend (October 2025)
 
