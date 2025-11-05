@@ -1,0 +1,120 @@
+model_id: "claude-sonnet-4-5-20250929"
+backend: "alt"
+temps:
+  - 1.0
+samples_per_item:
+  "1.0": 1
+max_new_tokens:
+  closed_book: 1280
+  open_book: 1536
+top_p: null
+top_k: null
+stop: []
+sizes:
+  closed_book_max_items: 500
+  open_book_max_items: 500
+  triviaqa_max_items: 250
+  nq_open_max_items: 250
+  squad_v2_max_items: 500
+paths:
+  raw_dir: "data/raw"
+  prepared_dir: "data/prepared/pilot"
+  batch_inputs_dir: "data/batch_inputs/pilot_anthropic"
+  results_dir: "results/pilot_anthropic"
+  reports_dir: "reports/pilot_anthropic"
+  run_manifest: "results/pilot_anthropic/run_manifest.json"
+  experiments_dir: "experiments"
+pricing:
+  input_per_million: 3.00
+  output_per_million: 15.00
+  batch_discount: 0.5
+use_batch_api: true
+provider:
+  name: anthropic
+  model: claude-sonnet-4-5-20250929
+  pricing_key: claude-sonnet-4-5-20250929
+  batch:
+    endpoint: /v1/messages/batches
+    max_output_tokens: 1536
+    temperature: 1.0
+  rate_limits:
+    processing_queue_limit: 100000
+    processing_queue_safety_margin: 0.1
+    processing_queue_poll_seconds: 5.0
+    batch_requests_per_minute: 2000
+    max_rate_limit_retries: 5
+    retry_after_fallback_seconds: 30.0
+  request_overrides:
+    max_tokens: 1536
+    thinking:
+      type: enabled
+      budget_tokens: 1024
+  client_options:
+    default_headers:
+      anthropic-version: "2023-06-01"
+  request_metadata:
+    orchestrator: excellence_pilot
+  batch_metadata:
+    orchestrator: excellence_pilot
+stats:
+  bootstrap_samples: 2000
+  permutation_samples: 2000
+  random_seed: 1337
+  enable_permutation: true
+  enable_fdr: true
+  risk_thresholds:
+    - 0.0
+    - 0.25
+    - 0.5
+    - 0.75
+    - 1.0
+  tost_alpha: 0.05
+  tost_margins:
+    em: 0.01
+    f1: 0.01
+unsupported:
+  strategy: overlap
+  threshold: 0.5
+  min_token_overlap: 0.6
+prompt_sets:
+  default:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/treatment_system.txt
+  operational_only:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/operational_only_system.md
+  structure_without_content:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/structure_without_content_system.md
+  philosophy_without_instructions:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/philosophy_without_instructions_system.md
+  length_matched_random:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/length_matched_random_system.md
+  length_matched_best_practices:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/length_matched_best_practices_system.md
+  excellence_25_percent:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/excellence_25_percent_system.md
+  excellence_50_percent:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/excellence_50_percent_system.md
+  excellence_75_percent:
+    control: config/prompts/control_system.txt
+    treatment: config/prompts/excellence_75_percent_system.md
+default_prompt_set: default
+sweep:
+  prompt_sets:
+    - default
+    - operational_only
+    - structure_without_content
+    - philosophy_without_instructions
+    - length_matched_random
+    - length_matched_best_practices
+    - excellence_25_percent
+    - excellence_50_percent
+    - excellence_75_percent
+  temps:
+    - 1.0

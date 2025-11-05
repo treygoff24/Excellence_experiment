@@ -71,12 +71,42 @@ def _build_done(cfg2: dict, trials: List[dict], experiments_dir: str, run_id: st
     # Mimic run_all._build_done logic minimally
     prompt_sets_cfg = cfg2.get("prompt_sets") or {}
     default_ps = cfg2.get("default_prompt_set") or (sorted(list(prompt_sets_cfg.keys()))[0] if prompt_sets_cfg else "default")
+    backend = str((cfg2.get("backend") or "fireworks")).strip().lower()
     temps_per_ps: dict[str, set[float]] = {}
     for tr in trials:
         psn = tr.get("prompt_set") or default_ps
         temps_per_ps.setdefault(psn, set()).update(float(t) for t in (tr.get("temps") or cfg2.get("temps") or [0.0]))
     # batch_inputs live under experiments/run_<id>/batch_inputs when using experiments dir
     batch_dir = os.path.join(experiments_dir, f"run_{run_id}", "batch_inputs")
+    configured_batch_dir = os.path.expanduser(
+        os.path.expandvars((cfg2.get("paths") or {}).get("batch_inputs_dir", ""))
+    )
+    search_roots = []
+    if os.path.isdir(batch_dir):
+        search_roots.append(batch_dir)
+    if configured_batch_dir and os.path.isdir(configured_batch_dir):
+        norm_configured = os.path.abspath(configured_batch_dir)
+        if all(os.path.abspath(p) != norm_configured for p in search_roots):
+            search_roots.append(configured_batch_dir)
+    if backend == "alt":
+        expected_names: set[str] = set()
+        for psn, tset in temps_per_ps.items():
+            suffix = f"_{psn}" if (len(prompt_sets_cfg) > 1 or psn not in ("default", None)) else ""
+            for t in sorted(tset):
+                t_label = "0" if f"{float(t):.1f}" == "0.0" else f"{float(t):.1f}".replace(".", "")
+                for cond in ("control", "treatment"):
+                    expected_names.add(f"t{t_label}{suffix}_{cond}.jsonl")
+        if not expected_names:
+            return True
+        if not search_roots:
+            return False
+        discovered: set[str] = set()
+        for root in search_roots:
+            for dirpath, _dirs, files in os.walk(root):
+                for fname in files:
+                    if fname.endswith(".jsonl"):
+                        discovered.add(fname)
+        return expected_names.issubset(discovered)
     for psn, tset in temps_per_ps.items():
         suffix = f"_{psn}" if (len(prompt_sets_cfg) > 1 or psn not in ("default", None)) else ""
         for t in sorted(tset):
@@ -134,8 +164,8 @@ def main() -> None:
 
     # Write a temporary config pointing to the small prepared dir
     cfg2 = dict(cfg)
-    cfg2["temps"] = [0.0]
-    cfg2["samples_per_item"] = {"0.0": 1}
+    cfg2["temps"] = [float((cfg.get("temps") or [0.0])[0] or 0.0)]
+    cfg2["samples_per_item"] = {f"{cfg2['temps'][0]:.1f}": 1}
     cfg2.setdefault("paths", {}).update({
         "prepared_dir": prepared_small,
         # Allow run_all to place batch_inputs/results under experiments/run_* automatically
@@ -158,12 +188,17 @@ def main() -> None:
         yaml.safe_dump(cfg2, f, sort_keys=False)
 
     # Run the orchestrator (pass 1), optionally injecting STOP at a checkpoint
+    backend = str((cfg.get("backend") or "fireworks")).strip().lower()
+    runner = "scripts.run_all"
+    if backend == "alt":
+        runner = "scripts.alt_run_all"
+    temp_label = f"{cfg2['temps'][0]:.1f}"
     common = [
-        sys.executable, "-m", "scripts.run_all",
+        sys.executable, "-m", runner,
         "--config", tmp_cfg,
         "--run_id", run_id,
         "--prompt_sets", args.prompt_set,
-        "--temps", "0.0",
+        "--temps", temp_label,
         "--skip_prepare",
         "--parts_per_dataset", "3",
         "--max_concurrent_jobs", "2",
@@ -190,10 +225,11 @@ def main() -> None:
             if args.stop_point == "post_build":
                 # Build completes when batch_inputs files exist
                 # Construct a single-trial placeholder to reuse helper
+                trial_temps = [float(t) for t in (cfg2.get("temps") or [0.0])]
                 trials = [{
                     "model_id": cfg2.get("model_id"),
                     "prompt_set": args.prompt_set,
-                    "temps": [0.0],
+                    "temps": trial_temps,
                 }]
                 ok = _wait_for(lambda: _build_done(cfg2, trials, exp_root, run_id), timeout_s=60.0)
                 if not ok:
@@ -283,22 +319,25 @@ def main() -> None:
     for root, _dirs, files in os.walk(chosen_dir):
         if "predictions.csv" in files:
             pred_paths.append(os.path.join(root, "predictions.csv"))
-    if not pred_paths:
-        raise SystemExit("orchestration smoke: predictions.csv not found; post-processing failed")
-    # Basic duplicate check: ensure custom_id column has no duplicates
-    import csv
-    for pp in pred_paths:
-        try:
-            ids: list[str] = []
-            with open(pp, "r", encoding="utf-8") as f:
-                r = csv.DictReader(f)
-                for row in r:
-                    if row.get("custom_id"):
-                        ids.append(row["custom_id"])
-            if ids and (len(set(ids)) != len(ids)):
-                raise SystemExit(f"Duplicate custom_id detected in {pp}; resume should avoid duplicates")
-        except Exception as e:
-            print(f"Warning: duplicate check skipped for {pp}: {e}")
+    if args.dry_run:
+        print("NOTE: Dry run completed; skipping predictions.csv presence/duplication checks.")
+    else:
+        if not pred_paths:
+            raise SystemExit("orchestration smoke: predictions.csv not found; post-processing failed")
+        # Basic duplicate check: ensure custom_id column has no duplicates
+        import csv
+        for pp in pred_paths:
+            try:
+                ids: list[str] = []
+                with open(pp, "r", encoding="utf-8") as f:
+                    r = csv.DictReader(f)
+                    for row in r:
+                        if row.get("custom_id"):
+                            ids.append(row["custom_id"])
+                if ids and (len(set(ids)) != len(ids)):
+                    raise SystemExit(f"Duplicate custom_id detected in {pp}; resume should avoid duplicates")
+            except Exception as e:
+                print(f"Warning: duplicate check skipped for {pp}: {e}")
     print(f"OK: Orchestration smoke completed. See {chosen_dir}")
     if not args.keep:
         try:

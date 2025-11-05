@@ -68,7 +68,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Dry-run: run many treatment prompts with one control, with concurrency=4")
     ap.add_argument("--config", default="config/eval_config.yaml")
     ap.add_argument("--prompts_dir", default="config/prompts", help="Directory containing treatment prompt markdown files")
-    ap.add_argument("--pattern", default="*.md", help="Glob for treatment prompt files")
+    ap.add_argument(
+        "--pattern",
+        default="*.md",
+        help="Glob for treatment prompt files (comma/space separated list)",
+    )
     ap.add_argument("--control", default="config/prompts/control_system.txt", help="Path to control system prompt")
     ap.add_argument("--temps", default="0.0", help="Temperatures to test (comma or space separated)")
     ap.add_argument("--n", type=int, default=5, help="Items per split for tiny prepared set")
@@ -80,9 +84,27 @@ def main() -> None:
     cfg = load_config(args.config)
 
     # Discover treatment files
-    treat_files = sorted(glob.glob(os.path.join(args.prompts_dir, args.pattern)))
+    raw_patterns = [p for p in str(args.pattern).replace(",", " ").split() if p]
+    if not raw_patterns:
+        raw_patterns = ["*.md"]
+    seen: set[str] = set()
+    treat_files: List[str] = []
+    control_abs = os.path.abspath(args.control)
+    control_norm = os.path.normcase(os.path.abspath(control_abs))
+    for pat in raw_patterns:
+        for path in glob.glob(os.path.join(args.prompts_dir, pat)):
+            norm = os.path.abspath(path)
+            if os.path.normcase(norm) == control_norm:
+                continue
+            if norm in seen:
+                continue
+            seen.add(norm)
+            treat_files.append(norm)
+    treat_files = sorted(treat_files)
     if not treat_files:
-        raise SystemExit(f"No treatment files matched in {args.prompts_dir} with pattern {args.pattern}")
+        raise SystemExit(
+            f"No treatment files matched in {args.prompts_dir} with patterns {', '.join(raw_patterns)}"
+        )
 
     ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     run_id = f"dry_multi_treat_{ts}"
@@ -103,7 +125,7 @@ def main() -> None:
     prompt_sets: Dict[str, Dict[str, str]] = {}
     for tf in treat_files:
         key = _slug_from_path(tf)
-        prompt_sets[key] = {"control": os.path.abspath(args.control), "treatment": os.path.abspath(tf)}
+        prompt_sets[key] = {"control": control_abs, "treatment": tf}
     cfg2["prompt_sets"] = prompt_sets
     # Disable any existing sweep so CLI prompt_sets are respected
     cfg2["sweep"] = None
@@ -118,8 +140,12 @@ def main() -> None:
 
     # Compose CLI args: use all prompt set keys
     keys: List[str] = sorted(prompt_sets.keys())
+    backend = str((cfg.get("backend") or "fireworks")).strip().lower()
+    runner = "scripts.run_all"
+    if backend == "alt":
+        runner = "scripts.alt_run_all"
     cmd = [
-        sys.executable, "-m", "scripts.run_all",
+        sys.executable, "-m", runner,
         "--config", tmp_cfg,
         "--run_id", run_id,
         "--prompt_sets", *keys,
