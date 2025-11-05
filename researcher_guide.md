@@ -6,7 +6,7 @@ This document provides a comprehensive guide for researchers writing an academic
 
 **Key Findings**:
 - **Temperature = 0.0 (Deterministic)**: The treatment prompt caused a statistically significant improvement in performance (p < 10⁻¹⁰⁰), with a 6.1 percentage point increase in exact match accuracy on closed-book tasks.
-- **Temperature = 1.0 (Stochastic / Reasoning)**: Currently running as a 1,000-item pilot on Anthropic Claude Sonnet 4.5 with thinking tokens (budget 2,048) to benchmark high-variance behaviour before scaling back up.
+- **Temperature = 1.0 (Stochastic / Reasoning)**: Currently running as a 1,000-item pilot on Anthropic Claude Sonnet 4.5 with `thinking.budget_tokens=2048`, paired with an OpenAI reasoning smoke test that exercises the `/v1/responses` endpoint.
 
 ## 1. Research Question and Hypothesis
 
@@ -31,11 +31,11 @@ System prompts have emerged as a critical factor in steering language model beha
 ### 2.2 Model and Infrastructure
 - **Baseline model (T=0.0)**: `accounts/fireworks/models/gpt-oss-120b` served through the Fireworks AI Batch Inference API (OpenAI-compatible surface).
 - **Reasoning follow-up (T=1.0)**: `claude-sonnet-4-5-20250929` via Anthropic’s Messages Batch API with `thinking.budget_tokens=2048` enforced per request.
-- **OpenAI thinking smoke**: `gpt-5-2025-08-07` accessed through `/v1/responses`; mirrors the Anthropic run with reasoning enabled for cross-provider comparisons.
+- **OpenAI reasoning smoke**: `gpt-5-2025-08-07` accessed through `/v1/responses` with `reasoning: {effort: medium, summary: auto}` overrides and `provider.allow_temperature: false` to satisfy model policy.
 - **Max tokens**: 1,024 for the deterministic baseline; 3,072 for reasoning experiments to avoid truncating long deliberations.
-- **Sampling**: 1 sample per item across active configs while we profile thinking-token overhead; multi-replicate runs are deferred to a later scaling phase.
+- **Sampling**: 1 sample per item across active configs while we profile reasoning-token overhead; multi-replicate runs are deferred to a later scaling phase.
 - **Context length**: 131,072 tokens (Fireworks) and 200k+ tokens (Anthropic Claude) per provider caps.
-- **Cost assumptions**: Fireworks baseline uses $0.075 / $0.30 per million tokens with a 50% batch discount. Anthropic reasoning relies on the provider pricing table (input 3.00, output 15.00 per MTok, discounted). OpenAI thinking smoke inherits the $0.15 / $0.60 per million rates with the same 50% batch discount.
+- **Cost assumptions**: Fireworks baseline uses $0.075 / $0.30 per million tokens with a 50% batch discount. Anthropic reasoning relies on the provider pricing table (input 3.00, output 15.00 per MTok, discounted). OpenAI reasoning smoke inherits the $0.15 / $0.60 per million rates with the same 50% batch discount.
 
 ### 2.3 Experimental Conditions
 
@@ -115,13 +115,13 @@ Three standard question-answering benchmarks were used to ensure broad coverage:
 
 #### Temperature = 1.0 (Reasoning Pilot)
 - **Scope**: Up to 1,000 closed-book TriviaQA items per condition (`squad_v2_max_items` = 0 for now to defer open-book cost).
-- **Samples per item**: 1 (thinking-enabled runs are token-intensive; we will re-introduce replicates once the budget model is validated).
+- **Samples per item**: 1 (reasoning-enabled runs are token-intensive; we will re-introduce replicates once the budget model is validated).
 - **Prompt sweep**: Focuses on `philosophy_without_instructions`, `operational_only`, and `excellence_50_percent` to isolate philosophical vs. operational contributions under stochastic sampling.
 - **Artifacts**: Outputs land in `results/anthropic_claude_sonnet_4_5/` with matching manifests under that directory.
 
-#### OpenAI Thinking Smoke (Preview)
-- **Scope**: 25-item slices per condition via `config/eval_config.openai_thinking_test.yaml`.
-- **Samples per item**: 1 (mirrors the Anthropic pilot while we profile OpenAI thinking tokens).
+#### OpenAI Reasoning Smoke (Preview)
+- **Scope**: 25-item slices per condition via `config/eval_config.openai_thinking_test.yaml` (legacy filename; now emits `reasoning` overrides).
+- **Samples per item**: 1 (mirrors the Anthropic pilot while we profile OpenAI reasoning tokens).
 - **Purpose**: Cross-provider sanity check—verifies that reasoning metadata parses correctly and that reports handle mixed backends.
 
 ### 3.3 Data File Structure
@@ -285,7 +285,7 @@ Control Correct    a        b      } b = 1,186
 
 #### Temperature = 1.0 (Reasoning Pilot)
 *Results pending — the pilot run is designed to measure:*
-- Effect size under stochastic sampling when Claude’s `thinking` mode is enabled (budget 2,048 tokens).
+- Effect size under stochastic sampling when Claude’s `thinking` mode is enabled (budget 2,048 tokens) and when OpenAI’s `/v1/responses` reasoning interface is active.
 - Comparative performance of philosophical vs. operational prompt variants on 1,000 closed-book items.
 - Token consumption and latency impacts of reasoning mode prior to scaling up.
 - Confidence intervals once enough paired items are collected (target ≥900 paired comparisons).
@@ -403,9 +403,9 @@ The treatment prompt's effectiveness may derive from:
 - **Dependencies**: Python 3.10+, see `requirements.txt`
 
 #### Temperature = 1.0 (Reasoning Pilot)
-- **Budget guidance**: Allocate ~$40-55 USD for 1,000 closed-book items with a 2,048-token thinking budget (actual spend varies with reasoning length).
+- **Budget guidance**: Allocate ~$40-55 USD for 1,000 closed-book items with a 2,048-token reasoning/thinking budget (actual spend varies with deliberation length).
 - **Estimated runtime**: ~3-5 hours depending on Anthropic queue depth and rate-limit backoff.
-- **Enhanced features**: Upgraded message-batch rate limiter, automatic thinking-budget validation, and prompt sweep support.
+- **Enhanced features**: Upgraded message-batch rate limiter, automatic reasoning/thinking budget validation, and prompt sweep support.
 - **Statistical output**: Paired deltas and McNemar remain primary; variance columns stay blank until multi-replicate runs resume.
 
 ### 9.4 Alternative Setup: Local LLM Backend (October 2025)
