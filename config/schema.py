@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator, ConfigDict, model_validator
@@ -101,6 +101,19 @@ class ProviderRateLimitModel(BaseModel):
         return fv
 
 
+class ProviderCacheControlModel(BaseModel):
+    enable_system_cache: bool = Field(default=True)
+    type: Literal["ephemeral", "persistent"] = Field(default="ephemeral")
+    ttl: Optional[str] = None
+
+    @field_validator("ttl")
+    @classmethod
+    def _normalize_ttl(cls, value: Optional[Any]):  # type: ignore[override]
+        if value is None:
+            return None
+        return str(value).strip()
+
+
 class ProviderModel(BaseModel):
     name: str
     model: str
@@ -117,6 +130,7 @@ class ProviderModel(BaseModel):
     batch_metadata: Dict[str, Any] = Field(default_factory=dict)
     client_options: Dict[str, Any] = Field(default_factory=dict)
     rate_limits: Optional[ProviderRateLimitModel] = None
+    cache_control: Optional[ProviderCacheControlModel] = None
 
     @field_validator("name")
     @classmethod
@@ -138,6 +152,34 @@ class ProviderModel(BaseModel):
     def _default_pricing_key(self) -> "ProviderModel":
         if not self.pricing_key:
             object.__setattr__(self, "pricing_key", self.model)
+        return self
+
+    @model_validator(mode="after")
+    def _extract_cache_control(self) -> "ProviderModel":
+        overrides = dict(self.request_overrides or {})
+        cache_cfg = overrides.pop("cache_control", None)
+        object.__setattr__(self, "request_overrides", overrides)
+        if cache_cfg is None:
+            return self
+        if isinstance(cache_cfg, ProviderCacheControlModel):
+            object.__setattr__(self, "cache_control", cache_cfg)
+            return self
+        if isinstance(cache_cfg, str):
+            token = cache_cfg.strip().lower()
+            if token in {"system", "enabled", "on", "true"}:
+                cache_model = ProviderCacheControlModel()
+            elif token in {"none", "disabled", "off", "false"}:
+                cache_model = ProviderCacheControlModel(enable_system_cache=False)
+            else:
+                raise ValueError(
+                    "provider.request_overrides.cache_control string values must be one of: system, enabled, on, true, none, disabled, off, false"
+                )
+            object.__setattr__(self, "cache_control", cache_model)
+            return self
+        if not isinstance(cache_cfg, dict):
+            raise ValueError("provider.request_overrides.cache_control must be a mapping when provided")
+        cache_model = ProviderCacheControlModel(**cache_cfg)
+        object.__setattr__(self, "cache_control", cache_model)
         return self
 
 

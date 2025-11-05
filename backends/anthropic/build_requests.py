@@ -146,21 +146,116 @@ def _coerce_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-def _extract_system_and_messages(messages: Sequence[dict[str, Any]]) -> Tuple[Optional[str], list[dict[str, Any]]]:
-    system_prompt: Optional[str] = None
+def _ensure_block_list(content: Any) -> list[dict[str, Any]]:
+    if isinstance(content, list):
+        blocks: list[dict[str, Any]] = []
+        for item in content:
+            if isinstance(item, dict):
+                block = dict(item)
+                b_type = str(block.get("type") or "text")
+                block["type"] = b_type
+                if "text" in block:
+                    block["text"] = "" if block["text"] is None else str(block["text"])
+                blocks.append(block)
+            elif isinstance(item, str):
+                blocks.append({"type": "text", "text": item})
+        return blocks
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if content is None:
+        return []
+    return [{"type": "text", "text": str(content)}]
+
+
+def _flatten_blocks(blocks: Sequence[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text")
+        if text:
+            parts.append(str(text))
+    return "\n".join(parts)
+
+
+def _extract_system_and_messages(messages: Sequence[dict[str, Any]]) -> Tuple[Optional[list[dict[str, Any]]], list[dict[str, Any]]]:
+    system_blocks: Optional[list[dict[str, Any]]] = None
     normalized: list[dict[str, Any]] = []
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         role = str(msg.get("role") or "").strip().lower()
-        content = _coerce_text(msg.get("content"))
-        if role == "system" and system_prompt is None:
-            system_prompt = content
+        content_blocks = _ensure_block_list(msg.get("content"))
+        if role == "system" and system_blocks is None:
+            if content_blocks:
+                system_blocks = content_blocks
             continue
         if not role:
             role = "user"
-        normalized.append({"role": role, "content": content})
-    return system_prompt, normalized
+        if not content_blocks:
+            # Skip empty messages to avoid API errors
+            continue
+        normalized.append({"role": role, "content": content_blocks})
+    return system_blocks, normalized
+
+
+def _apply_cache_control(
+    blocks: list[dict[str, Any]],
+    cache_control: Optional[dict[str, Any]],
+    *,
+    explicit: bool,
+) -> list[dict[str, Any]]:
+    if not blocks:
+        return blocks
+    has_existing = any(isinstance(block, dict) and block.get("cache_control") for block in blocks)
+    if cache_control is None:
+        if not explicit:
+            return blocks
+        cleared: list[dict[str, Any]] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                cleared.append(block)
+                continue
+            new_block = dict(block)
+            new_block.pop("cache_control", None)
+            cleared.append(new_block)
+        return cleared
+
+    if not explicit and has_existing:
+        return blocks
+
+    payload = dict(cache_control)
+    updated: list[dict[str, Any]] = []
+    applied = False
+    for block in blocks:
+        if not isinstance(block, dict):
+            updated.append(block)
+            continue
+        new_block = dict(block)
+        new_block.pop("cache_control", None)
+        if not applied and new_block.get("type", "text") == "text":
+            new_block["cache_control"] = dict(payload)
+            applied = True
+        updated.append(new_block)
+    if not applied:
+        updated.append({"type": "text", "text": "", "cache_control": dict(payload)})
+    return updated
+
+
+def _normalize_cache_settings(settings: Optional[dict[str, Any]]) -> tuple[Optional[dict[str, Any]], bool]:
+    if settings is None:
+        return {"type": "ephemeral"}, False
+    enabled = settings.get("enable_system_cache")
+    if enabled is None:
+        enabled = True
+    if not bool(enabled):
+        return None, True
+    cache_type = str(settings.get("type") or "ephemeral").strip() or "ephemeral"
+    payload: dict[str, Any] = {"type": cache_type}
+    ttl = settings.get("ttl")
+    if ttl:
+        payload["ttl"] = str(ttl)
+    return payload, True
 
 
 @dataclass
@@ -208,12 +303,14 @@ def build_message_requests(
     max_new_tokens: Optional[dict[str, Any] | Any],
     metadata: Optional[dict[str, Any]] = None,
     request_overrides: Optional[dict[str, Any]] = None,
+    cache_control: Optional[dict[str, Any]] = None,
 ) -> list[RequestPayload]:
     """Convert shard rows into Anthropic Message Batch request payloads."""
 
     token_lookup = _max_tokens_lookup(max_new_tokens)
     meta = _normalize_metadata(metadata)
     overrides = dict(request_overrides or {})
+    cache_payload, cache_explicit = _normalize_cache_settings(cache_control)
     used_custom_ids: set[str] = set()
 
     if _is_thinking_enabled(overrides.get("thinking")):
@@ -229,9 +326,10 @@ def build_message_requests(
         raw_messages = base_body.get("messages")
         if not isinstance(raw_messages, list):
             continue
-        system_prompt, conversation = _extract_system_and_messages(raw_messages)
+        system_blocks, conversation = _extract_system_and_messages(raw_messages)
         if not conversation:
             continue
+        processed_system_blocks = _apply_cache_control(system_blocks or [], cache_payload, explicit=cache_explicit)
 
         safe_custom_id = _sanitize_custom_id(orig_custom_id, used_custom_ids)
         params: dict[str, Any] = {
@@ -243,8 +341,8 @@ def build_message_requests(
             params["top_p"] = float(top_p)
         if top_k is not None:
             params["top_k"] = int(top_k)
-        if system_prompt:
-            params["system"] = system_prompt
+        if processed_system_blocks:
+            params["system"] = processed_system_blocks
 
         stop_sequences = _coerce_stop_sequences(base_body.get("stop"))
         if stop_sequences:

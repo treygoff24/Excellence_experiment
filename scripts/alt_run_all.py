@@ -921,7 +921,17 @@ def main() -> None:
                             "part_index": part_index,
                             "part_suffix": part_suffix,
                         })
-                        artifacts.append(adapter.submit(trial_slug=tr.slug, artifacts=art, dry_run=args.dry_run))
+                        submitted_artifact = adapter.submit(trial_slug=tr.slug, artifacts=art, dry_run=args.dry_run)
+                        artifacts.append(submitted_artifact)
+                        cache_metrics = getattr(submitted_artifact, "extra", {}).get("cache_metrics") if submitted_artifact else None
+                        if cache_metrics and cache_metrics.get("cache_read_input_tokens") is not None:
+                            read_tokens = cache_metrics.get("cache_read_input_tokens")
+                            created_tokens = cache_metrics.get("cache_creation_input_tokens")
+                            batch_reference = submitted_artifact.batch_id or "pending"
+                            print(
+                                f"[cache] {adapter.backend} batch {batch_reference}: cache_read_input_tokens={read_tokens}, "
+                                f"cache_creation_input_tokens={created_tokens}"
+                            )
             tr.artifacts = artifacts
             _update_stage(
                 manifest=manifest,

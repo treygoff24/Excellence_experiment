@@ -37,6 +37,11 @@ provider:
     batch_requests_per_minute: 2000
     max_rate_limit_retries: 5
     retry_after_fallback_seconds: 30.0
+  request_overrides:
+    cache_control:
+      enable_system_cache: true
+      type: ephemeral
+      ttl: 1h
 pricing:
   input_per_million: 0.15
   output_per_million: 0.60

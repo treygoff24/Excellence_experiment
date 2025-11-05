@@ -234,6 +234,23 @@ python -c "from config.schema import EvalConfigModel; EvalConfigModel.from_file(
 - Extracts usage metrics, finish reasons, request IDs.
 - Appends metadata to manifests for traceability (prompt hashes, token counts).
 
+### 8.6 Anthropic prompt caching
+
+- Anthropic batches now send structured message content with `cache_control` annotations on the system prompt. This drives Sonnet 4.5’s prompt cache from day one (≃90 % input cost savings for our 1.4k-token treatment prompt).
+- Configuration lives under `provider.request_overrides.cache_control`. Example:
+  ```yaml
+  provider:
+    request_overrides:
+      cache_control:
+        enable_system_cache: true
+        type: ephemeral
+        ttl: 1h
+  ```
+  - `enable_system_cache` defaults to `true` for Anthropic runs; set it to `false` to opt out for short prompts.
+  - `type` mirrors the Anthropic API (`ephemeral` or `persistent`). TTL strings (`1h`, `15m`, etc.) are forwarded unchanged when provided.
+- `scripts.prompt_adapter.render_payload` and `backends/anthropic.build_message_requests` cooperate so cache metadata is present in both manual previews and batch submissions. Reused control prompts automatically hit the cache because the block text is identical.
+- `scripts.alt_run_all` prints cache metrics reported by the batch API (`cache_read_input_tokens`, `cache_creation_input_tokens`) during the submit phase. Watch these logs to confirm cache hits during pilots; misses usually mean the prompt changed or the TTL elapsed between shards.
+
 ---
 
 ## 9. Scoring & Statistical Analysis

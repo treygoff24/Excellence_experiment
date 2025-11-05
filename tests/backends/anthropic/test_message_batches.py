@@ -52,9 +52,14 @@ def test_build_message_requests_basic(tmp_path: Path) -> None:
     assert req.custom_id == "dataset_item_control_0_0_0_open"
     assert req.orig_custom_id == "dataset|item|control|0.0|0|open"
     assert req.params["model"] == "claude-sonnet-3.5"
-    assert req.params["system"] == "You are a helpful assistant."
+    system_blocks = req.params["system"]
+    assert isinstance(system_blocks, list)
+    assert system_blocks[0]["text"] == "You are a helpful assistant."
+    assert system_blocks[0]["cache_control"]["type"] == "ephemeral"
     assert req.params["messages"][0]["role"] == "user"
-    assert req.params["messages"][0]["content"] == "Outline selective risk."
+    user_blocks = req.params["messages"][0]["content"]
+    assert isinstance(user_blocks, list)
+    assert user_blocks[0]["text"] == "Outline selective risk."
     assert req.params["stop_sequences"] == ["</end>"]
     assert req.params["max_tokens"] == 1536
     assert req.metadata["trial"] == "slug-123"
@@ -64,6 +69,111 @@ def test_build_message_requests_basic(tmp_path: Path) -> None:
     assert written == 1
     dumped = preview.read_text(encoding="utf-8").strip().splitlines()
     assert json.loads(dumped[0])["custom_id"] == req.custom_id
+
+
+def test_build_message_requests_respects_cache_ttl(tmp_path: Path) -> None:
+    src = tmp_path / "shard_ttl.jsonl"
+    _jsonl_write(
+        src,
+        [
+            {
+                "custom_id": "dataset|item|control|0.0|0|open",
+                "body": {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": [
+                                {"type": "text", "text": "System prompt.", "cache_control": {"type": "ephemeral", "ttl": "5m"}},
+                            ],
+                        },
+                        {"role": "user", "content": "Question?"},
+                    ]
+                },
+            }
+        ],
+    )
+    requests = build_message_requests(
+        src_path=str(src),
+        model="claude-sonnet-3.5",
+        temperature=0.4,
+        top_p=None,
+        top_k=None,
+        max_new_tokens={"default": 512},
+        cache_control={"enable_system_cache": True, "ttl": "1h"},
+    )
+    assert len(requests) == 1
+    system_blocks = requests[0].params["system"]
+    assert system_blocks[0]["cache_control"]["ttl"] == "1h"
+
+
+def test_build_message_requests_preserves_existing_when_no_override(tmp_path: Path) -> None:
+    src = tmp_path / "shard_existing.jsonl"
+    _jsonl_write(
+        src,
+        [
+            {
+                "custom_id": "dataset|item|control|0.0|0|open",
+                "body": {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": [
+                                {"type": "text", "text": "System prompt.", "cache_control": {"type": "ephemeral", "ttl": "5m"}},
+                            ],
+                        },
+                        {"role": "user", "content": "Question?"},
+                    ]
+                },
+            }
+        ],
+    )
+    requests = build_message_requests(
+        src_path=str(src),
+        model="claude-sonnet-3.5",
+        temperature=0.4,
+        top_p=None,
+        top_k=None,
+        max_new_tokens={"default": 512},
+    )
+    assert len(requests) == 1
+    system_blocks = requests[0].params["system"]
+    assert system_blocks[0]["cache_control"]["ttl"] == "5m"
+
+
+def test_build_message_requests_skips_cache_when_disabled(tmp_path: Path) -> None:
+    src = tmp_path / "shard_nocache.jsonl"
+    _jsonl_write(
+        src,
+        [
+            {
+                "custom_id": "dataset|item|control|0.0|0|open",
+                "body": {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": [
+                                {"type": "text", "text": "Short.", "cache_control": {"type": "ephemeral", "ttl": "5m"}},
+                            ],
+                        },
+                        {"role": "user", "content": "Hi"},
+                    ]
+                },
+            }
+        ],
+    )
+    requests = build_message_requests(
+        src_path=str(src),
+        model="claude-sonnet-3.5",
+        temperature=0.1,
+        top_p=None,
+        top_k=None,
+        max_new_tokens={"default": 128},
+        cache_control={"enable_system_cache": False},
+    )
+    assert len(requests) == 1
+    system_blocks = requests[0].params["system"]
+    assert isinstance(system_blocks, list)
+    assert "cache_control" not in system_blocks[0]
 
 
 def test_build_message_requests_enforces_limit(tmp_path: Path) -> None:

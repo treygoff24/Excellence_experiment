@@ -49,6 +49,10 @@ provider:
     thinking:
       type: enabled
       budget_tokens: 1024
+    cache_control:
+      enable_system_cache: true
+      type: ephemeral
+      ttl: 1h
   client_options:
     default_headers:
       anthropic-version: "2023-06-01"

@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 import os
-from typing import Dict, Literal, Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 from config.schema import load_config
 
@@ -49,6 +49,57 @@ def _system_prompt_from_cfg(cfg: Dict, prompt_set: str, condition: Cond) -> str:
     return _read_text(path)
 
 
+def _provider_settings(cfg: Dict) -> Tuple[str, Dict[str, Any]]:
+    provider = cfg.get("provider") or {}
+    name = str(provider.get("name") or "").strip().lower()
+    cache_cfg_raw = provider.get("cache_control")
+    cache_cfg: Dict[str, Any] = {}
+    if isinstance(cache_cfg_raw, dict):
+        cache_cfg = dict(cache_cfg_raw)
+    elif cache_cfg_raw:
+        cache_cfg = {"enable_system_cache": True, "type": "ephemeral"}
+    return name, cache_cfg
+
+
+def _normalize_cache_block(cache_cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not cache_cfg:
+        return None
+    enabled = cache_cfg.get("enable_system_cache")
+    if enabled is None:
+        enabled = True
+    if not bool(enabled):
+        return None
+    cache_type = str(cache_cfg.get("type") or "ephemeral").strip() or "ephemeral"
+    block: Dict[str, Any] = {"type": cache_type}
+    ttl = cache_cfg.get("ttl")
+    if ttl:
+        block["ttl"] = str(ttl)
+    return block
+
+
+def _blocks_from_text(text: str, *, cache_control: Optional[Dict[str, Any]] = None) -> list[Dict[str, Any]]:
+    block: Dict[str, Any] = {"type": "text", "text": text}
+    if cache_control:
+        block["cache_control"] = cache_control
+    return [block]
+
+
+def _normalize_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(part for part in parts if part)
+    return "" if content is None else str(content)
+
+
 def render_payload(
     cfg: Dict,
     *,
@@ -72,15 +123,28 @@ def render_payload(
         mnt_val = int(mnt.get("closed_book") or 0) or None
 
     stop = cfg.get("stop") or []
+    provider_name, provider_cache_cfg = _provider_settings(cfg)
+    cache_block = _normalize_cache_block(provider_cache_cfg) if provider_name == "anthropic" else None
+    use_structured_messages = provider_name == "anthropic"
 
     body: Dict
     if out_format == "messages":
-        body = {
-            "messages": [
-                {"role": "system", "content": system_text},
-                {"role": "user", "content": user_text},
-            ]
-        }
+        if use_structured_messages:
+            system_blocks = _blocks_from_text(system_text, cache_control=cache_block)
+            user_blocks = _blocks_from_text(user_text)
+            body = {
+                "messages": [
+                    {"role": "system", "content": system_blocks},
+                    {"role": "user", "content": user_blocks},
+                ]
+            }
+        else:
+            body = {
+                "messages": [
+                    {"role": "system", "content": system_text},
+                    {"role": "user", "content": user_text},
+                ]
+            }
     else:
         # Combine system + user for engines that only accept a single prompt string
         body = {
@@ -132,13 +196,17 @@ def check_render_equivalence(cfg: Dict, *, prompt_set: str, question: str, conte
     usr_a = a["body"]["messages"][1]["content"]
     sys_b = b["body"]["messages"][0]["content"]
     usr_b = b["body"]["messages"][1]["content"]
+    sys_a_text = _normalize_content_to_text(sys_a)
+    usr_a_text = _normalize_content_to_text(usr_a)
+    sys_b_text = _normalize_content_to_text(sys_b)
+    usr_b_text = _normalize_content_to_text(usr_b)
 
     return {
-        "control": {"system_sha1": _sha1(sys_a), "user_sha1": _sha1(usr_a)},
-        "treatment": {"system_sha1": _sha1(sys_b), "user_sha1": _sha1(usr_b)},
+        "control": {"system_sha1": _sha1(sys_a_text), "user_sha1": _sha1(usr_a_text)},
+        "treatment": {"system_sha1": _sha1(sys_b_text), "user_sha1": _sha1(usr_b_text)},
         "checks": {
-            "system_differs": _sha1(sys_a) != _sha1(sys_b),
-            "user_equal": _sha1(usr_a) == _sha1(usr_b),
+            "system_differs": _sha1(sys_a_text) != _sha1(sys_b_text),
+            "user_equal": _sha1(usr_a_text) == _sha1(usr_b_text),
         },
     }
 

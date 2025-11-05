@@ -96,6 +96,29 @@ def _maybe_model_dump(obj: Any) -> Any:
     return obj
 
 
+def _extract_cache_metrics(batch: Any) -> dict[str, int]:
+    metrics: dict[str, int] = {}
+    if batch is None:
+        return metrics
+    source = batch.model_dump() if hasattr(batch, "model_dump") else batch
+    for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        value: Any
+        if isinstance(source, dict):
+            value = source.get(key)
+        else:
+            value = getattr(batch, key, None)
+        if value is None:
+            continue
+        try:
+            metrics[key] = int(value)
+        except (TypeError, ValueError):
+            try:
+                metrics[key] = int(float(value))
+            except Exception:
+                continue
+    return metrics
+
+
 class AnthropicBatchAdapter:
     backend = "anthropic"
 
@@ -109,11 +132,19 @@ class AnthropicBatchAdapter:
         self.poll_seconds = float(provider_cfg.get("poll_seconds") or 30.0)
         self.batch_params = dict(provider_cfg.get("batch_params") or {})
         self.request_overrides = dict(provider_cfg.get("request_overrides") or {})
+        cache_override = self.request_overrides.pop("cache_control", None)
         self.request_metadata = dict(provider_cfg.get("request_metadata") or {})
         self.batch_metadata = dict(provider_cfg.get("batch_metadata") or provider_cfg.get("job_metadata") or {})
         self.client_options = dict(provider_cfg.get("client_options") or {})
         self.provider_cfg = provider_cfg
         self.rate_limits_cfg = dict(provider_cfg.get("rate_limits") or {})
+        if cache_override is not None:
+            if isinstance(cache_override, dict):
+                self.cache_control_cfg = dict(cache_override)
+            else:
+                self.cache_control_cfg = {"enable_system_cache": bool(cache_override)}
+        else:
+            self.cache_control_cfg = dict(provider_cfg.get("cache_control") or {})
         self._client = client
         self._limiter: AnthropicBatchLimiter | None = None
         self._anthropic: Any | None = None
@@ -235,6 +266,7 @@ class AnthropicBatchAdapter:
             max_new_tokens=max_new_tokens,
             metadata=request_metadata,
             request_overrides=self.request_overrides or None,
+            cache_control=self.cache_control_cfg or None,
         )
         write_requests_preview(requests, request_preview_path)
         id_map_path = os.path.join(
@@ -285,6 +317,9 @@ class AnthropicBatchAdapter:
         batch_id = getattr(batch, "id", None) or getattr(batch, "batch_id", None) or (batch.get("id") if isinstance(batch, dict) else None)
         if not batch_id:
             raise RuntimeError("Anthropic batch submission did not return a batch id.")
+        cache_metrics = _extract_cache_metrics(batch)
+        if cache_metrics:
+            artifacts.extra["cache_metrics"] = cache_metrics
         if limiter:
             limiter.register_batch(batch_id, request_count)
         artifacts.batch_id = batch_id
