@@ -33,16 +33,15 @@ provider:
   name: openai
   model: gpt-5-2025-08-07
   pricing_key: gpt-5-2025-08-07
+  allow_temperature: false
   batch:
     endpoint: /v1/responses
     max_output_tokens: 3072
     temperature: 0.0
   request_overrides:
-    thinking:
-      type: enabled
-      budget_tokens: 2048
     reasoning:
       effort: medium
+      summary: auto
     metadata:
       verbosity: low
 prompt_sets:

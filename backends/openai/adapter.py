@@ -105,6 +105,30 @@ class OpenAIBatchAdapter:
         self.batch_cfg = batch_cfg
         ensure_thinking_budget(self.request_overrides, context="provider.request_overrides")
         ensure_thinking_budget(self.batch_params, context="provider.batch_params")
+        allow_temperature = provider_cfg.get("allow_temperature")
+        self.allow_temperature = True if allow_temperature is None else bool(allow_temperature)
+        batch_allow_temperature = self.batch_cfg.get("allow_temperature")
+        if batch_allow_temperature is not None:
+            self.allow_temperature = bool(batch_allow_temperature)
+        allow_top_p = provider_cfg.get("allow_top_p")
+        self.allow_top_p = True if allow_top_p is None else bool(allow_top_p)
+        batch_allow_top_p = self.batch_cfg.get("allow_top_p")
+        if batch_allow_top_p is not None:
+            self.allow_top_p = bool(batch_allow_top_p)
+
+        if not self.allow_temperature:
+            self.request_overrides.pop("temperature", None)
+            self.batch_params.pop("temperature", None)
+        if not self.allow_top_p:
+            self.request_overrides.pop("top_p", None)
+            self.batch_params.pop("top_p", None)
+
+        reasoning_cfg = self.request_overrides.get("reasoning") or self.batch_params.get("reasoning")
+        if reasoning_cfg and self.endpoint != "/v1/responses":
+            raise ValueError(
+                "OpenAI reasoning runs must target the /v1/responses endpoint. "
+                f"Configured endpoint {self.endpoint!r} is incompatible with reasoning overrides."
+            )
         self._client = client
 
     def _ensure_client(self) -> Any:
@@ -176,6 +200,8 @@ class OpenAIBatchAdapter:
         if not model_id:
             raise ValueError("OpenAI adapter requires a model_id in config or artifact metadata.")
         top_p = extra.get("top_p", self.cfg.get("top_p"))
+        if not self.allow_top_p:
+            top_p = None
         max_tokens = _coerce_max_tokens(extra.get("max_new_tokens") or self.cfg.get("max_new_tokens"))
         endpoint = extra.get("endpoint") or self.endpoint
 
@@ -189,6 +215,8 @@ class OpenAIBatchAdapter:
             endpoint=endpoint,
             metadata=self._prepare_request_metadata(trial_slug, artifacts),
             request_overrides=self.request_overrides or None,
+            allow_temperature=self.allow_temperature,
+            allow_top_p=self.allow_top_p,
         )
         artifacts.extra["request_count"] = request_count
         artifacts.extra["request_path"] = request_path

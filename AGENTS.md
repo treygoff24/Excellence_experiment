@@ -124,8 +124,9 @@ Env: use direnv allow once per repo; prefer mise run tasks; for Python, uv venv 
 
 ## Reasoning / Thinking Modes
 
-- Anthropic and OpenAI adapters now accept `thinking` overrides; when `thinking` is enabled you **must** set a positive `thinking.budget_tokens` (validation happens in `backends/openai.build_inputs.ensure_thinking_budget`).
+- Anthropic adapters continue to honor `thinking` overrides with token budgets, while OpenAI runs now expect `reasoning` overrides (effort/summary) on `/v1/responses`; legacy `thinking` blocks are auto-translated with a warning by `backends/openai.build_inputs.ensure_thinking_budget`.
 - Use `config/eval_config.openai_thinking_test.yaml` for quick OpenAI reasoning smokes; pair it with `python -m scripts.build_batches --limit_items 25` to stay within budgets.
+- Some OpenAI reasoning tiers block temperature control; flip `provider.allow_temperature: false` (or `provider.batch.allow_temperature`) to remove it from requests without disturbing trial metadata.
 - Anthropic reasoning sweeps live in `config/eval_config.anthropic_full.yaml`; the rate limiter guards queue pressure, so keep `samples_per_item` small unless you raise the processing limits.
 - The long-form prompts used for reasoning experiments are mirrored in `config/prompts copy/` for archival comparisons; update both copies when editing prompt text.
 

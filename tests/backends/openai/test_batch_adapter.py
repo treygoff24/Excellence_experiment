@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from backends.openai import OpenAIBatchAdapter
 from backends.openai.build_inputs import build_batch_requests
 from backends.openai.normalize import normalize_jsonl
 from backends.openai.poll_and_download import download_and_extract, poll_until_complete
@@ -124,9 +125,81 @@ def test_build_batch_requests_accepts_thinking_with_budget(tmp_path: Path) -> No
     )
     assert count == 1
     record = _read_jsonl(dest)[0]
-    thinking = record["body"].get("thinking")
-    assert thinking is not None
-    assert thinking["budget_tokens"] == 128
+    assert "thinking" not in record["body"]
+    reasoning = record["body"].get("reasoning")
+    assert reasoning is not None
+    assert reasoning["effort"] == "low"
+
+
+def test_build_batch_requests_with_reasoning_overrides(tmp_path: Path) -> None:
+    src = tmp_path / "shard.jsonl"
+    src.write_text(
+        json.dumps(
+            {
+                "custom_id": "dataset|item|treatment|0.0|0|closed",
+                "body": {
+                    "messages": [
+                        {"role": "system", "content": "System prompt."},
+                        {"role": "user", "content": "Answer me."},
+                    ]
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dest = tmp_path / "requests.jsonl"
+    count = build_batch_requests(
+        src_path=str(src),
+        dest_path=str(dest),
+        model="gpt-4.1-mini",
+        temperature=0.8,
+        top_p=0.95,
+        max_new_tokens=None,
+        endpoint="/v1/responses",
+        metadata=None,
+        request_overrides={"reasoning": {"effort": "medium", "summary": "auto"}},
+    )
+    assert count == 1
+    record = _read_jsonl(dest)[0]
+    reasoning = record["body"].get("reasoning")
+    assert reasoning == {"effort": "medium", "summary": "auto"}
+
+
+def test_build_batch_requests_without_temperature(tmp_path: Path) -> None:
+    src = tmp_path / "shard.jsonl"
+    src.write_text(
+        json.dumps(
+            {
+                "custom_id": "dataset|item|control|0.0|0|open",
+                "body": {
+                    "messages": [
+                        {"role": "system", "content": "System prompt."},
+                        {"role": "user", "content": "User question?"},
+                    ]
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dest = tmp_path / "requests.jsonl"
+    count = build_batch_requests(
+        src_path=str(src),
+        dest_path=str(dest),
+        model="gpt-4.1-mini",
+        temperature=0.0,
+        top_p=0.9,
+        max_new_tokens=None,
+        endpoint="/v1/responses",
+        metadata=None,
+        request_overrides=None,
+        allow_temperature=False,
+    )
+    assert count == 1
+    body = _read_jsonl(dest)[0]["body"]
+    assert "temperature" not in body
+    assert body["top_p"] == 0.9
 
 
 class _StubBatches:
@@ -192,3 +265,90 @@ def test_download_and_normalize_results(tmp_path: Path) -> None:
     assert {row["condition"] for row in rows} == {"control", "treatment"}
     texts = {row["response_text"] for row in rows}
     assert texts == {"Control answer.", "Treatment answer."}
+
+
+def test_adapter_reasoning_requires_responses_endpoint() -> None:
+    cfg = {
+        "provider": {
+            "name": "openai",
+            "model": "o4-mini",
+            "batch": {"endpoint": "/v1/chat/completions"},
+            "request_overrides": {"reasoning": {"effort": "medium"}},
+        }
+    }
+    with pytest.raises(ValueError):
+        OpenAIBatchAdapter(cfg)
+
+
+def test_adapter_reasoning_with_responses_endpoint() -> None:
+    cfg = {
+        "provider": {
+            "name": "openai",
+            "model": "o4-mini",
+            "batch": {"endpoint": "/v1/responses"},
+            "request_overrides": {"reasoning": {"effort": "high"}},
+        }
+    }
+    adapter = OpenAIBatchAdapter(cfg)
+    assert adapter.request_overrides["reasoning"]["effort"] == "high"
+
+
+def test_adapter_respects_allow_temperature() -> None:
+    cfg = {
+        "provider": {
+            "name": "openai",
+            "model": "o4-mini",
+            "allow_temperature": False,
+        }
+    }
+    adapter = OpenAIBatchAdapter(cfg)
+    assert adapter.allow_temperature is False
+
+
+def test_normalize_responses_with_wrapped_body(tmp_path: Path) -> None:
+    record = {
+        "id": "batch_req_test",
+        "custom_id": "dataset|item|control|0.0|0|closed",
+        "response": {
+            "status_code": 200,
+            "request_id": "req-123",
+            "body": {
+                "id": "resp-123",
+                "model": "o4-mini",
+                "status": "completed",
+                "output": [
+                    {
+                        "id": "thought",
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "Reasoning summary"}],
+                    },
+                    {
+                        "id": "msg",
+                        "type": "message",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "unknown"}],
+                        "finish_reason": "stop",
+                    },
+                ],
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 34,
+                    "output_tokens_details": {"reasoning_tokens": 30},
+                    "total_tokens": 46,
+                },
+                "reasoning": {"effort": "medium", "summary": "auto"},
+            },
+        },
+    }
+    src = tmp_path / "wrapped.jsonl"
+    src.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    dest = tmp_path / "normalized.jsonl"
+    count = normalize_jsonl([str(src)], str(dest), endpoint="/v1/responses")
+    assert count == 1
+    normalized = _read_jsonl(dest)[0]
+    body = normalized["response"]["body"]
+    assert body["choices"][0]["message"]["content"] == "unknown"
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["usage"]["input_tokens"] == 12
+    assert body["usage"]["output_tokens"] == 34
+    assert body.get("reasoning") == {"effort": "medium", "summary": "auto"}

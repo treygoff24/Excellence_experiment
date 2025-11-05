@@ -32,6 +32,8 @@ class ProviderBatchModel(BaseModel):
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
+    allow_temperature: Optional[bool] = None
+    allow_top_p: Optional[bool] = None
 
     @field_validator("max_output_tokens", "max_tokens")
     @classmethod
@@ -106,6 +108,8 @@ class ProviderModel(BaseModel):
     region: Optional[str] = None
     pricing_key: Optional[str] = None
     batch: Optional[ProviderBatchModel] = None
+    allow_temperature: bool = Field(default=True)
+    allow_top_p: bool = Field(default=True)
     metadata: Dict[str, Any] = Field(default_factory=dict)
     batch_params: Dict[str, Any] = Field(default_factory=dict)
     request_overrides: Dict[str, Any] = Field(default_factory=dict)

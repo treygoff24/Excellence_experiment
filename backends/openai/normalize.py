@@ -31,36 +31,41 @@ def _collect_output_text(output: Iterable[Any]) -> tuple[str, Optional[str]]:
 
 
 def _normalize_responses_body(resp: dict[str, Any]) -> dict[str, Any]:
-    aggregated, finish_reason = _collect_output_text(resp.get("output") or [])
+    source = resp.get("body") if isinstance(resp.get("body"), dict) else resp
+    aggregated, finish_reason = _collect_output_text(source.get("output") or [])
     if not aggregated:
-        text = resp.get("output_text") or resp.get("text")
+        text = source.get("output_text") or source.get("text")
         if isinstance(text, str):
             aggregated = text.strip()
-    usage = resp.get("usage") or {}
-    body = {
+    usage = source.get("usage") or resp.get("usage") or {}
+    finish = finish_reason or source.get("status") or resp.get("status") or "stop"
+    normalized_body: dict[str, Any] = {
         "choices": [
             {
                 "message": {"role": "assistant", "content": aggregated},
-                "finish_reason": finish_reason or resp.get("status") or "stop",
+                "finish_reason": finish,
             }
         ],
         "usage": usage,
-        "id": resp.get("id"),
-        "model": resp.get("model"),
+        "id": source.get("id") or resp.get("id"),
+        "model": source.get("model") or resp.get("model"),
     }
-    return body
+    if isinstance(source.get("reasoning"), dict):
+        normalized_body["reasoning"] = source["reasoning"]
+    return normalized_body
 
 
 def _normalize_chat_completions_body(resp: dict[str, Any]) -> dict[str, Any]:
-    choices = resp.get("choices") or []
-    usage = resp.get("usage") or {}
-    body = {
+    source = resp.get("body") if isinstance(resp.get("body"), dict) else resp
+    choices = source.get("choices") or resp.get("choices") or []
+    usage = source.get("usage") or resp.get("usage") or {}
+    normalized_body = {
         "choices": choices,
         "usage": usage,
-        "id": resp.get("id"),
-        "model": resp.get("model"),
+        "id": source.get("id") or resp.get("id"),
+        "model": source.get("model") or resp.get("model"),
     }
-    return body
+    return normalized_body
 
 
 def normalize_record(record: dict[str, Any], *, endpoint: str) -> dict[str, Any]:
@@ -80,12 +85,13 @@ def normalize_record(record: dict[str, Any], *, endpoint: str) -> dict[str, Any]
     usage = body.get("usage") or response.get("usage") or {}
     body["usage"] = usage
 
+    source = response.get("body") if isinstance(response.get("body"), dict) else response
     normalized = dict(record)
     normalized["response"] = {
         "body": body,
         "usage": usage,
-        "id": response.get("id"),
-        "model": response.get("model"),
+        "id": body.get("id") or source.get("id"),
+        "model": body.get("model") or source.get("model"),
         "raw": response,
     }
     return normalized

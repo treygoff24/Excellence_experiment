@@ -47,9 +47,10 @@ Environment: `.env` is loaded via python-dotenv. Prefer `--account_id=slug` or o
 
 ## Thinking / Reasoning Settings
 
-- Both Anthropic and OpenAI adapters honor `thinking` overrides; when you enable them, set `thinking.budget_tokens` to a positive integer or schema validation will fail (`backends/openai.build_inputs.ensure_thinking_budget` enforces this).
+- OpenAI reasoning runs now use `reasoning` overrides (e.g., `reasoning: {effort: medium, summary: auto}`) on the `/v1/responses` endpoint. Legacy `thinking.*` config is auto-translated but emits warnings—update configs directly to stay future-proof.
+- Some OpenAI reasoning models reject `temperature`; set `provider.allow_temperature: false` (or `provider.batch.allow_temperature: false`) to strip it from Batch payloads while retaining the temp label in metadata.
 - Quick OpenAI reasoning smoke: `python -m scripts.run_all --config config/eval_config.openai_thinking_test.yaml --archive --dry_run`, then lift the dry run once you have budget approval. Pair with `--limit_items` during build stages.
-- Anthropic reasoning runs use `config/eval_config.anthropic_full.yaml`; the upgraded rate limiter protects queue capacity, so revisit `tests/backends/anthropic/test_message_batches.py` and `tests/backends/anthropic/test_rate_limiter.py` when changing concurrency knobs.
+- Anthropic reasoning runs still rely on `thinking` knobs in `config/eval_config.anthropic_full.yaml`; the upgraded rate limiter protects queue capacity, so revisit `tests/backends/anthropic/test_message_batches.py` and `tests/backends/anthropic/test_rate_limiter.py` when changing concurrency knobs.
 - OpenAI request overrides and reasoning payloads are covered by `tests/backends/openai/test_batch_adapter.py`; keep it green after adapter edits.
 - Frozen prompt copies in `config/prompts copy/` map one-to-one to active prompts—update both locations when editing prose.
 

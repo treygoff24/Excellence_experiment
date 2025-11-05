@@ -4,8 +4,15 @@ import json
 import os
 from typing import Any, Dict, Iterable, Optional
 
+import logging
+
 
 SUPPORTED_ENDPOINTS = {"/v1/responses", "/v1/chat/completions"}
+LEGACY_THINKING_LOW_BUDGET = 512
+LEGACY_THINKING_MEDIUM_BUDGET = 2048
+
+
+logger = logging.getLogger(__name__)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -50,40 +57,108 @@ def _parse_thinking_state(data: Any) -> tuple[bool, dict[str, Any]]:
     return enabled, thinking_dict
 
 
+def _normalize_reasoning_dict(reasoning_cfg: Any, *, context: str) -> dict[str, Any]:
+    data = _as_dict(reasoning_cfg)
+    if not data:
+        raise ValueError(f"Reasoning settings for {context} must be a non-empty object.")
+    normalized: dict[str, Any] = {}
+    for key, value in data.items():
+        if key is None:
+            continue
+        if key == "effort":
+            if value is None:
+                raise ValueError(f"reasoning.effort for {context} cannot be null.")
+            effort = str(value).strip()
+            if not effort:
+                raise ValueError(f"reasoning.effort for {context} cannot be empty.")
+            normalized["effort"] = effort
+        elif key == "summary":
+            if isinstance(value, str):
+                summary = value.strip()
+                if not summary:
+                    raise ValueError(f"reasoning.summary for {context} cannot be empty.")
+                normalized["summary"] = summary
+            elif isinstance(value, bool):
+                normalized["summary"] = value
+            else:
+                normalized["summary"] = value
+        else:
+            normalized[str(key)] = value
+    if "effort" not in normalized:
+        normalized["effort"] = "medium"
+    return normalized
+
+
+def _effort_from_budget(value: int) -> str:
+    if value <= LEGACY_THINKING_LOW_BUDGET:
+        return "low"
+    if value <= LEGACY_THINKING_MEDIUM_BUDGET:
+        return "medium"
+    return "high"
+
+
 def ensure_thinking_budget(container: Any, *, context: str) -> None:
     mapping = _as_dict(container)
     if not mapping:
+        return
+    if "reasoning" in mapping and mapping["reasoning"] is not None:
+        normalized = _normalize_reasoning_dict(mapping["reasoning"], context=context)
+        if isinstance(container, dict):
+            container["reasoning"] = normalized
         return
     if "thinking" not in mapping:
         return
     enabled, thinking_cfg = _parse_thinking_state(mapping["thinking"])
     if not enabled:
+        if isinstance(container, dict):
+            container.pop("thinking", None)
         return
     if not thinking_cfg:
         raise ValueError(
             f"Thinking is enabled for {context} but no configuration object was provided. "
-            "Include a budget_tokens value or disable thinking."
+            "Replace thinking.* with reasoning.* or disable the feature."
         )
+    effort_value = thinking_cfg.get("effort")
     budget_value = None
     for key in ("budget_tokens", "budgetTokens", "budget", "max_tokens", "maxTokens"):
         if key in thinking_cfg and thinking_cfg[key] is not None:
             budget_value = thinking_cfg[key]
             break
-    if budget_value is None:
+    if effort_value is None and budget_value is None:
         raise ValueError(
-            f"Thinking is enabled for {context} but no token budget was supplied. "
-            "Set thinking.budget_tokens to a positive integer."
+            f"Thinking overrides for {context} must specify either an effort level or a positive budget_tokens value."
         )
-    try:
-        budget_int = int(budget_value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"Thinking budget for {context} must be an integer; received {budget_value!r}."
-        ) from exc
-    if budget_int <= 0:
-        raise ValueError(
-            f"Thinking budget for {context} must be positive; received {budget_int}."
-        )
+    budget_int: Optional[int] = None
+    if budget_value is not None:
+        try:
+            budget_int = int(budget_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Thinking budget for {context} must be an integer; received {budget_value!r}."
+            ) from exc
+        if budget_int <= 0:
+            raise ValueError(
+                f"Thinking budget for {context} must be positive; received {budget_int}."
+            )
+    if effort_value is not None:
+        effort = str(effort_value).strip()
+        if not effort:
+            raise ValueError(f"Thinking overrides for {context} include an empty effort value.")
+    else:
+        effort = _effort_from_budget(int(budget_int))
+    summary_value = thinking_cfg.get("summary")
+    reasoning_payload = _normalize_reasoning_dict(
+        {"effort": effort, **({"summary": summary_value} if summary_value is not None else {})},
+        context=context,
+    )
+    logger.warning(
+        "Thinking overrides for %s are deprecated; mapping to reasoning.effort=%s. Update your config to use provider.request_overrides.reasoning.",
+        context,
+        reasoning_payload.get("effort"),
+    )
+    if isinstance(container, dict):
+        container.pop("thinking", None)
+        container["reasoning"] = reasoning_payload
 
 
 def _load_rows(path: str) -> Iterable[dict[str, Any]]:
@@ -187,6 +262,8 @@ def build_batch_requests(
     endpoint: str = "/v1/responses",
     metadata: Optional[dict[str, Any]] = None,
     request_overrides: Optional[dict[str, Any]] = None,
+    allow_temperature: bool = True,
+    allow_top_p: bool = True,
 ) -> int:
     """Convert prepared shard rows into OpenAI Batch JSONL records.
 
@@ -199,6 +276,20 @@ def build_batch_requests(
     token_lookup = _max_tokens_lookup(max_new_tokens)
     string_metadata = _normalize_metadata(metadata)
     overrides = dict(request_overrides or {})
+    if overrides:
+        ensure_thinking_budget(overrides, context=f"{src_path} overrides")
+        if not allow_temperature and "temperature" in overrides:
+            logger.warning(
+                "Dropping temperature override for %s because allow_temperature is disabled.",
+                src_path,
+            )
+            overrides.pop("temperature", None)
+        if not allow_top_p and "top_p" in overrides:
+            logger.warning(
+                "Dropping top_p override for %s because allow_top_p is disabled.",
+                src_path,
+            )
+            overrides.pop("top_p", None)
 
     out_dir = os.path.dirname(dest_path) or "."
     os.makedirs(out_dir, exist_ok=True)
@@ -215,11 +306,10 @@ def build_batch_requests(
                 continue
             stop = base_body.get("stop")
 
-            request_body: Dict[str, Any] = {
-                "model": model,
-                "temperature": float(temperature),
-            }
-            if top_p is not None:
+            request_body: Dict[str, Any] = {"model": model}
+            if allow_temperature and temperature is not None:
+                request_body["temperature"] = float(temperature)
+            if allow_top_p and top_p is not None:
                 request_body["top_p"] = float(top_p)
             if stop:
                 request_body["stop"] = stop
